@@ -10,6 +10,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from core.admin import catalog, config_store, connections, pages
 from core.admin import admin_handler as ah
+from core.agent import llm_router, reports
 from core.providers.asr import doubao_stream
 
 CUSTOM_YAML = """\
@@ -273,6 +274,87 @@ async def test_llm_and_page_endpoints(client):
         await client.post("/admin/api/logout", json={})
         assert (await client.get(f"/admin/api/{path}")).status == 401
         await client.post("/admin/api/login", json={"password": "pass-1234"})
+
+
+# ---------- 本机设备接口（/kiosk） ----------
+
+@pytest.fixture
+def kiosk(client, tmp_path, monkeypatch):
+    """不登录也能用；Claude Code 当作已安装；设备记住的模型写到临时文件。"""
+    from core.agent.session_store import SessionStore
+
+    monkeypatch.setattr(llm_router, "_store", SessionStore(tmp_path / "agent_sessions.json", "last_model"))
+    monkeypatch.setattr(ah.AdminHandler, "_claude_install", lambda self, merged: {"installed": True})
+    return client
+
+
+async def test_kiosk_llm_list_and_device_model(kiosk):
+    r = await kiosk.post("/admin/api/llm/vendors/deepseek",
+                         json={"base_url": "https://api.deepseek.com", "model": "deepseek-chat", "api_key": "sk-ds-123456789"})
+    assert r.status == 200
+    await kiosk.post("/admin/api/logout", json={})
+    data = await (await kiosk.get("/kiosk/llm")).json()
+    assert data["ok"] and data["selected"] == data["default"] == "ClaudeCLI" and data["kind"] == "cli"
+    assert [(o["kind"], o["vendor"], o["entry"]) for o in data["options"]] == \
+        [("cli", "claude-code", "ClaudeCLI"), ("api", "deepseek", "DeepSeekLLM")]  # 没配好的厂商不列
+    assert data["options"][1]["model"] == "deepseek-chat"
+    # 设备上次切到的模型（呼名或在屏幕上切换）才是它实际会用的
+    llm_router.store().put("dev-1", {"model": "DeepSeekLLM"})
+    data = await (await kiosk.get("/kiosk/llm?device=dev-1")).json()
+    assert data["selected"] == "DeepSeekLLM" and data["default"] == "ClaudeCLI"
+    llm_router.store().put("dev-1", {"model": "ChatGLMLLM"})  # 没配好：退回默认
+    assert (await (await kiosk.get("/kiosk/llm?device=dev-1")).json())["selected"] == "ClaudeCLI"
+
+
+async def test_kiosk_llm_use_moves_live_connections(kiosk, cfg_path, monkeypatch):
+    switched = []
+    monkeypatch.setattr(llm_router, "switch", lambda conn, name, remember=True: switched.append((conn.session_id, name, remember)))
+    await kiosk.post("/admin/api/llm/vendors/deepseek",
+                     json={"base_url": "https://api.deepseek.com", "model": "deepseek-chat", "api_key": "sk-ds-123456789"})
+    await kiosk.post("/admin/api/logout", json={})
+    fake = SimpleNamespace(session_id="s-8", device_id="dev-8", client_ip="127.0.0.1")
+    connections.register(fake)
+    try:
+        r = await kiosk.post("/kiosk/llm/use", json={"kind": "api", "vendor": "deepseek", "device": "dev-8"})
+        assert r.status == 200 and (await r.json())["ok"]
+        assert merged(cfg_path)["selected_module"]["LLM"] == "DeepSeekLLM"
+        assert merged(cfg_path)["selected_module"]["Intent"] == "function_call"  # 和后台切换一样联动意图识别
+        assert switched == [("s-8", "DeepSeekLLM", False)]  # 在线连接马上跟着切
+        assert llm_router.store().get("dev-8")["model"] == "DeepSeekLLM"  # 这台设备记住它
+        r = await kiosk.post("/kiosk/llm/use", json={"kind": "api", "vendor": "openai"})
+        assert r.status == 400 and "还没配置好" in (await r.json())["error"] and len(switched) == 1
+        r = await kiosk.post("/kiosk/llm/use", json={"kind": "cli"})
+        assert r.status == 200 and switched[-1] == ("s-8", "ClaudeCLI", False)
+        assert llm_router.store().get("dev-8")["model"] == "DeepSeekLLM"  # 没带 device 不改记住的
+    finally:
+        connections.unregister(fake)
+
+
+async def test_kiosk_reports(kiosk):
+    reports.clear()
+    try:
+        assert (await kiosk.post("/kiosk/reports", json={})).status == 400
+        reports.add("dev-1", "bot-1", "孙悟空做完了：好。")
+        data = await (await kiosk.post("/kiosk/reports", json={"device": "dev-1", "quiet": True})).json()
+        assert data == {"ok": True, "count": 1, "playing": False}
+        assert "dev-1" in reports._quiet
+        data = await (await kiosk.post("/kiosk/reports", json={"device": "dev-1", "play": True})).json()
+        assert data == {"ok": True, "count": 1, "playing": False}  # 设备没连着，念不了
+        assert "dev-1" not in reports._quiet
+    finally:
+        reports.clear()
+
+
+async def test_kiosk_only_from_this_machine(kiosk, monkeypatch):
+    calls = [("get", "/kiosk/llm", None), ("post", "/kiosk/llm/use", {"kind": "cli"}),
+             ("post", "/kiosk/reports", {"device": "dev-1"})]
+    for method, path, body in calls:  # 本机反向代理转发来的不算本机
+        r = await getattr(kiosk, method)(path, json=body, headers={"X-Forwarded-For": "203.0.113.5"})
+        assert r.status == 403
+    monkeypatch.setattr(web.BaseRequest, "remote", property(lambda self: "192.168.1.20"))  # 局域网里的其他电脑
+    for method, path, body in calls:
+        r = await getattr(kiosk, method)(path, json=body)
+        assert r.status == 403 and (await r.json())["error"] == "仅限本机"
 
 
 async def test_vendor_test_endpoint(client, monkeypatch):

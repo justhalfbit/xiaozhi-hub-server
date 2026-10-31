@@ -6,6 +6,9 @@
 - API Key 只写不读：接口永远不返回完整的 Key。
 
 页面使用的接口（/admin/api/llm、asr、tts、intent 等）只暴露后台要管理的内容，并做取值校验。
+
+本机设备接口（/kiosk/*）给和网关装在同一台机器上的设备客户端用（例如带屏幕的语音终端），不用登录，
+只接受本机直接发来的请求，见 _from_this_machine。
 """
 
 import asyncio
@@ -21,6 +24,7 @@ from config.logger import setup_logging
 from core.admin import auth, catalog, config_store, connections, pages, pipeline
 from core.admin.grokbot import GrokBotAdmin
 from core.admin.status import _claude_version, collect_status
+from core.agent import llm_router, reports
 from core.agent.agent_session import ErrorKind
 from core.agent.grokbot_client import GrokBotError
 from core.utils.modules_initialize import initialize_modules
@@ -92,6 +96,9 @@ class AdminHandler:
                 web.post("/admin/api/grokbot/logout", self.handle_grokbot_logout),
                 web.post("/admin/api/grokbot/bots/refresh", self.handle_grokbot_refresh),
                 web.post("/admin/api/grokbot/bots", self.handle_grokbot_bots),
+                web.get("/kiosk/llm", self.handle_kiosk_llm),
+                web.post("/kiosk/llm/use", self.handle_kiosk_llm_use),
+                web.post("/kiosk/reports", self.handle_kiosk_reports),
             ]
         )
 
@@ -492,22 +499,33 @@ class AdminHandler:
         """切换到本地 CLI 或某个 API 厂商；意图识别自动跟着切。"""
         self._require_login(request)
         body = await self._read_json(request)
+        name, result = await self._use_llm(body)
+        if name is None:
+            return result
+        return self._json(result)
+
+    async def _use_llm(self, body: dict):
+        """把默认模型切到 body 指定的（{"kind": "cli"} 或 {"kind": "api", "vendor": ...}）。
+
+        成功返回 (条目名, 结果)；失败返回 (None, 错误响应)。
+        """
         merged = await self._blocking(self._merged)
         if body.get("kind") == "cli":
             name = pages.CLAUDE_CLI_ENTRY
         else:
             vendor = catalog.VENDOR_BY_ID.get(str(body.get("vendor") or ""))
             if vendor is None:
-                return self._error("不支持这个厂商", 404)
+                return None, self._error("不支持这个厂商", 404)
             name = vendor["entry"]
             if not pages.describe_vendor(vendor, merged)["configured"]:
-                return self._error(f"{vendor['label']} 还没配置好，请先填写接口地址、模型和 API Key 并保存", 400)
+                return None, self._error(
+                    f"{vendor['label']} 还没配置好，请先填写接口地址、模型和 API Key 并保存", 400)
         try:
             result = await self._switch("LLM", name)
         except KeyError:
-            return self._error(f"配置里没有 {name}", 404)
+            return None, self._error(f"配置里没有 {name}", 404)
         if not result["ok"]:
-            return self._error(result["note"], 400)
+            return None, self._error(result["note"], 400)
 
         merged = await self._blocking(self._merged)
         intent = await self._blocking(pages.desired_intent, merged, name, self.config_path)
@@ -518,7 +536,83 @@ class AdminHandler:
                 result["note"] += "；" + (note if intent_result["ok"] else intent_result["note"])
             except KeyError:
                 result["note"] += f"；配置里没有 {intent}，请检查意图识别"
+        return name, result
+
+    # ---------- 本机设备接口 ----------
+
+    @staticmethod
+    def _from_this_machine(request: web.Request) -> bool:
+        """请求直接来自本机。经过反向代理转发来的（带 X-Forwarded-For / Forwarded）不算：
+        代理和网关在同一台机器上时来源地址也是 127.0.0.1，但发起请求的可能是任何人。"""
+        if "X-Forwarded-For" in request.headers or "Forwarded" in request.headers:
+            return False
+        return request.remote in ("127.0.0.1", "::1")
+
+    async def handle_kiosk_llm(self, request: web.Request):
+        """可选的模型（配好的 API 厂商，装了 Claude Code 的话排第一个）和当前选中的。
+
+        带 ?device=<device-id> 时，selected 是这台设备实际会用的模型：它上次切到的（呼名或在这里切换），
+        还可用的话；default 始终是后台默认模型。
+        """
+        if not self._from_this_machine(request):
+            return self._error("仅限本机", 403)
+        merged = await self._blocking(self._merged)
+        data = pages.describe_llm(merged)
+        options = [
+            {"kind": "api", "vendor": v["id"], "label": v["label"], "entry": v["entry"], "model": v["model"]}
+            for v in data["vendors"] if v.get("configured")
+        ]
+        install = await self._blocking(self._claude_install, merged)
+        if install.get("installed"):
+            options.insert(0, {"kind": "cli", "vendor": "claude-code", "label": "Claude Code",
+                               "entry": pages.CLAUDE_CLI_ENTRY, "model": data["claude"]["values"].get("model", "")})
+        selected = data["selected"]
+        device = request.query.get("device")
+        if device:
+            name = (llm_router.store().get(device) or {}).get("model")
+            if name and llm_router.model_ready(merged, name) and any(o["entry"] == name for o in options):
+                selected = name
+        return self._json({"ok": True, "selected": selected, "default": data["selected"],
+                           "kind": data["kind"], "vendor": data["vendor"], "options": options})
+
+    async def handle_kiosk_llm_use(self, request: web.Request):
+        """切换默认模型（同后台"保存并设为默认"），在线的连接也马上跟着切（新模型从新对话开始，同呼名切换）。
+
+        body 带 device 时，这台设备记住这个模型：它上次呼名切到的模型不会在重连时又把它切回去。
+        """
+        if not self._from_this_machine(request):
+            return self._error("仅限本机", 403)
+        body = await self._read_json(request)
+        name, result = await self._use_llm(body)
+        if name is None:
+            return result
+        if body.get("device"):
+            await self._blocking(llm_router.store().put, str(body["device"]), {"model": name})
+        for item in connections.snapshot():
+            conn = connections.get(item["session_id"])
+            if conn is None:
+                continue
+            try:
+                await self._blocking(llm_router.switch, conn, name, remember=False)
+            except Exception as e:
+                self.logger.bind(tag=TAG).error(f"在线连接 {item['session_id']} 切换模型失败: {e}")
         return self._json(result)
+
+    async def handle_kiosk_reports(self, request: web.Request):
+        """{"device", "quiet", "play"}：返回这台设备有几条待汇报。
+
+        quiet：设备是否在睡眠时段（期间不主动念）。每次查询都带上，网关重启后不会丢。
+        play：用户点了"有一条待汇报"，马上在设备的连接上念（睡眠时段也念）；playing 表示已安排，设备没连着时为 false。
+        """
+        if not self._from_this_machine(request):
+            return self._error("仅限本机", 403)
+        body = await self._read_json(request)
+        device = str(body.get("device") or "")
+        if not device:
+            return self._error("缺少 device", 400)
+        reports.set_quiet(device, bool(body.get("quiet")))
+        playing = bool(body.get("play")) and reports.deliver_now(device)
+        return self._json({"ok": True, "count": reports.count(device), "playing": playing})
 
     # ---------- 工作原理 ----------
 

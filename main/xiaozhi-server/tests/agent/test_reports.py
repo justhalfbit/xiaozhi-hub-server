@@ -149,3 +149,38 @@ async def test_speak_marks_device_speaking_so_second_report_waits(spoken):
         assert spoken[-1] == "林黛玉做完了：第二。"
     finally:
         connections.unregister(conn)
+
+
+async def test_quiet_device_waits_for_tap_or_wake(spoken):
+    """睡眠时段：有待汇报也不主动念，只报条数；用户点了（deliver_now）照样念。"""
+    import asyncio
+    conn = FakeConn(loop=asyncio.get_running_loop())
+    connections.register(conn)
+    try:
+        reports.set_quiet("dev-1", True)
+        reports.add("dev-1", "bot-1", "孙悟空做完了：好。")
+        reports.add("dev-1", "bot-2", "林黛玉做完了：嗯。")
+        await real_sleep(0.1)
+        assert spoken == [] and reports.count("dev-1") == 2
+        assert reports.deliver_now("dev-1") is True
+        for _ in range(50):
+            if spoken:
+                break
+            await real_sleep(0.02)
+        assert spoken == ["孙悟空做完了：好。林黛玉做完了：嗯。"] and reports.count("dev-1") == 0
+        # 离开睡眠时段后照常主动念
+        reports.set_quiet("dev-1", False)
+        conn.client_is_speaking = False
+        reports.add("dev-1", "bot-1", "又做完一件。")
+        for _ in range(50):
+            if len(spoken) == 2:
+                break
+            await real_sleep(0.02)
+        assert spoken[-1] == "又做完一件。"
+    finally:
+        connections.unregister(conn)
+
+
+def test_deliver_now_needs_online_device():
+    reports.add("dev-9", "bot-1", "孙悟空做完了：好。")
+    assert reports.deliver_now("dev-9") is False and reports.count("dev-9") == 1

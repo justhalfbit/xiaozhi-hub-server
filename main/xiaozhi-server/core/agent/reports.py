@@ -5,6 +5,9 @@
 - 设备不在线：留着，下次连上后等问候播完再念；
 - 用户说"嗨 孙悟空"切回去、或给它派新活：先念它的待汇报。
 
+带屏幕的设备只在对话前后才连着，待汇报会一直等到下次唤醒。本机设备接口（/kiosk/reports）让它随时查有几条，
+用户点一下就连上来念（deliver_now）；设备在睡眠时段时标成"安静"（set_quiet），连着也不主动念，等用户点或唤醒。
+
 只放内存，服务重启就丢（用户决定）；24 小时没念掉的也丢。
 """
 
@@ -37,6 +40,7 @@ class Report:
 _lock = threading.Lock()
 _box: Dict[str, List[Report]] = {}  # 设备 -> 待汇报
 _delivering = set()  # 正在等设备空闲的设备
+_quiet = set()  # 睡眠时段的设备：有待汇报也不主动念
 
 
 def device_key(conn) -> str:
@@ -66,6 +70,22 @@ def pending(key: str, bot_id: str = None) -> bool:
     return any(bot_id is None or r.bot_id == bot_id for r in items)
 
 
+def count(key: str) -> int:
+    with _lock:
+        items = _prune(_box.get(key, []))
+        _box[key] = items
+    return len(items)
+
+
+def set_quiet(key: str, quiet: bool) -> None:
+    """设备进入或离开睡眠时段。只放内存，设备每次查询都会重新告诉一遍，服务重启不影响。"""
+    with _lock:
+        if quiet:
+            _quiet.add(key)
+        else:
+            _quiet.discard(key)
+
+
 def take(key: str, bot_id: str = None) -> List[Report]:
     """取走（并删除）这台设备的待汇报；指定 bot_id 时只取这个 Bot 的。"""
     with _lock:
@@ -83,6 +103,7 @@ def clear() -> None:
     with _lock:
         _box.clear()
         _delivering.clear()
+        _quiet.clear()
 
 
 # ---------- 找机会念 ----------
@@ -97,14 +118,28 @@ def _find_conn(key: str):
     return None
 
 
-def _try_deliver(key: str) -> None:
+def _schedule(key: str) -> bool:
+    """设备在线就安排等它空闲时念；不在线返回 False。"""
     conn = _find_conn(key)
     loop = getattr(conn, "loop", None) if conn is not None else None
     if conn is None or loop is None:
-        return
+        return False
     import asyncio
 
     asyncio.run_coroutine_threadsafe(deliver_when_idle(conn), loop)
+    return True
+
+
+def _try_deliver(key: str) -> None:
+    with _lock:
+        if key in _quiet:
+            return
+    _schedule(key)
+
+
+def deliver_now(key: str) -> bool:
+    """用户要听（点了"有一条待汇报"）：睡眠时段也念。设备没连着返回 False。"""
+    return _schedule(key)
 
 
 def is_idle(conn) -> bool:

@@ -56,3 +56,14 @@ def match_resume(text: str, keywords=None):
             if sum(a != b for a, b in zip(window, k)) <= 1 and not _negated(core, start):
                 return _remainder(core, start, start + len(k))
     return None
+
+
+# 让后台在做的事停下：整句话基本就是这条指令时才算（"别停下"这类带否定的不算）
+STOP_WORDS = ("停下", "停下来", "停止", "停", "别做了", "不用做了", "不做了", "不要做了", "取消", "算了", "停掉")
+_STOP_PREFIX = re.compile(r"^(?:让它|叫它|你|给我|先|赶紧|快)+")
+
+
+def match_stop(text: str) -> bool:
+    core = _STOP_PREFIX.sub("", _LEADING_FILLERS.sub("", normalize(text)))
+    # "算了""别做了"本身以语气词结尾：去掉结尾语气词前后各比一次
+    return core in STOP_WORDS or _TRAILING_FILLERS.sub("", core) in STOP_WORDS

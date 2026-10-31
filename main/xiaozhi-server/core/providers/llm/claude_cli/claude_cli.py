@@ -8,6 +8,11 @@
 每个设备连接最多对应一个常驻的 Claude Code 进程：首句话到来时启动（顺便决定新开还是接续），
 空闲超时、连接关闭或服务退出时结束。
 
+设备这边结束一轮（唤醒词打断、点结束、退出词、连接超时断开、单轮超时）时，Claude 如果在干正经活
+（用过工具，或已经做了 background_after_seconds 以上），不中断它：这一轮转到后台接着做，做完把回复放进
+待汇报箱（core/agent/reports.py），设备空闲时念；后台最多做 background_max_seconds。只是在聊天、刚开口
+就被打断的，照旧马上中断。后台在做时同一台设备又问 Claude：说"还在做上一件事"，不发出去；说"停下"就停掉它。
+
 管理后台热加载大模型时，旧实例会被调用 shutdown()：已连接的设备继续用旧实例对话，
 等最后一个连接关闭、手上的任务都结束后，再停止事件循环，后台线程随之退出。
 """
@@ -27,10 +32,11 @@ from typing import Dict, Optional
 
 from config.config_loader import get_project_dir
 from config.logger import setup_logging
+from core.agent import reports
 from core.agent.agent_session import STARTING_LABELS, Activity, AgentSessionError, Done, Error, ErrorKind, TextDelta
 from core.agent.claude_session import ClaudeSession, ClaudeSessionConfig
 from core.agent.session_store import SessionStore, choose_resume
-from core.agent.voice_commands import DEFAULT_RESUME_KEYWORDS, match_resume
+from core.agent.voice_commands import DEFAULT_RESUME_KEYWORDS, match_resume, match_stop
 from core.providers.llm.base import LLMProviderBase
 from core.utils import textUtils
 from core.utils.prompt_manager import EMOJI_List
@@ -51,6 +57,10 @@ VOICE_RULES = f"""
 
 SENTENCE_ENDS = "。！？!?.;；~～…"
 DEFAULT_PROGRESS_REPLY = "还在处理，请稍等"
+# 后台做事相关的播报
+BACKGROUND_NOTICE = "这件事要做一阵子，我先不等了，做完了我再告诉你。"
+BUSY_NOTICE = "😶Claude 还在做上一件事，做完了我告诉你。想让它停下，就说停下。"
+STOPPED_NOTICE = "😶好，已经让 Claude 停下了。"
 PROGRESS_MAX_FACTOR = 4  # 进度提示的间隔逐次翻倍，最多拉长到 4 倍（默认 30 → 60 → 120 秒）
 
 
@@ -126,11 +136,80 @@ class ConnState:
     closed: bool = False  # 连接已关闭：不再启动或保留 Claude Code 进程
     turn_gen: int = 0  # 每开始一轮加 1，用于让过期的空闲定时器失效
     turn_task: Optional[asyncio.Task] = None  # 正在执行的一轮，卡死时要取消它，否则它一直占着锁
+    turn: Optional["Turn"] = None  # 正在执行的一轮（含转到后台的）
+
+
+class Turn:
+    """一轮对话的事件去向：设备在听时交给 response()（经 out 队列），转到后台后自己收着，做完交给待汇报箱。
+
+    emit 在事件循环线程里调用，detach 在连接的线程里调用，用锁保证一条事件要么交给了设备、要么留在这里。"""
+
+    def __init__(self, st: ConnState, out: queue.Queue):
+        self.st = st
+        self.out = out
+        self.gen = st.turn_gen
+        self.agent = None
+        self.started = time.monotonic()
+        self.last_event = self.started
+        self.tools_running = 0
+        self.used_tool = False
+        self.detached = False
+        self.finished = False
+        self.cancelled = False  # 用户说了"停下"：不再汇报
+        self.stop_kind: Optional[ErrorKind] = None  # 后台判定卡死或做太久，被我们停下
+        self.texts = []  # 转到后台后（以及转的时候还没念）的文字
+        self.error: Optional[Error] = None
+        self.ended = asyncio.Event()  # 在事件循环线程里创建
+        self._lock = threading.Lock()
+
+    def emit(self, ev) -> None:
+        with self._lock:
+            if isinstance(ev, Activity) and ev.tools_running >= 0:
+                self.tools_running = ev.tools_running
+                self.used_tool = self.used_tool or ev.tools_running > 0
+            self.last_event = time.monotonic()
+            if not self.detached:
+                self.out.put(ev)
+            elif isinstance(ev, TextDelta):
+                self.texts.append(ev.text)
+            elif isinstance(ev, Error):
+                self.error = ev
+
+    def is_task(self, after: float) -> bool:
+        """在干正经活：用过工具，或者已经做了 after 秒以上（想得久）。只是聊天、刚开口的不算。"""
+        return self.used_tool or time.monotonic() - self.started >= after
+
+    def detach(self) -> bool:
+        """设备不听了，转到后台。队列里还没念的文字也收回来。已经结束或已经转过返回 False。"""
+        with self._lock:
+            if self.finished or self.detached:
+                return False
+            self.detached = True
+            while True:
+                try:
+                    ev = self.out.get_nowait()
+                except queue.Empty:
+                    break
+                if isinstance(ev, TextDelta):
+                    self.texts.append(ev.text)
+                elif isinstance(ev, Error):
+                    self.error = ev
+            return True
+
+    def finish(self) -> bool:
+        """这一轮结束了；返回它是不是在后台结束的。"""
+        with self._lock:
+            self.finished = True
+            self.ended.set()
+            return self.detached
 
 
 class LLMProvider(LLMProviderBase):
     # 日志和提示里对这个 Agent 的称呼。其他 Agent 的 provider（grok_bot）继承本类，改掉它和 _ensure_agent 即可
     AGENT_LABEL = "Claude Code"
+    # 设备这边结束一轮时，在干正经活的转到后台接着做（见模块说明）。grok_bot 的会话自己有后台盯着的机制，关掉
+    BACKGROUND_TURNS = True
+    REPORT_ID = "claude_cli"  # 待汇报箱里标记是谁的话
 
     def __init__(self, config: dict):
         self.model_name = f"claude_cli:{config.get('model') or 'default'}"
@@ -169,6 +248,11 @@ class LLMProvider(LLMProviderBase):
         self.filler = single_sentence(config.get("first_reply_filler", filler_default))
         self.filler_delay = _num(config, "filler_delay_seconds", filler_delay_default)
         self.abandon_grace = 5.0  # 发出中断后等这么久，这一轮还没停下就强制关闭进程
+        # 设备不听了以后，Claude 在后台最多再做多久（从这一轮开始算），到时间就停下并汇报；填 0 不转后台（照旧中断）
+        self.background_max = _num(config, "background_max_seconds", 7200)
+        # 做了这么久（或用过工具）才算"正经活"、值得转后台；更短的聊天被打断就直接中断
+        self.background_after = _num(config, "background_after_seconds", 30)
+        self._background: Dict[str, Turn] = {}  # 设备 -> 在后台做的一轮
 
         self._states: Dict[str, ConnState] = {}
         self._states_lock = threading.Lock()
@@ -203,7 +287,7 @@ class LLMProvider(LLMProviderBase):
 
     def _maybe_stop(self) -> None:
         with self._states_lock:
-            if not self._retiring or self._stopping or self._states:
+            if not self._retiring or self._stopping or self._states or self._background:
                 return
             self._stopping = True
             loop = self._loop
@@ -258,6 +342,8 @@ class LLMProvider(LLMProviderBase):
 
     def abort(self, conn) -> None:
         st = self._states.get(conn.session_id)
+        if st and self._let_go(st, "设备打断"):
+            return
         if st and st.agent:
             asyncio.run_coroutine_threadsafe(st.agent.interrupt(), self._loop)
             # 卡在工具调用里时 interrupt 可能无效，兜底防止下一句话一直排队等这一轮
@@ -268,8 +354,98 @@ class LLMProvider(LLMProviderBase):
             st = self._states.pop(conn.session_id, None)
         if st:
             st.closed = True
-            asyncio.run_coroutine_threadsafe(self._close_agent(st, "连接关闭"), self._loop)
+            if self._let_go(st, "连接关闭") or self._in_background(st):
+                logger.bind(tag=TAG).info(f"连接关闭，{self.AGENT_LABEL} 还在后台做，做完再关进程，设备 {st.key}")
+            else:
+                asyncio.run_coroutine_threadsafe(self._close_agent(st, "连接关闭"), self._loop)
         self._maybe_stop()
+
+    # ---------- 设备不听了：转后台接着做 ----------
+
+    @staticmethod
+    def _in_background(st: ConnState) -> bool:
+        turn = st.turn
+        return turn is not None and turn.detached and not turn.finished
+
+    def _let_go(self, st: ConnState, reason: str) -> bool:
+        """设备这边结束这一轮。Claude 在干正经活就不中断，转后台接着做、做完进待汇报箱，返回 True；
+        没有进行中的一轮、只是聊天、或不支持后台的 Agent 返回 False（调用方照旧中断或关闭）。可以从任何线程调用。"""
+        turn = st.turn
+        if (not self.BACKGROUND_TURNS or not self.background_max or turn is None
+                or not turn.is_task(self.background_after) or not turn.detach()):
+            return False
+        with self._states_lock:
+            self._background[st.key] = turn
+        logger.bind(tag=TAG).info(
+            f"{reason}：{self.AGENT_LABEL} 还在干活（已 {time.monotonic() - turn.started:.0f} 秒），不中断，转后台，"
+            f"做完进待汇报，设备 {st.key}")
+        asyncio.run_coroutine_threadsafe(self._watch_background(turn), self._loop)
+        return True
+
+    async def _watch_background(self, turn: Turn) -> None:
+        """后台这一轮的看门狗：真卡死（连续 stall_timeout 没有任何事件、也没有工具在跑）或做满 background_max 就停下它。"""
+        while not turn.finished:
+            try:
+                await asyncio.wait_for(turn.ended.wait(), timeout=1)
+            except asyncio.TimeoutError:
+                pass
+            if turn.finished:
+                return
+            now = time.monotonic()
+            stalled = not turn.tools_running and now - turn.last_event >= self.stall_timeout
+            if stalled or now - turn.started >= self.background_max:
+                turn.stop_kind = ErrorKind.STALLED if stalled else ErrorKind.TIMEOUT
+                logger.bind(tag=TAG).warning(
+                    f"后台的 {self.AGENT_LABEL} {'连续 %d 秒没有任何响应' % int(self.stall_timeout) if stalled else '做满 %d 秒' % int(self.background_max)}，停下它")
+                if turn.agent is not None:
+                    await turn.agent.interrupt()
+                asyncio.ensure_future(self._abandon_if_stuck(turn.st, turn.gen))
+                return
+
+    def _background_report(self, turn: Turn) -> str:
+        """后台这一轮结束后要念给用户的话。"""
+        if turn.cancelled:
+            return ""
+        if turn.stop_kind == ErrorKind.STALLED:
+            return "Claude 刚才那件事一直没有回应，我让它停下了。想接着做，跟我说继续就行。"
+        if turn.stop_kind == ErrorKind.TIMEOUT:
+            return "Claude 刚才那件事做了太久，我让它停下了。想接着做，跟我说继续就行。"
+        body = textUtils.check_emoji("".join(turn.texts)).strip().lstrip("。")  # 汇报时不需要换表情
+        if turn.error is not None and not body:
+            return f"Claude 刚才那件事没做完：{turn.error.voice_message}"
+        return f"Claude 做完了：{body}" if body else "Claude 做完了。"
+
+    async def _finish_background(self, st: ConnState, turn: Turn) -> None:
+        with self._states_lock:
+            if self._background.get(st.key) is turn:
+                self._background.pop(st.key, None)
+        text = self._background_report(turn)
+        logger.bind(tag=TAG).info(f"后台的 {self.AGENT_LABEL} 这一轮结束（{time.monotonic() - turn.started:.0f} 秒）"
+                                  f"{'，待汇报：' + text[:80] if text else '，不汇报'}")
+        if text:
+            reports.add(st.key, self.REPORT_ID, text)
+        if st.closed:
+            await self._close_agent(st, "后台这一轮做完，连接早已关闭")
+        self._maybe_stop()
+
+    async def _busy_in_background(self, st: ConnState, text: str, out: queue.Queue) -> bool:
+        """这台设备有一轮还在后台做（可能是上一个连接留下的）：这句话不发给 Claude。说"停下"就停掉它。"""
+        with self._states_lock:
+            bg = self._background.get(st.key)
+        if bg is None or bg.finished:
+            return False
+        if match_stop(text):
+            bg.cancelled = True
+            logger.bind(tag=TAG).info(f"用户让后台的 {self.AGENT_LABEL} 停下，设备 {st.key}")
+            if bg.agent is not None:
+                await bg.agent.interrupt()
+            asyncio.ensure_future(self._abandon_if_stuck(bg.st, bg.gen))
+            out.put(TextDelta(STOPPED_NOTICE))
+        else:
+            logger.bind(tag=TAG).info(f"{self.AGENT_LABEL} 还在后台做上一件事，这句话不发：{text[:40]}")
+            out.put(TextDelta(BUSY_NOTICE))
+        out.put(Done())
+        return True
 
     # ---------- 后台循环中的逻辑 ----------
 
@@ -359,20 +535,28 @@ class LLMProvider(LLMProviderBase):
         return False
 
     async def _run_turn(self, st: ConnState, text: str, system_prompt: str, out: queue.Queue) -> None:
+        if self.BACKGROUND_TURNS and await self._busy_in_background(st, text, out):
+            return
         if st.lock is None:
             st.lock = asyncio.Lock()
         async with st.lock:
             st.turn_gen += 1
             st.turn_task = asyncio.current_task()
+            turn = st.turn = Turn(st, out)
             if st.idle_handle:
                 st.idle_handle.cancel()
                 st.idle_handle = None
             try:
+                if self.BACKGROUND_TURNS:
+                    pending = reports.take_text(st.key, self.REPORT_ID)  # 上一件事在后台做完、还没念的，先念
+                    if pending:
+                        out.put(TextDelta(pending))
                 if await self._ensure_agent(st, text, out, system_prompt):
                     if st.agent:  # grok_bot 在连接已关闭时把话交出去后也返回 True，那时没有会话
                         self.store.touch(st.key, st.agent.session_id)
                     return
                 agent, recorded, working, failed, previous = st.agent, False, False, False, None
+                turn.agent = agent
                 async for ev in agent.send(text):
                     if isinstance(ev, Error) and not working and ev.kind != ErrorKind.PROCESS_EXITED:
                         failed = True  # 还没开始干活就出错：没登录、额度用完、限流或过载重试用完等
@@ -384,7 +568,7 @@ class LLMProvider(LLMProviderBase):
                             self.store.touch(st.key, agent.session_id)
                             recorded = True
                         working = working or not (isinstance(ev, Activity) and ev.label in STARTING_LABELS)
-                    out.put(ev)
+                    turn.emit(ev)
                     if isinstance(ev, Error) and ev.kind == ErrorKind.PROCESS_EXITED:
                         st.agent = None
                 if failed:
@@ -394,15 +578,17 @@ class LLMProvider(LLMProviderBase):
                 elif recorded and st.agent:
                     self.store.touch(st.key, st.agent.session_id)  # 更新最后活跃时间
             except AgentSessionError as e:
-                out.put(Error(e.kind, e.detail, voice=self._voice_error(e.kind)))
+                turn.emit(Error(e.kind, e.detail, voice=self._voice_error(e.kind)))
             except asyncio.CancelledError:
                 # Claude Code 卡死被强制关闭（_abandon_if_stuck 取消了这一轮）：告诉还在等的一方这一轮结束了
-                out.put(Done(interrupted=True))
+                turn.emit(Done(interrupted=True))
                 raise
             except Exception as e:
                 logger.bind(tag=TAG).exception(f"{self.AGENT_LABEL} 处理出错: {e}")
-                out.put(Error(ErrorKind.UNKNOWN, str(e), voice=self._voice_error(ErrorKind.UNKNOWN)))
+                turn.emit(Error(ErrorKind.UNKNOWN, str(e), voice=self._voice_error(ErrorKind.UNKNOWN)))
             finally:
+                if turn.finish():
+                    await self._finish_background(st, turn)
                 if st.agent and not st.closed:
                     self._schedule_idle_close(st)
 
@@ -454,6 +640,11 @@ class LLMProvider(LLMProviderBase):
                         last_spoken_at, tail = time.time(), text[-1]
                         yield notice
                     stalled = not tools_running and time.time() - last_event_at >= self.stall_timeout
+                    if elapsed >= self.turn_timeout and not stalled and self._let_go(st, "单轮超时"):
+                        # Claude 还在正常干活：不中断，转后台，做完进待汇报
+                        yield self._before_notice(tail, first_at is not None or filler_sent) + BACKGROUND_NOTICE
+                        finished = True
+                        return
                     if elapsed >= self.turn_timeout or stalled:
                         kind = ErrorKind.STALLED if stalled else ErrorKind.TIMEOUT
                         logger.bind(tag=TAG).warning(
@@ -500,8 +691,8 @@ class LLMProvider(LLMProviderBase):
                     )
                     return
         finally:
-            if not finished and st.agent:
-                # 生成器被提前关闭（例如设备打断后服务端停止迭代），让 Claude 也停下来
+            if not finished and st.agent and not self._let_go(st, "停止播报"):
+                # 生成器被提前关闭（例如设备打断后服务端停止迭代），让 Claude 也停下来（在干正经活的除外，转后台）
                 asyncio.run_coroutine_threadsafe(st.agent.interrupt(), self._loop)
 
     @staticmethod

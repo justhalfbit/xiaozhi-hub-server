@@ -183,7 +183,8 @@ def describe_tips(merged: dict) -> list:
         tips.append({"title": "长任务", "say": "让 Claude 做要几分钟的事",
                      "result": ("设备陪着等，不限时长" if not turn else f"设备陪着等，最长 {_duration(turn)}")
                                + (f"；{_duration(progress)}没开口就提示一次进度" if progress else "")
-                               + "。被停下或打断后，说“继续”接着做"})
+                               + ("。中途打断、结束或等满了，Claude 不停，后台接着做，做完了告诉你；想让它停下就说“停下”"
+                                  if _setting(cli, "background_max_seconds", 7200) else "。被停下或打断后，说“继续”接着做")})
         window = _setting(cli, "resume_window_minutes", 120)
         keywords = cli.get("resume_keywords") or ["接着上次聊"]
         said = _quoted(keywords[:2], "或")

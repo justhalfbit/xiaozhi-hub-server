@@ -301,8 +301,9 @@ def save_claude_cli(payload: dict, merged: dict, path: Path = None) -> list:
             raise ValueError(f"工具名不对：{', '.join(bad)}")
         payload["allowed_tools"] = items
     # 这几项填 0 有特别含义（见 claude_cli.py）：单轮、无响应超时 0 是不限制，空闲关闭 0 是每轮结束就关进程，
-    # 自动接续 0 是不自动接续
-    for name in ("turn_timeout_seconds", "stall_timeout_seconds", "idle_timeout_seconds", "resume_window_minutes"):
+    # 自动接续 0 是不自动接续，后台最长 0 是不转后台（打断就停）
+    for name in ("turn_timeout_seconds", "stall_timeout_seconds", "idle_timeout_seconds", "resume_window_minutes",
+                 "background_max_seconds", "background_after_seconds"):
         if name in payload:
             _check_non_negative_number(name, payload[name])
     if "filler_delay_seconds" in payload:

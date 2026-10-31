@@ -61,6 +61,7 @@ def shared_loop() -> asyncio.AbstractEventLoop:
 
 class LLMProvider(AgentProvider):
     AGENT_LABEL = "Grok Bot"
+    BACKGROUND_TURNS = False  # 会话自己被打断后留后台盯着（grokbot_session.AfterWatch），这里不用父类的后台机制
 
     def __init__(self, config: dict):
         self.bot_id = str(config.get("bot_id") or "").strip()

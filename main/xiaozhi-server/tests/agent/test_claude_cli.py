@@ -724,10 +724,13 @@ def test_notice_not_glued_to_half_sentence(provider):
     """超时提示前如果 Claude 只说了半句，先补句号收住，不能和半句话粘成一句念。"""
     from core.agent.agent_session import Activity
     provider.filler, provider.turn_timeout, provider.stall_timeout = "", 0.5, 30
-    FakeAgent.script = [[TextDelta("🙂我先看一下文件"), Activity("x", tools_running=1), 5.0, Done()]]
+    FakeAgent.script = [[TextDelta("🙂我先看一下文件"), 5.0, Done()]]
     c = conn()
     provider.on_conn_open(c)
     assert run(provider, c, "看看").startswith("🙂我先看一下文件。这件事做得太久")
+    # 在跑工具（正经活）时超时：不中断，转后台，提示一样收住半句
+    FakeAgent.script = [[TextDelta("🙂我先跑一下命令"), Activity("x", tools_running=1), 5.0, Done()]]
+    assert run(provider, c, "跑一下").startswith("🙂我先跑一下命令。" + provider_mod.BACKGROUND_NOTICE)
 
 
 def test_resumed_session_record_unchanged_when_not_logged_in(provider):
@@ -976,7 +979,9 @@ def test_abort_ends_turn_immediately_even_if_claude_ignores_it(provider):
     alive_at = c.last_activity_time
     time.sleep(3)
     assert said == [] and c.last_activity_time == alive_at  # 没有再说话，也不再刷新连接的活动时间
-    assert FakeAgent.instances[0].interrupts >= 1 and FakeAgent.instances[0].closed  # 卡死的进程被强制关闭
+    # 在跑工具（正经活）：不中断，转后台接着做（做完进待汇报，见下面后台的用例）
+    assert FakeAgent.instances[0].interrupts == 0 and not FakeAgent.instances[0].closed
+    assert provider._in_background(provider._states[c.session_id])
 
 
 def test_abort_after_turn_keeps_process(provider):
@@ -1050,3 +1055,194 @@ def test_wants_resume_tolerates_one_wrong_char():
     # 4 个字以内的关键字必须完全一致，避免误触发
     assert wants_resume("接着聊", keywords=["接着聊"])
     assert not wants_resume("接着量", keywords=["接着聊"])
+
+
+# ---------- 设备不听了，Claude 在后台接着做（用户：「Claude Code CLI 也有可能长时间才回复」）----------
+
+from core.agent import reports as reports_mod  # noqa: E402
+
+
+def start_turn(p, c, text):
+    """模拟 conn.chat：在线程里迭代 response()，设备打断（client_abort）后停止送 TTS。"""
+    said, ended = [], threading.Event()
+
+    def consume():
+        for piece in p.response(c.session_id, [{"role": "user", "content": text}]):
+            said.append(piece)
+            if getattr(c, "client_abort", False):
+                break
+        ended.set()
+
+    threading.Thread(target=consume, daemon=True).start()
+    return said, ended
+
+
+def wait_for(cond, timeout=3.0):
+    deadline = time.time() + timeout
+    while not cond():
+        if time.time() > deadline:
+            raise AssertionError("等待超时")
+        time.sleep(0.02)
+
+
+@pytest.fixture
+def bg(provider, monkeypatch):
+    reports_mod.clear()
+    monkeypatch.setattr(reports_mod, "_try_deliver", lambda key: None)  # 不找设备念，只看箱子
+    provider.filler, provider.turn_timeout, provider.stall_timeout = "", 30, 30
+    provider.abandon_grace, provider.background_after = 0.3, 30
+    yield provider
+    reports_mod.clear()
+
+
+def test_abort_mid_task_keeps_working_and_reports(bg):
+    """唤醒词打断时 Claude 在跑工具：不中断，做完后的话进待汇报（去掉表情），进程留着下一句复用。"""
+    FakeAgent.script = [[TextDelta("🙂我先看看。"), Activity("x", tools_running=1), 0.6,
+                         Activity("y", tools_running=0), TextDelta("😊整理好了，"), TextDelta("一共三个文件。"), Done()],
+                        [TextDelta("🙂好"), Done()]]
+    c = conn()
+    c.client_abort = False
+    bg.on_conn_open(c)
+    said, ended = start_turn(bg, c, "整理一下文件")
+    wait_for(lambda: said)
+    c.client_abort = True
+    bg.abort(c)
+    assert ended.wait(1)
+    agent = FakeAgent.instances[0]
+    assert agent.interrupts == 0
+    wait_for(lambda: reports_mod.pending("dev-1"))
+    assert reports_mod.take_text("dev-1", "claude_cli") == "Claude 做完了：整理好了，一共三个文件。"
+    c.client_abort = False
+    assert run(bg, c, "下一句") == "🙂好" and len(FakeAgent.instances) == 1
+
+
+def test_chat_abort_still_interrupts(bg):
+    """只是在聊天（没用工具、刚开口）被打断：照旧马上中断，不转后台、不汇报。"""
+    FakeAgent.script = [[TextDelta("🙂从前有座山，"), 1.0, TextDelta("山里有座庙。"), Done()]]
+    c = conn()
+    c.client_abort = False
+    bg.on_conn_open(c)
+    said, ended = start_turn(bg, c, "讲个故事")
+    wait_for(lambda: said)
+    c.client_abort = True
+    bg.abort(c)
+    assert ended.wait(1)
+    wait_for(lambda: FakeAgent.instances[0].interrupts == 1)
+    time.sleep(1.2)
+    assert not reports_mod.pending("dev-1")
+
+
+def test_long_thinking_counts_as_task(bg):
+    """没用工具但已经想了 background_after 秒以上：也算正经活，打断后转后台。"""
+    bg.background_after = 0.3
+    FakeAgent.script = [[Activity("thinking"), 0.6, TextDelta("🙂想好了。"), Done()]]
+    c = conn()
+    c.client_abort = False
+    bg.on_conn_open(c)
+    said, ended = start_turn(bg, c, "想个方案")
+    time.sleep(0.4)
+    c.client_abort = True
+    bg.abort(c)
+    assert ended.wait(1)
+    wait_for(lambda: reports_mod.pending("dev-1"))
+    assert reports_mod.take_text("dev-1") == "Claude 做完了：想好了。"
+    assert FakeAgent.instances[0].interrupts == 0
+
+
+def test_turn_timeout_while_working_goes_background(bg):
+    """单轮超时时 Claude 还在正常干活：说"做完了再告诉你"，不中断，做完进待汇报。"""
+    bg.turn_timeout = 0.5
+    FakeAgent.script = [[Activity("x", tools_running=1), 1.0, Activity("y", tools_running=0), TextDelta("🙂编译好了。"), Done()]]
+    c = conn()
+    bg.on_conn_open(c)
+    out = run(bg, c, "编译一下")
+    assert out == "😶" + provider_mod.BACKGROUND_NOTICE
+    wait_for(lambda: reports_mod.pending("dev-1"))
+    assert reports_mod.take_text("dev-1") == "Claude 做完了：编译好了。"
+    assert FakeAgent.instances[0].interrupts == 0
+
+
+def test_conn_close_mid_task_keeps_process_until_done(bg):
+    """连接关闭（点结束、退出词、2 分钟没人说话）时在干活：进程先不关，做完进待汇报后再关。"""
+    FakeAgent.script = [[Activity("x", tools_running=1), 0.8, Activity("y", tools_running=0), TextDelta("🙂装好了。"), Done()]]
+    c = conn()
+    c.client_abort = False
+    bg.on_conn_open(c)
+    said, ended = start_turn(bg, c, "装个包")
+    wait_for(lambda: FakeAgent.instances and FakeAgent.instances[0].sent)
+    time.sleep(0.1)
+    bg.on_conn_close(c)
+    agent = FakeAgent.instances[0]
+    time.sleep(0.2)
+    assert not agent.closed and agent.interrupts == 0
+    wait_for(lambda: reports_mod.pending("dev-1"))
+    assert reports_mod.take_text("dev-1") == "Claude 做完了：装好了。"
+    wait_for(lambda: agent.closed)
+
+
+def test_new_question_while_background_busy_and_stop(bg):
+    """后台还在做时同一台设备（重连后的新连接）又问：说还在做上一件事，不发出去；说"停下"就停掉它，不再汇报。"""
+    FakeAgent.script = [[Activity("x", tools_running=1), 30.0, Done()]]
+    c = conn()
+    c.client_abort = False
+    bg.on_conn_open(c)
+    said, ended = start_turn(bg, c, "跑个很久的任务")
+    wait_for(lambda: FakeAgent.instances and FakeAgent.instances[0].sent)
+    time.sleep(0.1)
+    bg.on_conn_close(c)  # 设备断开
+    c2 = conn(sid="conn-2")
+    bg.on_conn_open(c2)
+    assert run(bg, c2, "今天几号") == provider_mod.BUSY_NOTICE
+    assert FakeAgent.instances[0].sent == ["跑个很久的任务"] and len(FakeAgent.instances) == 1  # 没发出去，也没开新进程
+    assert run(bg, c2, "停下吧") == provider_mod.STOPPED_NOTICE
+    agent = FakeAgent.instances[0]
+    wait_for(lambda: agent.interrupts >= 1 and agent.closed)  # 不理中断的被强制关闭
+    time.sleep(0.2)
+    assert not reports_mod.pending("dev-1")
+    FakeAgent.script = [[TextDelta("🙂今天一号"), Done()]]
+    assert run(bg, c2, "今天几号") == "🙂今天一号"  # 停掉后正常对话
+
+
+def test_background_stall_is_stopped_and_reported(bg):
+    """后台真卡死（连续 stall_timeout 没事件、没工具在跑）：停下它，并告诉用户。"""
+    bg.stall_timeout = 0.5
+    FakeAgent.script = [[Activity("x", tools_running=1), 0.2, Activity("y", tools_running=0), 30.0, Done()]]
+    c = conn()
+    c.client_abort = False
+    bg.on_conn_open(c)
+    said, ended = start_turn(bg, c, "干个活")
+    wait_for(lambda: FakeAgent.instances and FakeAgent.instances[0].sent)
+    time.sleep(0.1)
+    c.client_abort = True
+    bg.abort(c)
+    wait_for(lambda: reports_mod.pending("dev-1"), timeout=5)
+    assert "一直没有回应" in reports_mod.take_text("dev-1")
+    assert FakeAgent.instances[0].interrupts >= 1
+
+
+def test_background_report_spoken_before_next_reply(bg, monkeypatch):
+    """后台做完、还没来得及念（设备一直不空闲）就又问 Claude：先念上一件事的结果。"""
+    reports_mod.add("dev-1", "claude_cli", "Claude 做完了：好了。")
+    c = conn()
+    bg.on_conn_open(c)
+    assert run(bg, c, "再来一件") == "Claude 做完了：好了。🙂好"
+
+
+def test_background_disabled_with_zero(bg):
+    bg.background_max = 0
+    FakeAgent.script = [[Activity("x", tools_running=1), 1.0, Done()]]
+    c = conn()
+    c.client_abort = False
+    bg.on_conn_open(c)
+    said, ended = start_turn(bg, c, "干个活")
+    wait_for(lambda: FakeAgent.instances and FakeAgent.instances[0].sent)
+    time.sleep(0.1)
+    c.client_abort = True
+    bg.abort(c)
+    wait_for(lambda: FakeAgent.instances[0].interrupts == 1)
+
+
+def test_match_stop():
+    from core.agent.voice_commands import match_stop
+    assert all(match_stop(t) for t in ("停下", "停下吧。", "让它停下来", "别做了", "算了", "好的，取消"))
+    assert not any(match_stop(t) for t in ("别停下", "停下来想想这个问题怎么做", "今天几号", ""))

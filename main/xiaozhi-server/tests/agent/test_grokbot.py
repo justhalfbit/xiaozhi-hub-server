@@ -71,6 +71,9 @@ class FakeCloud:
         self.entries = [{"id": "e0", "kind": "message", "role": "user", "content": "旧消息"}]
         self.sent = []
         self.send_fail_once = False
+        self.send_hold = 0.0  # sendPrompt 收到后过这么久才返回
+        self.tail_hold = 0  # 接下来这么多次读尾部挂一会儿才返回
+        self.tail_waiting = False
         self.acceptance = {"status": "accepted"}
         self.hibernate_once = False
         self.tail_fail = 0  # 接下来这么多次 getAgentTranscriptTail 返回 500
@@ -138,6 +141,8 @@ class FakeCloud:
     async def send_prompt(self, request):
         body = await request.json()
         self.sent.append(body)
+        if self.send_hold:
+            await real_sleep(self.send_hold)
         if self.send_fail_once:
             self.send_fail_once = False
             return web.Response(status=500, text="boom")
@@ -151,6 +156,10 @@ class FakeCloud:
             self.tail_fail -= 1
             return web.json_response({"error": "server transcript tail is not enabled"}, status=500)
         body = await request.json()
+        if self.tail_hold:
+            self.tail_hold -= 1
+            self.tail_waiting = True
+            await real_sleep(0.5)
         return web.json_response({"entries": self.entries[-int(body.get("limit", 10)):], "nextBeforeSeq": 0})
 
     async def window(self, request):
@@ -1211,6 +1220,55 @@ async def test_close_mid_turn_turns_into_watch(cloud, hub):
     await cloud.push("agent-upserted", {"agent": {"id": "bot-1", "isRunning": False}})
     await wait_until(lambda: got, timeout=3)
     assert got == ["孙悟空做完了：做完了。"]
+
+
+# ---------- 设备断开的各个时间点：之后拿到的回复都要进待汇报箱 ----------
+
+@pytest.mark.parametrize("send_hold", [0.5, 0.0], ids=["sendPrompt 还没返回", "等回显"])
+async def test_close_during_send_still_reports(cloud, hub, send_hold):
+    """现场 19:37：sendPrompt 还没返回设备就断开了。以前只有发送之后的断开才算打断，这一轮被当成正常的收掉，
+    回复没人听也不进待汇报箱。"""
+    cloud.send_hold = send_hold
+    s, got = reporting_session(hub)
+    s.device_key = "dev-1"
+    await s.start()
+
+    async def script():
+        await wait_until(lambda: cloud.sent)
+        await s.close()  # 设备断开 → provider 关掉会话
+
+    task = asyncio.ensure_future(script())
+    evs = await collect(s, "派个活")
+    await task
+    assert isinstance(evs[-1], Done) and evs[-1].interrupted and texts(evs) == []
+    await cloud.push("agent-upserted", {"agent": {"id": "bot-1", "isRunning": True}})
+    await cloud.push("transcript", {"agentId": "bot-1", "type": "appended", "entry": reply_entry("二百四十七。")})
+    await cloud.push("agent-upserted", {"agent": {"id": "bot-1", "isRunning": False}})
+    await wait_until(lambda: got, timeout=3)
+    assert got == ["孙悟空做完了：二百四十七。"]
+
+
+async def test_close_while_re_reading_still_reports(cloud, hub):
+    """发送后没回显、重连补读时设备断开：补读拿回来的回复不能当这一轮念掉（没人听），要进待汇报箱。"""
+    cloud.stream_dead = True
+    s, got = reporting_session(hub, echo_timeout=0.3, poll_interval=5)
+    s.device_key = "dev-1"
+    await s.start()
+
+    async def script():
+        await wait_until(lambda: cloud.sent)
+        cloud.entries += [echo_entry(cloud), reply_entry("二百四十七。")]
+        cloud.agents[0]["newestEntryId"] = "e2"
+        cloud.tail_hold = 1  # 补读挂一会儿，断开发生在补读途中
+        await wait_until(lambda: cloud.tail_waiting)
+        await s.close()
+
+    task = asyncio.ensure_future(script())
+    evs = await collect(s, "派个活")
+    await task
+    assert texts(evs) == []  # 没当这一轮念掉
+    await wait_until(lambda: got, timeout=5)
+    assert got == ["孙悟空做完了：二百四十七。"]
 
 
 async def test_gateway_connection_error_re_ensures_box(cloud, client):

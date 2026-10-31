@@ -365,14 +365,24 @@ class GrokBotSession(AgentSession):
 
     # ---------- 被打断后在后台盯着 ----------
 
-    def _start_watch(self, tracker: Tracker) -> None:
-        if self.on_report is None or tracker.finished(time.monotonic()):
+    def _start_watch(self, tracker: Tracker, texts: List[str] = ()) -> None:
+        """转后台盯着。texts 是设备不听了之后这一轮才收到的回复（没有念过），一并汇报；
+        这一轮已经结束时不用再盯，手上有话就直接汇报。"""
+        if self.on_report is None:
+            return
+        finished = tracker.finished(time.monotonic())
+        if finished and not texts:
+            return
+        watch = AfterWatch(self, tracker)
+        watch.texts = list(texts)
+        if finished:
+            watch._report()
             return
         old = _watches.pop(self.watch_key, None)
         if old is not None:
             old.take()  # 同一设备同一 Bot 只盯一个（上一个的话已经在这一轮念过或进了箱子）
-        _watches[self.watch_key] = AfterWatch(self, tracker)
-        _watches[self.watch_key].start()
+        _watches[self.watch_key] = watch
+        watch.start()
 
     def take_watch(self) -> str:
         """新的一轮开始前：停掉这台设备对这个 Bot 的后台盯着任务（哪怕是上一个会话留下的），
@@ -387,6 +397,15 @@ class GrokBotSession(AgentSession):
             yield Error(ErrorKind.PROCESS_EXITED, "session not started", voice=voice_for(ErrorKind.PROCESS_EXITED))
             return
         self._interrupted = False
+        # 从这里起就算在一轮里：发送前后（读尾部、sendPrompt 还没返回）设备断开也当打断，话照样发，转后台盯着
+        self._in_turn = True
+        try:
+            async for ev in self._send(text):
+                yield ev
+        finally:
+            self._in_turn = False
+
+    async def _send(self, text: str) -> AsyncIterator[AgentEvent]:
         cfg = self.config
         client = self.hub.client
         bot_id = cfg.bot_id
@@ -442,26 +461,29 @@ class GrokBotSession(AgentSession):
                 return
 
         yield Activity("sent", tools_running=1)
-        self._in_turn = True
+        held: List[str] = []  # 设备不听了（打断、断开）之后才到的回复，例如断开时正在补读：不念，留着汇报
         try:
             finished = False
             async for ev in self._follow(tracker, queue, lambda: self._interrupted):
+                if self._interrupted and isinstance(ev, TextDelta):
+                    held.append(ev.text)
+                    continue
                 finished = finished or isinstance(ev, Done)
                 yield ev
-            if self._interrupted and not finished:
-                self._log("info", "本轮被打断，停止播报（云端继续做，做完再汇报）")
-                self._start_watch(tracker)
-                yield Done(session_id=bot_id, interrupted=True)
+            if self._interrupted:
+                if not finished:
+                    self._log("info", "本轮被打断，停止播报（云端继续做，做完再汇报）")
+                self._start_watch(tracker, held)
+                if not finished:
+                    yield Done(session_id=bot_id, interrupted=True)
         except asyncio.CancelledError:
             # 打断时正卡在慢请求里，被上层强制取消：一样转后台盯着
-            self._start_watch(tracker)
+            self._start_watch(tracker, held)
             raise
         except AgentSessionError as e:
             yield Error(e.kind, e.detail, voice=voice_for(e.kind))
         except GrokBotError as e:
             yield Error(e.kind, e.detail, voice=voice_for(e.kind))
-        finally:
-            self._in_turn = False
 
 
     async def hand_off(self, text: str) -> None:

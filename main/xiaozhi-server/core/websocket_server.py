@@ -33,6 +33,7 @@ _setup_websockets_logger()
 from core.connection import ConnectionHandler
 from config.config_loader import get_config_from_api_async
 from core.auth import AuthManager, AuthenticationError
+from core.utils import tts_phrase_cache
 from core.utils.modules_initialize import initialize_modules
 from core.utils.util import check_vad_update, check_asr_update
 
@@ -59,6 +60,9 @@ class WebSocketServer:
         self._llm = modules["llm"] if "llm" in modules else None
         self._intent = modules["intent"] if "intent" in modules else None
         self._memory = modules["memory"] if "memory" in modules else None
+        # [xiaozhi-hub] 提示语（"交给 Grok Bot 了"等）先在后台合成好，用到时不用现合成
+        if "TTS" in self.config["selected_module"]:
+            tts_phrase_cache.prewarm(self.config)
 
         auth_config = self.config["server"].get("auth", {})
         self.auth_enable = auth_config.get("enabled", False)

@@ -35,6 +35,11 @@ class TTSProvider(TTSProviderBase):
         self.edge_rate = f"{self.speech_rate:+}%"
         self.edge_volume = f"{self.volume:+}%"
         self.edge_pitch = f"{self.pitch_rate:+}Hz"
+        # [xiaozhi-hub] 调大音量不交给 Edge：它把波形整体放大，响的字会被硬削顶（"+50%" 时峰值冲到满幅的 1.15 倍），
+        # 设备上听到字中间轻轻"咔"一下。按原音量合成，解码后由网关加增益、平滑压峰（core/utils/pcm_gain.py）
+        if self.volume > 0 and delete_audio_file and self.audio_file_type == "mp3":
+            self.post_gain = 1 + self.volume / 100
+            self.edge_volume = "+0%"
 
     def generate_filename(self, extension=".mp3"):
         return os.path.join(

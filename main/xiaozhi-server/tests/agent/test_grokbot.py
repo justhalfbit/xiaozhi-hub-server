@@ -931,7 +931,7 @@ async def test_voice_hint_appended_and_echo_by_content(cloud, hub):
 
 def test_provider_defaults_filler_delay_and_hint(provider):
     p0 = grok_mod.LLMProvider({"bot_id": "b", "bot_name": "x"})
-    assert p0.filler_delay == 4 and p0.session_config.voice_hint == grok_mod.DEFAULT_VOICE_HINT
+    assert p0.filler_delay == 6 and p0.session_config.voice_hint == grok_mod.DEFAULT_VOICE_HINT
     p = grok_mod.LLMProvider({"bot_id": "b", "bot_name": "x", "voice_hint": "", "filler_delay_seconds": 1})
     assert p.session_config.voice_hint == "" and p.filler_delay == 1
 

@@ -7,6 +7,9 @@ from core.providers.tts.base import TTSProviderBase
 # 最小 stub：仅需满足抽象方法实例化要求；object.__new__ 会绕过
 # abstractmethod 检查，若基类新增抽象方法这里不会自动报错，属预期（测试不调用）
 class _TTS(TTSProviderBase):
+    # 这里只测引号；短段合并（MIN_SEGMENT_CHARS）另见 test_short_segment_merge.py
+    MIN_SEGMENT_CHARS = 0
+
     async def text_to_speak(self, text, output_file):
         return None
 

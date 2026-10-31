@@ -13,7 +13,7 @@ import numpy as np
 import opuslib_next
 from io import BytesIO
 from contextlib import contextmanager
-from core.utils import p3
+from core.utils import p3, mp3_decode
 from pydub import AudioSegment
 from typing import Callable, Any
 
@@ -386,14 +386,23 @@ def audio_bytes_to_data_stream(
         # 直接用p3解码
         return p3.decode_opus_from_bytes_stream(audio_bytes, callback)
     else:
-        # 其他格式用pydub
-        with _ffmpeg_path_override():
-            audio = AudioSegment.from_file(
-                BytesIO(audio_bytes), format=file_type, parameters=["-nostdin"]
-            )
-        audio = audio.set_channels(1).set_frame_rate(sample_rate).set_sample_width(2)
-        raw_data = audio.raw_data
+        raw_data = decode_audio_bytes(audio_bytes, file_type, sample_rate)
         pcm_to_data_stream(raw_data, is_opus, callback, sample_rate, opus_encoder)
+
+
+def decode_audio_bytes(audio_bytes, file_type, sample_rate=16000) -> bytes:
+    """[xiaozhi-hub] 音频文件字节 → 16 位单声道 PCM。MP3 先用进程内的 libmpg123（快），不行再用 ffmpeg。"""
+    if file_type == "mp3":
+        raw_data = mp3_decode.decode_mp3(audio_bytes, sample_rate)
+        if raw_data is not None:
+            return raw_data
+    # 其他格式用pydub
+    with _ffmpeg_path_override():
+        audio = AudioSegment.from_file(
+            BytesIO(audio_bytes), format=file_type, parameters=["-nostdin"]
+        )
+    audio = audio.set_channels(1).set_frame_rate(sample_rate).set_sample_width(2)
+    return audio.raw_data
 
 
 def pcm_to_data_stream(raw_data, is_opus=True, callback: Callable[[Any], Any] = None, sample_rate=16000, opus_encoder=None):

@@ -13,12 +13,12 @@ from core.utils import textUtils
 from typing import Callable, Any, Optional
 from abc import ABC, abstractmethod
 from config.logger import setup_logging
-from core.utils import opus_encoder_utils
+from core.utils import opus_encoder_utils, pcm_gain, tts_phrase_cache
 from core.utils.tts import MarkdownCleaner, convert_percentage_to_range
 from core.utils.output_counter import add_device_output
 from core.handle.reportHandle import enqueue_tts_report
 from core.handle.sendAudioHandle import sendAudioMessage
-from core.utils.util import audio_bytes_to_data_stream, audio_to_data_stream
+from core.utils.util import audio_bytes_to_data_stream, audio_to_data_stream, decode_audio_bytes, pcm_to_data_stream
 from core.providers.tts.dto.dto import (
     TTSMessageDTO,
     SentenceType,
@@ -31,6 +31,9 @@ logger = setup_logging()
 
 
 class TTSProviderBase(ABC):
+    # [xiaozhi-hub] 解码后再乘的增益（子类把调大音量从合成服务挪到这里时设置，见 edge.py）
+    post_gain = 1.0
+
     def __init__(self, config, delete_audio_file):
         self.interface_type = InterfaceType.NON_STREAM
         self.conn = None
@@ -130,7 +133,41 @@ class TTSProviderBase(ABC):
         if self._correct_words_pattern:
             text = self._correct_words_pattern.sub(lambda m: self.correct_words[m.group(0)], text)
         max_repeat_time = 5
-        if self.delete_audio_file:
+        if self.delete_audio_file and self.audio_file_type != "p3":
+            # [xiaozhi-hub] 合成 → 进程内解码成 PCM（短句走缓存）→ 用本连接的编码器编成 Opus
+            while max_repeat_time > 0:
+                try:
+                    pcm = self._synthesize_pcm(text, self.conn.sample_rate)
+                    if pcm:
+                        # 使用原始文本用于显示/上报
+                        self.tts_audio_queue.put((SentenceType.FIRST, None, original_text, getattr(self, 'current_sentence_id', None)))
+                        packets = []
+                        pcm_to_data_stream(
+                            pcm,
+                            is_opus=True,
+                            callback=lambda p: (packets.append(1), opus_handler(p)),
+                            sample_rate=self.conn.sample_rate,
+                            opus_encoder=self.opus_encoder,
+                        )
+                        logger.bind(tag=TAG).info(f"本段合成 {len(packets)} 包: {original_text[:20]}")
+                        break
+                    else:
+                        max_repeat_time -= 1
+                except Exception as e:
+                    logger.bind(tag=TAG).warning(
+                        f"语音生成失败{5 - max_repeat_time + 1}次: {original_text}，错误: {e}"
+                    )
+                    max_repeat_time -= 1
+            if max_repeat_time > 0:
+                logger.bind(tag=TAG).info(
+                    f"语音生成成功: {original_text}，重试{5 - max_repeat_time}次"
+                )
+            else:
+                logger.bind(tag=TAG).error(
+                    f"语音生成失败: {original_text}，请检查网络或服务是否正常"
+                )
+            return None
+        elif self.delete_audio_file:
             # 需要删除文件的直接转为音频数据
             while max_repeat_time > 0:
                 try:
@@ -192,6 +229,26 @@ class TTSProviderBase(ABC):
                 logger.bind(tag=TAG).error(f"Failed to generate TTS file: {e}")
                 return None
     
+    def _synthesize_pcm(self, text, sample_rate) -> Optional[bytes]:
+        """[xiaozhi-hub] 合成一段（已清理、已替换词的文本）并解码成 16 位单声道 PCM；短句先查缓存。"""
+        k = tts_phrase_cache.key(self, text, sample_rate)
+        pcm = tts_phrase_cache.get(k)
+        if pcm is None:
+            audio_bytes = asyncio.run(self.text_to_speak(text, None))
+            if not audio_bytes:
+                return None
+            pcm = decode_audio_bytes(audio_bytes, self.audio_file_type, sample_rate)
+            pcm = pcm_gain.apply_gain(pcm, self.post_gain, sample_rate)
+            tts_phrase_cache.put(k, pcm)
+        return pcm
+
+    def synthesize_pcm(self, text, sample_rate=16000) -> Optional[bytes]:
+        """[xiaozhi-hub] 和 to_tts_stream 一样清理、替换词后合成（预先合成提示语用）。"""
+        text = MarkdownCleaner.clean_markdown(text)
+        if self._correct_words_pattern:
+            text = self._correct_words_pattern.sub(lambda m: self.correct_words[m.group(0)], text)
+        return self._synthesize_pcm(text, sample_rate)
+
     def to_tts(self, text):
         # 保留原始文本用于日志/显示
         original_text = text
@@ -199,7 +256,26 @@ class TTSProviderBase(ABC):
         if self._correct_words_pattern:
             text = self._correct_words_pattern.sub(lambda m: self.correct_words[m.group(0)], text)
         max_repeat_time = 5
-        if self.delete_audio_file:
+        if self.delete_audio_file and self.audio_file_type != "p3":
+            # [xiaozhi-hub] 和 to_tts_stream 一样走 PCM（缓存、进程内解码、增益），用临时编码器编成一组 Opus 包
+            while max_repeat_time > 0:
+                try:
+                    pcm = self._synthesize_pcm(text, self.conn.sample_rate)
+                    if pcm:
+                        audio_datas = []
+                        pcm_to_data_stream(pcm, True, audio_datas.append, self.conn.sample_rate)
+                        return audio_datas
+                    max_repeat_time -= 1
+                except Exception as e:
+                    logger.bind(tag=TAG).warning(
+                        f"语音生成失败{5 - max_repeat_time + 1}次: {original_text}，错误: {e}"
+                    )
+                    max_repeat_time -= 1
+            logger.bind(tag=TAG).error(
+                f"语音生成失败: {original_text}，请检查网络或服务是否正常"
+            )
+            return None
+        elif self.delete_audio_file:
             # 需要删除文件的直接转为音频数据
             while max_repeat_time > 0:
                 try:
@@ -545,6 +621,14 @@ class TTSProviderBase(ABC):
             return end - 1
         return -1
 
+    # [xiaozhi-hub] 少于这么多个字（不算空格、标点、表情）的段并到下一段
+    MIN_SEGMENT_CHARS = 6
+
+    @classmethod
+    def _too_short(cls, segment_raw: str) -> bool:
+        text = textUtils.get_string_no_punctuation_or_emoji(segment_raw)
+        return len(re.sub(r"\s", "", text)) < cls.MIN_SEGMENT_CHARS
+
     def _get_segment_text(self) -> Optional[str]:
         # 合并当前全部文本并处理未分割部分
         full_text = "".join(self.tts_text_buff)
@@ -569,6 +653,18 @@ class TTSProviderBase(ABC):
         if last_punct_pos != -1:
             cut_pos = self._quote_safe_cut(
                 current_text, last_punct_pos, punctuations_to_use
+            )
+        # [xiaozhi-hub] 太短的段（"好，""嗯。"）不单独合成，并到后面一起：每段合成都有固定开销，
+        # 段越碎句间停顿越多。顺延到下一个能切的标点，没有就等后面的文字（最后由 flush 兜底）
+        while cut_pos != -1 and self._too_short(current_text[: cut_pos + 1]):
+            nxt = next(
+                (i for i in range(cut_pos + 1, len(current_text)) if current_text[i] in punctuations_to_use),
+                -1,
+            )
+            cut_pos = (
+                self._quote_safe_cut(current_text, nxt, punctuations_to_use)
+                if nxt != -1
+                else -1
             )
         if cut_pos != -1:
             segment_text_raw = current_text[: cut_pos + 1]

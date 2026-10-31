@@ -335,6 +335,11 @@ async def send_tts_message(conn: "ConnectionHandler", state, text=None):
         if current_sentence_id != conn.sentence_id:
             return
 
+        # [xiaozhi-hub] 这轮实际发给设备的音频包数，和合成出来的包数对照，查丢尾巴
+        conn.logger.bind(tag=TAG).info(
+            f"本轮音频发送完毕：已发 {getattr(conn, 'audio_flow_control', {}).get('packet_count', 0)} 包，"
+            f"流控队列剩 {len(conn.audio_rate_controller.queue) if getattr(conn, 'audio_rate_controller', None) else 0} 包"
+        )
         # 停止音频发送循环（仅在流控器已初始化时调用）
         if hasattr(conn, "audio_rate_controller") and conn.audio_rate_controller:
             conn.audio_rate_controller.stop_sending()

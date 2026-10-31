@@ -369,7 +369,8 @@ class LLMProvider(LLMProviderBase):
                 st.idle_handle = None
             try:
                 if await self._ensure_agent(st, text, out, system_prompt):
-                    self.store.touch(st.key, st.agent.session_id)
+                    if st.agent:  # grok_bot 在连接已关闭时把话交出去后也返回 True，那时没有会话
+                        self.store.touch(st.key, st.agent.session_id)
                     return
                 agent, recorded, working, failed, previous = st.agent, False, False, False, None
                 async for ev in agent.send(text):

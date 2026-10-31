@@ -185,7 +185,8 @@ class LLMProvider(AgentProvider):
                 logger.bind(tag=TAG).info(f"Grok Bot「{self.bot_name}」会话就绪前设备已断开，照样发出去，做完再汇报")
                 await agent.hand_off(text)
                 await agent.close()
-                raise AgentSessionError(ErrorKind.PROCESS_EXITED, "连接已关闭")
+                out.put(Done(interrupted=True))
+                return True
             st.agent = agent
             logger.bind(tag=TAG).info(f"Grok Bot「{self.bot_name}」会话已就绪（{time.time() - t0:.1f}s），设备 {st.key}")
         if getattr(st, "abort_gen", None) == st.turn_gen:

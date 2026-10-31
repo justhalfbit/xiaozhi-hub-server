@@ -178,7 +178,7 @@ def test_save_tts_voice(cfg_path):
 
 def test_save_vad_silence(cfg_path):
     v = pages.describe_asr(merged(cfg_path))["vad"]
-    assert v["selected"] == "SileroVAD" and v["supported"] and v["silence_ms"] == 800
+    assert v["selected"] == "SileroVAD" and v["supported"] and v["silence_ms"] == 600
     for bad in ("abc", "100", "6000", "1.5"):
         with pytest.raises(ValueError, match="200～5000"):
             pages.save_vad_silence(bad, merged(cfg_path), cfg_path)

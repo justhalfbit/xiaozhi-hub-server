@@ -633,8 +633,9 @@ VAD:
     threshold: 0.5
     threshold_low: 0.3
     model_dir: models/snakers4_silero-vad
-    # [xiaozhi-hub] 原为 200，稍一停顿就被当成说完；改为 800。也可以在管理后台“语音识别”页调整
-    min_silence_duration_ms: 800  # 如果说话停顿比较长，可以把这个值设置大一些
+    # [xiaozhi-hub] 原为 200，稍一停顿就被当成说完；改为 800，后来为了说完更快出字改为 600（每句快 0.2 秒）。
+    # 话说到一半被截断就调大。也可以在管理后台“语音识别”页调整
+    min_silence_duration_ms: 600  # 如果说话停顿比较长，可以把这个值设置大一些
 
 LLM:
   # 所有openai类型均可以修改超参，以AliLLM为例

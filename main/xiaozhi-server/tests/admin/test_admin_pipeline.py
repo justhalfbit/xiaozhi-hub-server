@@ -55,7 +55,7 @@ def marks(text):
 def test_stages_follow_config(cli_path):
     stages = {s["id"]: s for s in pipeline.describe_flow(merged(cli_path))["stages"]}
     assert list(stages) == ["listen", "asr", "llm", "tts", "play"]
-    assert stages["listen"]["value"] == "停顿 800ms 算说完"  # config.yaml 里 SileroVAD 的 min_silence_duration_ms
+    assert stages["listen"]["value"] == "停顿 600ms 算说完"  # config.yaml 里 SileroVAD 的 min_silence_duration_ms
     assert stages["llm"]["value"] == "Claude Code · Haiku" and stages["llm"]["hint"] == "思考力度：低"
     assert stages["play"]["value"] == "缓冲约 0.9 秒" and stages["play"]["page"] is None
     assert {s["page"] for s in stages.values()} == {"asr", "llm", "tts", None}  # 点击跳到对应的设置页

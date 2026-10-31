@@ -24,11 +24,13 @@ def start_turn(conn, sid, question="讲个故事"):
     return user
 
 
-def speak(conn, sid, sentences):
-    """sentences: [(文字, 包数)]，按顺序发给设备。"""
+def speak(conn, sid, sentences, last=True):
+    """sentences: [(文字, 包数)]，按顺序发给设备；last：这轮的音频到此为止。"""
     for text, packets in sentences:
         reply_progress.note_audio(conn, sid, text, None)          # FIRST：只有文字
         reply_progress.note_audio(conn, sid, None, [PKT] * packets)  # MIDDLE：音频
+    if last:
+        reply_progress.note_audio(conn, sid, None, [], last=True)  # LAST
 
 
 def contents(conn):
@@ -40,8 +42,20 @@ def test_heard_text_whole_sentences_then_proportional_cut():
     speak(conn, "t1", [("从前有座山", 10), ("山里有座庙", 10)])  # 0–600ms、600–1200ms
     assert reply_progress.heard_text(conn, 0) == ("", False)
     assert reply_progress.heard_text(conn, 600) == ("从前有座山", False)
-    assert reply_progress.heard_text(conn, 840) == ("从前有座山山里", False)  # 第二句播了 40%
-    assert reply_progress.heard_text(conn, 1200) == ("从前有座山山里有座庙", True)
+    assert reply_progress.heard_text(conn, 840) == ("从前有座山，山里", False)  # 第二句播了 40%
+    assert reply_progress.heard_text(conn, 1200) == ("从前有座山，山里有座庙", True)
+
+
+def test_all_sent_audio_played_is_not_the_whole_reply():
+    # 打断时后面的句子还没合成出来：已发出的都播完了，也不算播完
+    conn = make_conn()
+    start_turn(conn, "t1")
+    speak(conn, "t1", [("好呀", 5)], last=False)
+    assert reply_progress.heard_text(conn, 2000) == ("好呀", False)
+    conn.dialogue.put(Message(role="assistant", content="好呀，从前有只小猫……故事讲完啦。"))
+    reply_progress.finish_turn(conn, "t1")
+    reply_progress.cut(conn, played_ms=2000)
+    assert contents(conn)[-1] == ("assistant", "好呀……")
 
 
 def test_new_turn_forgets_previous_audio():
@@ -106,7 +120,7 @@ def test_tool_turn_keeps_tool_calls_and_one_reply():
         ("user", "调大音量再讲个笑话", None),
         ("assistant", None, [{"id": "c1"}]),
         ("tool", "ok", None),
-        ("assistant", "好的音量调好了……", None),
+        ("assistant", "好的，音量调好了……", None),
     ]
 
 

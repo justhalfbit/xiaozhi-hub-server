@@ -22,6 +22,7 @@ from core.utils.dialogue import Message
 FRAME_MS = 60
 KEEP_TURNS = 5
 CUT_MARK = "……"
+PUNCT = set("，。！？；：、,.!?;:…")
 
 _lock = threading.Lock()
 
@@ -42,12 +43,13 @@ def note_turn(conn, sentence_id, user_msg) -> None:
             del turns[old]
 
 
-def note_audio(conn, sentence_id, text, audios) -> None:
-    """一段回复音频要发给设备了（text 不为空表示新的一句从这里开始）。"""
+def note_audio(conn, sentence_id, text, audios, last=False) -> None:
+    """一段回复音频要发给设备了（text 不为空表示新的一句从这里开始，last 表示这轮的音频到此为止）。"""
     sid = sentence_id or conn.sentence_id
     st = getattr(conn, "reply_audio", None)
     if st is None or st["sid"] != sid:
-        st = conn.reply_audio = {"sid": sid, "sentences": [], "total_ms": 0}
+        st = conn.reply_audio = {"sid": sid, "sentences": [], "total_ms": 0, "ended": False}
+    st["ended"] = st["ended"] or last
     if text:
         st["sentences"].append([st["total_ms"], str(text)])
     if audios:
@@ -64,7 +66,9 @@ def estimate_played_ms(conn) -> float:
 
 
 def heard_text(conn, played_ms):
-    """这一轮已经播出去的文字和整轮有没有播完：(text, complete)。"""
+    """这一轮已经播出去的文字和整轮有没有播完：(text, complete)。
+
+    后面的句子常常还没合成出来：已发出的都播完了也不算播完，要这轮的音频发到了最后（ended）。"""
     st = getattr(conn, "reply_audio", None)
     if st is None or st["sid"] != conn.sentence_id:
         return "", False
@@ -79,8 +83,16 @@ def heard_text(conn, played_ms):
             n = int(len(text) * (played_ms - start) / (end - start))
             if n > 0:
                 parts.append(text[:n])
-        return "".join(parts), False
-    return "".join(parts), True
+        return _join(parts), False
+    return _join(parts), st["ended"]
+
+
+def _join(parts) -> str:
+    # 合成时每句去掉了句末标点，拼回去时补一个逗号
+    out = ""
+    for p in parts:
+        out += ("" if not out or out[-1] in PUNCT else "，") + p
+    return out
 
 
 def cut(conn, played_ms=None) -> None:

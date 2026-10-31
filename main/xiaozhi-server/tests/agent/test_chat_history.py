@@ -420,7 +420,11 @@ def spoken(monkeypatch):
         said.append("<clear>")
         return {"deleted": 3, "grok": []}
 
+    async def fake_notify(conn):
+        said.append("<notify>")
+
     monkeypatch.setattr(clear_command, "_speak", fake_speak)
+    monkeypatch.setattr(clear_command, "_notify_cleared", fake_notify)
     monkeypatch.setattr(clear_command, "clear_now", fake_clear)
     return said
 
@@ -430,7 +434,7 @@ def test_voice_clear_asks_first_then_clears(spoken):
     assert run(clear_command.handle(conn, "清除聊天记录")) is None
     assert spoken == [clear_command.ASK]
     assert run(clear_command.handle(conn, "确定")) is None
-    assert spoken[1:] == ["<clear>", clear_command.DONE]
+    assert spoken[1:] == ["<clear>", "<notify>", clear_command.DONE]
     # 确认只算一次
     assert run(clear_command.handle(conn, "确定")) == "确定"
 
@@ -523,3 +527,16 @@ def test_handler_puts_summary_memory_in_system_prompt():
     h = make_handler(llm)
     h.chat("你好")
     assert "- 用户叫小明" in llm.seen[0][0]["content"]
+
+
+def test_notify_cleared_message():
+    sent_msgs = []
+
+    class WS:
+        async def send(self, data):
+            sent_msgs.append(json.loads(data))
+
+    conn = make_conn()
+    conn.websocket = WS()
+    run(clear_command._notify_cleared(conn))
+    assert sent_msgs == [{"type": "chat_history", "state": "cleared", "session_id": "s-dev-1"}]

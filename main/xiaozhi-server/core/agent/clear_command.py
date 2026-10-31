@@ -5,6 +5,7 @@
 """
 
 import asyncio
+import json
 import re
 import time
 import uuid
@@ -69,7 +70,9 @@ async def handle(conn: "ConnectionHandler", text: str):
         conn.chat_clear_asked = 0
         if time.monotonic() - pending < CONFIRM_SECONDS:
             if is_confirm(text):
-                await _speak(conn, text, result_text(await clear_now(conn)))
+                result = await clear_now(conn)
+                await _notify_cleared(conn)
+                await _speak(conn, text, result_text(result))
                 return None
             if is_cancel(text):
                 await _speak(conn, text, KEPT)
@@ -98,6 +101,15 @@ async def clear_now(conn: "ConnectionHandler") -> dict:
     config = llm_router._server_config(conn)
     return await asyncio.get_running_loop().run_in_executor(
         None, lambda: chat_history.clear(device, config, connections=online))
+
+
+async def _notify_cleared(conn: "ConnectionHandler") -> None:
+    """告诉设备记录清掉了（带屏幕的设备据此清空聊天页）。不认识这条消息的设备会忽略它。"""
+    try:
+        await conn.websocket.send(json.dumps({"type": "chat_history", "state": "cleared",
+                                              "session_id": conn.session_id}))
+    except Exception as e:
+        conn.logger.bind(tag=TAG).warning(f"通知设备聊天记录已清除失败: {e}")
 
 
 async def _speak(conn: "ConnectionHandler", heard: str, reply: str) -> bool:

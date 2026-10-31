@@ -7,11 +7,12 @@
 - 普通 HTTP 模型：新连接（或切到这个模型）时从库里载入这台设备这个模型最近 max_messages 条（load），
   每次发给模型时再按"最近 max_messages 条 + 约 max_tokens 个 token"截一个窗口（select_window）。
   窗口只从用户的话开始切，工具调用、工具结果和后面的回复跟着它那句话走，不会拆开；
-- 被窗口截掉的部分在后台增量总结成一段记忆（summarize），放进系统提示的 <memory>。
+- 被窗口截掉的部分在后台增量总结成一段记忆（summarize），放进系统提示的 <memory>。记忆按设备一份，
+  这台设备所有普通 API 模型共用（记的是关于用户的事）；管理后台能查看、手改、清空（set_memory，马上生效）。
   只拿库里的真实对话去总结：上游 mem_local_short 把整份 dialogue 交给模型，工具调用示例（假对话）会混进记忆；
 - Claude Code、Grok Bot 的上下文在它们自己的会话里（网关只发最后一句），这里只存记录给屏幕显示，
   不载入、不截断、不总结；
-- 清除（clear）：删库里这台设备的记录和记忆、清在线连接的对话，Claude Code 删掉会话映射并关掉进程（下次新开会话），
+- 清除（clear）：删库里这台设备的记录、清空记忆、清在线连接的对话，Claude Code 删掉会话映射并关掉进程（下次新开会话），
   Grok Bot 调云端的"重置对话"（Bot、它的记忆和文件都保留，对话从头开始）。
 
 配置（config.yaml 的 chat_history）：enabled、max_messages、max_tokens、summary、summary_min、summary_chars、
@@ -54,7 +55,7 @@ SUMMARY_PROMPT = """你负责给一个语音助手维护关于用户的长期记
 _db = None
 _db_lock = threading.Lock()
 _sync_lock = threading.RLock()
-_summarizing = set()  # 正在总结的 (device, model)
+_summarizing = set()  # 正在总结的设备
 _summarizing_lock = threading.Lock()
 
 
@@ -108,16 +109,43 @@ class ChatDB:
                 created REAL NOT NULL
             );
             CREATE INDEX IF NOT EXISTS messages_device_model ON messages (device, model, id);
-            CREATE TABLE IF NOT EXISTS memories (
+            CREATE TABLE IF NOT EXISTS device_memory (
+                device TEXT PRIMARY KEY,
+                summary TEXT NOT NULL DEFAULT '',
+                version INTEGER NOT NULL DEFAULT 0,
+                source TEXT NOT NULL DEFAULT '',
+                updated REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS memory_progress (
                 device TEXT NOT NULL,
                 model TEXT NOT NULL,
-                summary TEXT NOT NULL DEFAULT '',
                 upto INTEGER NOT NULL DEFAULT 0,
-                updated REAL NOT NULL,
                 PRIMARY KEY (device, model)
             );
             """
         )
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """早期按"设备 + 模型"各存一份记忆（memories 表）：合并成每台设备一份，进度按模型留着。"""
+        if not self._conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='memories'").fetchone():
+            return
+        rows = self._conn.execute("SELECT device, model, summary, upto, updated FROM memories ORDER BY device, updated").fetchall()
+        merged = {}
+        self._conn.execute("BEGIN")
+        for device, model, summary, upto, updated in rows:
+            parts, last = merged.get(device, ([], 0))
+            if summary:
+                parts.append(summary)
+            merged[device] = (parts, max(last, updated))
+            self._conn.execute("INSERT OR REPLACE INTO memory_progress (device, model, upto) VALUES (?,?,?)",
+                               (device, model, upto))
+        for device, (parts, updated) in merged.items():
+            self._conn.execute("INSERT OR REPLACE INTO device_memory (device, summary, version, source, updated) "
+                               "VALUES (?,?,1,'summary',?)", (device, "\n".join(parts), updated))
+        self._conn.execute("DROP TABLE memories")
+        self._conn.execute("COMMIT")
+        logger.bind(tag=TAG).info(f"记忆合并成每台设备一份：{len(merged)} 台设备")
 
     def _exec(self, sql: str, args=()):
         with self._lock:
@@ -159,24 +187,58 @@ class ChatDB:
     def models(self, device) -> List[str]:
         return [r[0] for r in self._exec("SELECT DISTINCT model FROM messages WHERE device=?", (device,)).fetchall()]
 
-    def memory(self, device, model) -> dict:
-        r = self._exec("SELECT summary, upto FROM memories WHERE device=? AND model=?", (device, model)).fetchone()
-        return {"summary": r[0], "upto": r[1]} if r else {"summary": "", "upto": 0}
+    def memory(self, device) -> dict:
+        """这台设备的记忆：{summary, version, source, updated}。version 每写一次加 1（总结时据此判断期间有没有被改过）；
+        source：summary（自动总结）、manual（后台手改）、cleared（被清空）。"""
+        r = self._exec("SELECT summary, version, source, updated FROM device_memory WHERE device=?", (device,)).fetchone()
+        return {"summary": r[0], "version": r[1], "source": r[2], "updated": r[3]} if r else \
+            {"summary": "", "version": 0, "source": "", "updated": None}
 
-    def set_memory(self, device, model, summary: str, upto: int) -> None:
-        self._exec(
-            "INSERT INTO memories (device, model, summary, upto, updated) VALUES (?,?,?,?,?) "
-            "ON CONFLICT (device, model) DO UPDATE SET summary=excluded.summary, upto=excluded.upto, updated=excluded.updated",
-            (device, model, summary, int(upto), time.time()))
+    def progress(self, device) -> Dict[str, int]:
+        """每个模型的消息总结到了哪条（id）。"""
+        rows = self._exec("SELECT model, upto FROM memory_progress WHERE device=?", (device,)).fetchall()
+        return {m: u for m, u in rows}
+
+    def set_memory(self, device, summary: str, source: str, expect_version: int = None, progress: dict = None) -> bool:
+        """写记忆（版本加 1）和总结进度。expect_version 不为空时，记忆期间被改过（版本变了）就不写，返回 False。"""
+        with self._lock:
+            c = self._conn
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                r = c.execute("SELECT version FROM device_memory WHERE device=?", (device,)).fetchone()
+                version = r[0] if r else 0
+                if expect_version is not None and version != expect_version:
+                    c.execute("ROLLBACK")
+                    return False
+                c.execute("INSERT INTO device_memory (device, summary, version, source, updated) VALUES (?,?,?,?,?) "
+                          "ON CONFLICT (device) DO UPDATE SET summary=excluded.summary, version=excluded.version, "
+                          "source=excluded.source, updated=excluded.updated",
+                          (device, summary, version + 1, source, time.time()))
+                for model, upto in (progress or {}).items():
+                    c.execute("INSERT INTO memory_progress (device, model, upto) VALUES (?,?,?) "
+                              "ON CONFLICT (device, model) DO UPDATE SET upto=excluded.upto", (device, model, int(upto)))
+                c.execute("COMMIT")
+                return True
+            except BaseException:
+                c.execute("ROLLBACK")
+                raise
+
+    def memory_devices(self) -> List[str]:
+        rows = self._exec("SELECT device FROM device_memory UNION SELECT DISTINCT device FROM messages").fetchall()
+        return sorted(r[0] for r in rows)
 
     def clear(self, device) -> int:
+        """删这台设备的记录、总结进度，记忆清空（留着那一行并把版本加 1：正在进行的总结写不回来）。"""
         n = self._exec("DELETE FROM messages WHERE device=?", (device,)).rowcount
-        self._exec("DELETE FROM memories WHERE device=?", (device,))
+        self._exec("DELETE FROM memory_progress WHERE device=?", (device,))
+        if self.memory(device)["version"]:
+            self.set_memory(device, "", "cleared")
         return n
 
     def clear_memory(self, device) -> None:
-        """只清记忆：总结清空，但记住总结到哪了，截掉的旧对话不会再被总结回来。"""
-        self._exec("UPDATE memories SET summary='', updated=? WHERE device=?", (time.time(), device))
+        """只清记忆：总结清空，但总结进度留着，截掉的旧对话不会再被总结回来。"""
+        if self.memory(device)["version"]:
+            self.set_memory(device, "", "cleared")
 
     def close(self) -> None:
         with self._lock:
@@ -332,21 +394,28 @@ def sync_all(conn) -> None:
 
 
 # ---------- 记忆 ----------
+# 记的是"关于用户"的事，同一台设备的所有普通 API 模型共用一份（切模型后也知道）；Claude Code、Grok Bot 不总结、不注入。
+# 记录本身仍按设备 + 模型分开存、分开截窗口；总结进度按模型记（memory_progress），一次总结把各模型截掉的部分一起合进去。
+# 同一台设备同一时间只跑一个总结（_summarizing 按设备）；写回时比对版本，期间被后台手改或清除过就丢弃这次结果。
 
 def memory_for(conn) -> str:
     key = getattr(getattr(conn, "dialogue", None), "chat_key", None)
-    if not key or not settings(_conn_config(conn))["summary"]:
+    config = _conn_config(conn)
+    if not key or not settings(config)["summary"] or is_agent(config, key[1]):
         return ""
     try:
-        return db().memory(*key)["summary"]
+        return db().memory(key[0])["summary"]
     except Exception as e:
         logger.bind(tag=TAG).error(f"读取记忆失败: {e}")
         return ""
 
 
 def _transcript(rows: List[dict]) -> str:
-    lines = []
+    lines, model = [], None
     for r in rows:
+        if r.get("model") != model:
+            model = r.get("model")
+            lines.append(f"（和 {model} 的对话）")
         content = _display_text(r["content"]) if r["role"] in ("user", "assistant") else (r["content"] or "")
         if r["role"] == "user":
             lines.append(f"用户：{content}")
@@ -360,18 +429,24 @@ def _transcript(rows: List[dict]) -> str:
     return "\n".join(lines)
 
 
-def pending_summary(device: str, name: str, cfg: dict):
-    """被窗口截掉、还没总结的消息：(rows, 已有记忆)。"""
+def pending_summary(device: str, cfg: dict, config: dict):
+    """各普通 API 模型被窗口截掉、还没总结的消息：(rows（带 model，按模型再按 id 排）, 已有记忆)。"""
     store = db()
-    mem = store.memory(device, name)
-    rows = store.after(device, name, mem["upto"])
-    start = select_window(rows, int(cfg["max_messages"]), int(cfg["max_tokens"]))
-    return rows[:start][:SUMMARY_BATCH], mem
+    mem = store.memory(device)
+    progress = store.progress(device)
+    batch = []
+    for name in sorted(store.models(device)):
+        if is_agent(config, name):
+            continue
+        rows = store.after(device, name, progress.get(name, 0))
+        start = select_window(rows, int(cfg["max_messages"]), int(cfg["max_tokens"]))
+        batch += [{**r, "model": name} for r in rows[:start]]
+    return batch[:SUMMARY_BATCH], mem
 
 
-def summarize_now(llm, device: str, name: str, cfg: dict) -> bool:
+def summarize_now(llm, device: str, cfg: dict, config: dict) -> bool:
     """同步执行一次总结。返回有没有更新记忆。"""
-    rows, mem = pending_summary(device, name, cfg)
+    rows, mem = pending_summary(device, cfg, config)
     if not rows:
         return False
     prompt = (f"【已有记忆】\n{mem['summary'] or '无'}\n\n【较早的对话】\n{_transcript(rows)}")
@@ -383,12 +458,15 @@ def summarize_now(llm, device: str, name: str, cfg: dict) -> bool:
         text = mem["summary"]
     limit = int(cfg["summary_chars"]) * 2
     store = db()
-    if store.memory(device, name)["upto"] != mem["upto"]:
-        return False  # 总结期间被清除了
+    progress = {}
+    for r in rows:
+        progress[r["model"]] = max(progress.get(r["model"], 0), r["id"])
     if not store.exists(rows[-1]["id"]):
         return False  # 这批记录已被清除
-    store.set_memory(device, name, text[:limit], rows[-1]["id"])
-    logger.bind(tag=TAG).info(f"设备 {device} 模型 {name}：总结了 {len(rows)} 条较早的对话，记忆 {len(text)} 字")
+    if not store.set_memory(device, text[:limit], "summary", expect_version=mem["version"], progress=progress):
+        logger.bind(tag=TAG).info(f"设备 {device}：总结期间记忆被修改或清除，这次的结果不要了")
+        return False
+    logger.bind(tag=TAG).info(f"设备 {device}：总结了 {len(rows)} 条较早的对话（{'、'.join(progress)}），记忆 {len(text)} 字")
     return True
 
 
@@ -399,26 +477,52 @@ def maybe_summarize(conn) -> None:
     cfg = settings(config)
     if not key or not cfg["summary"] or is_agent(config, key[1]):
         return
+    device = key[0]
     with _summarizing_lock:
-        if key in _summarizing:
+        if device in _summarizing:
             return
-        _summarizing.add(key)
+        _summarizing.add(device)
 
     def run():
         try:
-            rows, _ = pending_summary(key[0], key[1], cfg)
+            rows, _ = pending_summary(device, cfg, config)
             if len(rows) < int(cfg["summary_min"]):
                 return
             llm = _summary_llm(conn, key[1], cfg)
             if llm is not None:
-                summarize_now(llm, key[0], key[1], cfg)
+                summarize_now(llm, device, cfg, config)
         except Exception as e:
             logger.bind(tag=TAG).error(f"总结聊天记录失败: {e}")
         finally:
             with _summarizing_lock:
-                _summarizing.discard(key)
+                _summarizing.discard(device)
 
     threading.Thread(target=run, name="chat-summary", daemon=True).start()
+
+
+def set_memory(device: str, summary: str, expect_version: int = None):
+    """管理后台手改记忆：马上生效（每次请求都从库里读），正在进行的总结写不回来。
+
+    expect_version：打开编辑时的版本；期间自动总结更新过就不保存。返回 (保存了没有, 现在的记忆)。"""
+    summary = (summary or "").strip()
+    ok = db().set_memory(device, summary, "manual" if summary else "cleared", expect_version=expect_version)
+    if ok:
+        logger.bind(tag=TAG).info(f"设备 {device}：记忆已在管理后台{'修改' if summary else '清空'}（{len(summary)} 字）")
+    return ok, db().memory(device)
+
+
+def describe_memories(config: dict) -> list:
+    """管理后台用：每台存过记录或记忆的设备，[{device, memory, models: [{entry, label, count, agent}]}]。"""
+    from core.agent import llm_router
+
+    store = db()
+    out = []
+    for device in store.memory_devices():
+        counts = store._exec("SELECT model, COUNT(*) FROM messages WHERE device=? GROUP BY model", (device,)).fetchall()
+        out.append({"device": device, "memory": store.memory(device),
+                    "models": [{"entry": m, "label": llm_router.model_label(m), "count": n, "agent": is_agent(config, m)}
+                               for m, n in counts]})
+    return out
 
 
 def _summary_llm(conn, name: str, cfg: dict):

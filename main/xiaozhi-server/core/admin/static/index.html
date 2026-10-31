@@ -309,6 +309,7 @@
       <button data-page="llm"><span class="ico">✦</span>大模型</button>
       <button data-page="calls"><span class="ico">☎</span>呼名</button>
       <button data-page="grokbot"><span class="ico">☁</span>Grok Bot</button>
+      <button data-page="memory"><span class="ico">✎</span>记忆</button>
       <button data-page="asr"><span class="ico">◐</span>语音识别</button>
       <button data-page="tts"><span class="ico">♪</span>语音合成</button>
       <button data-page="intent"><span class="ico">⚙</span>意图识别</button>
@@ -411,7 +412,7 @@ $("auth-form").addEventListener("submit", async (ev) => {
 });
 $("logout").onclick = async () => { if (!confirmLeave()) return; page.dirty = null; await api("logout", {}); await route(); };
 
-const PAGES = { status: renderStatus, how: renderHow, llm: renderLLM, calls: renderCallNames, grokbot: renderGrokBot, asr: renderASR, tts: renderTTS, intent: renderIntent };
+const PAGES = { status: renderStatus, how: renderHow, llm: renderLLM, calls: renderCallNames, grokbot: renderGrokBot, memory: renderMemory, asr: renderASR, tts: renderTTS, intent: renderIntent };
 const page = { name: "", dirty: null, timer: null };
 function currentPage() { const p = location.hash.slice(1); return PAGES[p] ? p : "status"; }
 function confirmLeave() { return !(page.dirty && page.dirty()) || confirm("当前页面有修改还没保存，确定离开吗？"); }
@@ -1300,6 +1301,58 @@ async function renderGrokBot(root) {
 }
 
 // ---------- 呼名 ----------
+
+// ---------- 记忆：聊天记录里被截掉的旧对话总结成的"关于用户"的要点，每台设备一份，所有 API 模型共用 ----------
+async function renderMemory(root) {
+  const d = await api("memory");
+  const st = d.settings;
+  const SOURCE = { summary: "自动总结", manual: "后台修改", cleared: "已清空" };
+  const fmt = (t) => (t ? new Date(t * 1000).toLocaleString("zh-CN", { hour12: false }) : "");
+  const edits = {};  // device -> 编辑框里的内容（改过才有）
+  page.dirty = () => d.devices.some((x) => edits[x.device] !== undefined && edits[x.device] !== x.memory.summary);
+  const status = !st.enabled ? '<span class="pill">聊天记录未开启</span>'
+    : st.summary ? '<span class="pill ok">自动总结已开启</span>' : '<span class="pill">自动总结已关闭</span>';
+  root.innerHTML = `
+    <div class="page-head"><div><h1>记忆</h1><p class="sub">聊天记录按设备和模型存在本机（data/chat.db），每次只把最近 ${st.max_messages} 条（约 ${st.max_tokens} token 以内）发给模型；
+      更早的部分自动总结成这里的记忆，放进系统提示。同一台设备的所有 API 模型共用一份记忆，Claude Code 和 Grok Bot 不用它（它们的上下文在自己的会话里）。
+      在这里修改或清空后，下一次提问就按新的来。</p></div>${status}</div>
+    <div id="mem-list"></div>`;
+  const list = $("mem-list");
+  const draw = () => {
+    if (!d.devices.length) { list.innerHTML = '<div class="card panel muted">还没有聊天记录。设备聊过几轮、旧对话被截掉后，这里会出现总结出来的记忆。</div>'; return; }
+    list.innerHTML = d.devices.map((x) => {
+      const m = x.memory, value = edits[x.device] ?? m.summary;
+      const models = x.models.map((o) => `${esc(o.label)} ${o.count} 条${o.agent ? "（不总结）" : ""}`).join("、") || "没有聊天记录";
+      return `<div class="card panel" data-device="${esc(x.device)}">
+        <div class="device-top"><span class="dot ${x.online ? "on" : ""}"></span><b class="mono">${esc(x.device)}</b>
+          ${m.updated ? `<span class="pill">${esc(SOURCE[m.source] || "")} · ${esc(fmt(m.updated))}</span>` : '<span class="pill">还没有记忆</span>'}</div>
+        <p class="muted small" style="margin:8px 0 0">存着的记录：${models}</p>
+        <label class="f" style="margin-top:14px">记忆全文<span class="hint">要点式，每条一行；自动总结时会在这份基础上合并新的内容（约 ${st.summary_chars} 字以内）</span>
+          <textarea class="in" rows="8" data-edit maxlength="5000" placeholder="（空）">${esc(value)}</textarea></label>
+        <div class="actions"><span class="result muted small">${value.length} 字</span>
+          <button class="btn" data-clear ${m.summary || value ? "" : "disabled"}>清空</button>
+          <button class="btn primary" data-save>保存</button></div></div>`;
+    }).join("");
+    list.querySelectorAll("[data-device]").forEach((card) => {
+      const dev = card.dataset.device, x = d.devices.find((y) => y.device === dev);
+      const ta = card.querySelector("[data-edit]");
+      ta.oninput = () => { edits[dev] = ta.value; card.querySelector(".result").textContent = `${ta.value.length} 字`; };
+      const save = (btn, text) => busy(btn, async () => {
+        const res = await fetch("/admin/api/memory/save", { method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ device: dev, summary: text, version: x.memory.version }) });
+        const r = await res.json().catch(() => ({}));
+        if (res.status === 401) return toast(EXPIRED + "。请先复制改好的内容，再刷新页面重新登录", true);
+        if (res.status === 409) { x.memory = r.memory; toast(r.error, true); draw(); return; }
+        if (!res.ok || r.ok === false) return toast(r.error || "保存失败", true);
+        x.memory = r.memory; delete edits[dev];
+        toast(text ? "已保存，下一次提问就用新的记忆" : "记忆已清空"); draw();
+      });
+      card.querySelector("[data-save]").onclick = (e) => save(e.currentTarget, ta.value);
+      card.querySelector("[data-clear]").onclick = (e) => { if (confirm(`清空 ${dev} 的记忆？聊天记录不受影响。`)) save(e.currentTarget, ""); };
+    });
+  };
+  draw();
+}
 
 async function renderCallNames(root) {
   const d = await api("call-names");

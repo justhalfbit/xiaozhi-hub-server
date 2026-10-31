@@ -67,7 +67,8 @@ chat_history:
   # 工具调用和它的结果不会被拆开。Claude Code、Grok Bot 的上下文在它们自己的会话里，只存记录给屏幕显示
   max_messages: 30
   max_tokens: 8000
-  # 截掉的旧对话在后台总结成记忆，放进系统提示的 <memory>；攒够 summary_min 条才总结一次
+  # 截掉的旧对话在后台总结成记忆，放进系统提示的 <memory>；攒够 summary_min 条才总结一次。
+  # 记忆每台设备一份，所有普通 API 模型共用；管理后台"记忆"页可以查看、修改、清空
   summary: true
   summary_min: 6
   summary_chars: 500

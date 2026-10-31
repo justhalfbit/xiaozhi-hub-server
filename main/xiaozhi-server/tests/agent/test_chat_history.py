@@ -15,6 +15,7 @@ from core.utils.dialogue import Dialogue, Message
 CONFIG = {
     "LLM": {
         "DeepSeekLLM": {"type": "openai", "model_name": "deepseek-chat", "base_url": "https://x", "api_key": "sk-1"},
+        "ClaudeAPI": {"type": "openai", "model_name": "claude-haiku-5-5", "base_url": "https://y", "api_key": "sk-2"},
         "ClaudeCLI": {"type": "claude_cli"},
         "GrokBot_小助手": {"type": "grok_bot", "bot_id": "bot-1", "bot_name": "小助手"},
     },
@@ -211,19 +212,20 @@ def test_dropped_messages_are_summarized_into_memory():
     for i in range(3):
         chat(conn, f"问{i}", f"答{i}")
     cfg = chat_history.settings(CONFIG)
-    rows, mem = chat_history.pending_summary("dev-1", "DeepSeekLLM", cfg)
+    rows, mem = chat_history.pending_summary("dev-1", cfg, CONFIG)
     assert [r["content"] for r in rows] == ["我叫小明", "你好小明"] and mem["summary"] == ""
+    assert {r["model"] for r in rows} == {"DeepSeekLLM"}
     llm = FakeLLM()
-    assert chat_history.summarize_now(llm, "dev-1", "DeepSeekLLM", cfg)
+    assert chat_history.summarize_now(llm, "dev-1", cfg, CONFIG)
     prompt = llm.calls[0][1]
     assert "用户：我叫小明" in prompt and "给我讲个故事吧" not in prompt  # 工具调用示例不会混进记忆
     assert chat_history.memory_for(conn) == "- 用户叫小明，喜欢爬山"
     # 已总结过的不再总结
-    assert chat_history.pending_summary("dev-1", "DeepSeekLLM", cfg)[0] == []
+    assert chat_history.pending_summary("dev-1", cfg, CONFIG)[0] == []
     # 增量：下一批带上已有记忆
     chat(conn, "问3", "答3")
     llm2 = FakeLLM("- 用户叫小明\n- 问过问0")
-    chat_history.summarize_now(llm2, "dev-1", "DeepSeekLLM", cfg)
+    chat_history.summarize_now(llm2, "dev-1", cfg, CONFIG)
     assert "【已有记忆】\n- 用户叫小明，喜欢爬山" in llm2.calls[0][1] and "用户：问0" in llm2.calls[0][1]
     assert "用户：我叫小明" not in llm2.calls[0][1]
 
@@ -304,7 +306,7 @@ def test_clear_removes_records_memory_and_live_dialogues(project):
     for i in range(4):
         chat(conn, f"问{i}", f"答{i}")
     chat(other, "别人的", "记录")
-    chat_history.db().set_memory("dev-1", "DeepSeekLLM", "记忆", 2)
+    chat_history.db().set_memory("dev-1", "记忆", "summary")
     claude = SessionStore(project / "data" / "agent_sessions.json", "claude_cli")
     claude.touch("dev-1", "sess-1")
     claude.touch("dev-2", "sess-2")
@@ -331,10 +333,10 @@ def test_clear_memory_only_keeps_records_and_does_not_resummarize(project):
     for i in range(5):
         chat(conn, f"问{i}", f"答{i}")
     cfg = chat_history.settings(CONFIG)
-    chat_history.summarize_now(FakeLLM(), "dev-1", "DeepSeekLLM", cfg)
+    chat_history.summarize_now(FakeLLM(), "dev-1", cfg, CONFIG)
     chat_history.clear("dev-1", CONFIG, memory_only=True)
     assert chat_history.memory_for(conn) == ""
-    assert chat_history.pending_summary("dev-1", "DeepSeekLLM", cfg)[0] == []
+    assert chat_history.pending_summary("dev-1", cfg, CONFIG)[0] == []
     assert len(chat_history.history("dev-1", 100)["DeepSeekLLM"]) == 10
 
 
@@ -522,7 +524,7 @@ def test_handler_saves_each_turn_and_next_connection_remembers(monkeypatch):
 
 
 def test_handler_puts_summary_memory_in_system_prompt():
-    chat_history.db().set_memory("dev-1", "DeepSeekLLM", "- 用户叫小明", 0)
+    chat_history.db().set_memory("dev-1", "- 用户叫小明", "manual")
     llm = EchoLLM()
     h = make_handler(llm)
     h.chat("你好")
@@ -556,5 +558,140 @@ def test_summary_finished_after_a_clear_is_dropped(project):
                 chat(conn, f"新{i}", f"新答{i}")
             return "- 旧记忆"
 
-    assert not chat_history.summarize_now(ClearingLLM(), "dev-1", "DeepSeekLLM", cfg)
+    assert not chat_history.summarize_now(ClearingLLM(), "dev-1", cfg, CONFIG)
     assert chat_history.memory_for(conn) == ""
+
+
+# ---------- 记忆按设备共用 ----------
+
+def test_memory_is_shared_by_api_models_of_a_device_but_not_agents():
+    chat_history.db().set_memory("dev-1", "- 用户叫小明", "summary")
+    for name, expect in (("DeepSeekLLM", "- 用户叫小明"), ("ClaudeAPI", "- 用户叫小明"), ("ClaudeCLI", ""),
+                         ("GrokBot_小助手", "")):
+        conn = make_conn()
+        chat_history.load(conn, conn.dialogue, name)
+        assert chat_history.memory_for(conn) == expect, name
+    other = make_conn("dev-2")
+    chat_history.load(other, other.dialogue, "DeepSeekLLM")
+    assert chat_history.memory_for(other) == ""
+
+
+def test_one_summary_covers_every_api_model_with_progress_per_model():
+    a, b, cli = make_conn(), make_conn(), make_conn()
+    chat_history.load(a, a.dialogue, "DeepSeekLLM")
+    chat_history.load(b, b.dialogue, "ClaudeAPI")
+    chat_history.load(cli, cli.dialogue, "ClaudeCLI")
+    for i in range(4):
+        chat(a, f"深{i}", f"深答{i}")
+        chat(b, f"克{i}", f"克答{i}")
+        chat(cli, f"命{i}", f"命答{i}")
+    cfg = chat_history.settings(CONFIG)
+    rows, _ = chat_history.pending_summary("dev-1", cfg, CONFIG)
+    assert [r["content"] for r in rows] == ["克0", "克答0", "深0", "深答0"]   # Claude Code 的不总结
+    llm = FakeLLM()
+    assert chat_history.summarize_now(llm, "dev-1", cfg, CONFIG)
+    assert "（和 ClaudeAPI 的对话）" in llm.calls[0][1] and "（和 DeepSeekLLM 的对话）" in llm.calls[0][1]
+    progress = chat_history.db().progress("dev-1")
+    assert set(progress) == {"ClaudeAPI", "DeepSeekLLM"}
+    assert chat_history.pending_summary("dev-1", cfg, CONFIG)[0] == []
+    # 只有一个模型又截掉了新的：只总结它的
+    chat(a, "深4", "深答4")
+    assert [r["content"] for r in chat_history.pending_summary("dev-1", cfg, CONFIG)[0]] == ["深1", "深答1"]
+
+
+def test_summary_is_dropped_if_memory_was_edited_meanwhile():
+    conn = make_conn()
+    chat_history.load(conn, conn.dialogue, "DeepSeekLLM")
+    for i in range(5):
+        chat(conn, f"问{i}", f"答{i}")
+    cfg = chat_history.settings(CONFIG)
+
+    class EditedMeanwhile(FakeLLM):
+        def response_no_stream(self, system_prompt, user_prompt, **kwargs):
+            ok, _ = chat_history.set_memory("dev-1", "- 后台改的")
+            assert ok
+            return "- 自动总结的"
+
+    assert not chat_history.summarize_now(EditedMeanwhile(), "dev-1", cfg, CONFIG)
+    mem = chat_history.db().memory("dev-1")
+    assert mem["summary"] == "- 后台改的" and mem["source"] == "manual"
+    # 进度没动：下次在手改的基础上再总结这批
+    llm = FakeLLM("- 合并后的")
+    assert chat_history.summarize_now(llm, "dev-1", cfg, CONFIG)
+    assert "【已有记忆】\n- 后台改的" in llm.calls[0][1]
+
+
+def test_concurrent_summaries_of_one_device_run_one_at_a_time(monkeypatch):
+    import threading
+    import time as _time
+
+    started, release = threading.Event(), threading.Event()
+    calls = []
+
+    class SlowLLM(FakeLLM):
+        def response_no_stream(self, system_prompt, user_prompt, **kwargs):
+            calls.append(1)
+            started.set()
+            release.wait(2)
+            return "- 记忆"
+
+    monkeypatch.setattr(chat_history, "_summary_llm", lambda c, name, cfg: SlowLLM())
+    a, b = make_conn(), make_conn()
+    chat_history.load(a, a.dialogue, "DeepSeekLLM")
+    chat_history.load(b, b.dialogue, "ClaudeAPI")
+    for i in range(4):
+        chat(a, f"深{i}", f"深答{i}")
+        chat(b, f"克{i}", f"克答{i}")
+    chat_history.maybe_summarize(a)
+    assert started.wait(2)
+    chat_history.maybe_summarize(b)   # 同一台设备已经在总结：不再开第二个
+    release.set()
+    deadline = _time.monotonic() + 2
+    while chat_history._summarizing and _time.monotonic() < deadline:
+        _time.sleep(0.01)
+    assert len(calls) == 1 and chat_history.memory_for(a) == "- 记忆"
+
+
+def test_set_memory_from_admin_takes_effect_and_checks_version():
+    conn = make_conn()
+    chat_history.load(conn, conn.dialogue, "DeepSeekLLM")
+    ok, mem = chat_history.set_memory("dev-1", "  - 用户叫小红  ")
+    assert ok and mem["summary"] == "- 用户叫小红" and mem["source"] == "manual" and mem["version"] == 1
+    assert "- 用户叫小红" in conn.dialogue.get_llm_dialogue_with_memory(chat_history.memory_for(conn))[0]["content"]
+    ok, mem = chat_history.set_memory("dev-1", "旧版本上改的", expect_version=0)
+    assert not ok and mem["summary"] == "- 用户叫小红"
+    ok, mem = chat_history.set_memory("dev-1", "", expect_version=1)
+    assert ok and mem["summary"] == "" and mem["source"] == "cleared"
+
+
+def test_old_per_model_memories_are_merged(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    c = sqlite3.connect(str(path))
+    c.executescript("""
+        CREATE TABLE memories (device TEXT, model TEXT, summary TEXT, upto INTEGER, updated REAL, PRIMARY KEY (device, model));
+        INSERT INTO memories VALUES ('dev-1', 'DeepSeekLLM', '- 叫小明', 12, 100), ('dev-1', 'ClaudeAPI', '- 爱爬山', 30, 200),
+                                    ('dev-2', 'DeepSeekLLM', '', 5, 50);
+    """)
+    c.commit()
+    c.close()
+    store = chat_history.ChatDB(path)
+    try:
+        assert store.memory("dev-1")["summary"] == "- 叫小明\n- 爱爬山"
+        assert store.progress("dev-1") == {"DeepSeekLLM": 12, "ClaudeAPI": 30}
+        assert store.memory("dev-2")["summary"] == "" and store.progress("dev-2") == {"DeepSeekLLM": 5}
+        assert not store._exec("SELECT 1 FROM sqlite_master WHERE name='memories'").fetchone()
+    finally:
+        store.close()
+    chat_history.ChatDB(path).close()   # 再打开一次不出错
+
+
+def test_clear_bumps_memory_version_so_running_summary_is_dropped(project):
+    conn = make_conn()
+    chat_history.load(conn, conn.dialogue, "DeepSeekLLM")
+    chat_history.db().set_memory("dev-1", "- 记忆", "summary")
+    before = chat_history.db().memory("dev-1")["version"]
+    chat_history.clear("dev-1", CONFIG)
+    mem = chat_history.db().memory("dev-1")
+    assert mem["summary"] == "" and mem["version"] == before + 1 and chat_history.db().progress("dev-1") == {}

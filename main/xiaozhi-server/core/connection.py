@@ -45,6 +45,7 @@ from core.utils.prompt_manager import PromptManager
 from core.utils.voiceprint_provider import VoiceprintProvider
 from core.utils.util import get_system_error_response
 from core.utils import reply_progress, textUtils
+from core.utils.tool_markup import ToolMarkupFilter, strip_tool_markup
 
 
 TAG = __name__
@@ -1178,6 +1179,8 @@ class ConnectionHandler:
         # 支持多个并行工具调用 - 使用列表存储
         tool_calls_list = []  # 格式: [{"id": "", "name": "", "arguments": ""}]
         content_arguments = ""
+        # [xiaozhi-hub] 模型漏进回复文字的工具调用标记（如 DeepSeek 的 DSML），送合成和写对话前去掉
+        markup_filter = ToolMarkupFilter()
         emotion_flag = True
         try:
             for response in llm_responses:
@@ -1214,6 +1217,9 @@ class ConnectionHandler:
                                     new_part = self._clean_response_garbage(new_part)
                                     if new_part:
                                         tc["_da_sent"] = safe_end
+                                        # [xiaozhi-hub] 变形的 DSML 标记接口认不出，会留在 response 参数里
+                                        new_part = tc.setdefault("_da_filter", ToolMarkupFilter()).feed(new_part)
+                                    if new_part:
                                         self.tts.tts_text_queue.put(
                                             TTSMessageDTO(
                                                 sentence_id=current_sentence_id,
@@ -1224,6 +1230,9 @@ class ConnectionHandler:
                                         )
                 else:
                     content = response
+
+                if content:
+                    content = markup_filter.feed(content)
 
                 # 在llm回复中获取情绪表情，一轮对话只在开头获取一次
                 if emotion_flag and content is not None and content.strip():
@@ -1245,6 +1254,22 @@ class ConnectionHandler:
                                 content_detail=content,
                             )
                         )
+            # [xiaozhi-hub] 过滤器为了等标记收全扣住的末尾
+            content = markup_filter.flush()
+            if content and not tool_call_flag and not self._superseded(current_sentence_id):
+                response_message.append(content)
+                self.tts.tts_text_queue.put(
+                    TTSMessageDTO(
+                        sentence_id=current_sentence_id,
+                        sentence_type=SentenceType.MIDDLE,
+                        content_type=ContentType.TEXT,
+                        content_detail=content,
+                    )
+                )
+            if markup_filter.removed:
+                self.logger.bind(tag=TAG).warning(
+                    f"回复文字里去掉了 {markup_filter.removed} 个工具调用标记"
+                )
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"LLM stream processing error: {e}")
             self.tts.tts_text_queue.put(
@@ -1311,17 +1336,23 @@ class ConnectionHandler:
                             remaining = da_response[sent_len:]
                             if remaining:
                                 remaining = self._clean_response_garbage(remaining)
-                                if remaining:
-                                    self.tts.tts_text_queue.put(
-                                        TTSMessageDTO(
-                                            sentence_id=current_sentence_id,
-                                            sentence_type=SentenceType.MIDDLE,
-                                            content_type=ContentType.TEXT,
-                                            content_detail=remaining,
-                                        )
+                            da_filter = tc.get("_da_filter") or ToolMarkupFilter()
+                            remaining = da_filter.feed(remaining) + da_filter.flush()
+                            if remaining:
+                                self.tts.tts_text_queue.put(
+                                    TTSMessageDTO(
+                                        sentence_id=current_sentence_id,
+                                        sentence_type=SentenceType.MIDDLE,
+                                        content_type=ContentType.TEXT,
+                                        content_detail=remaining,
                                     )
+                                )
+                            if da_filter.removed:
+                                self.logger.bind(tag=TAG).warning(
+                                    f"direct_answer 回复里去掉了 {da_filter.removed} 个工具调用标记"
+                                )
                             # 写入对话历史
-                            da_response = self._clean_response_garbage(da_response)
+                            da_response = self._clean_response_garbage(strip_tool_markup(da_response))
                             self.tts.store_tts_text(current_sentence_id, da_response)
                             self._put_reply(current_sentence_id, da_response)
 

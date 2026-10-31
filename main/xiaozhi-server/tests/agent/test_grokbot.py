@@ -64,6 +64,7 @@ class FakeCloud:
         self.refresh_calls = 0
         self.refresh_logout = False
         self.ensure_calls = 0
+        self.ensure_hold = 0  # 接下来这么多次 EnsureSandBox 挂着不回（冷启动，电脑还在醒）
         self.ensure_states = []  # 依次返回的 runState（没有 gatewayUrl）；用完后正常返回
         self.ensure_status = []  # 依次返回的 HTTP 状态码（401 等）
         self.agents = [{"id": "bot-1", "name": "孙悟空", "isRunning": False, "newestEntryId": "e0", "harness": "temporal"}]
@@ -112,6 +113,9 @@ class FakeCloud:
 
     async def ensure(self, request):
         self.ensure_calls += 1
+        if self.ensure_hold:
+            self.ensure_hold -= 1
+            await real_sleep(0.5)
         if self.ensure_status:
             return web.json_response({"error": "x"}, status=self.ensure_status.pop(0))
         if self.ensure_states:
@@ -577,7 +581,7 @@ class FakeGrokAgent:
         self.hub, self.config, self.on_report, self.device_key = hub, config, on_report, device_key
         self.session_id = config.bot_id
         self.alive = False
-        self.sent, self.interrupts, self.closed = [], 0, False
+        self.sent, self.interrupts, self.closed, self.handed_off = [], 0, False, []
         FakeGrokAgent.instances.append(self)
 
     async def start(self):
@@ -594,6 +598,10 @@ class FakeGrokAgent:
 
     async def interrupt(self):
         self.interrupts += 1
+
+    async def hand_off(self, text):
+        self.sent.append(text)
+        self.handed_off.append(text)
 
     async def close(self):
         self.closed = True
@@ -1091,8 +1099,7 @@ def test_warm_up_then_idle_close_does_not_crash(tmp_path, monkeypatch):
     assert FakeGrokAgent.instances[0].closed and p._states[c.session_id].agent is None  # 空闲后关掉了
 
 
-def test_abort_during_slow_start_does_not_send(tmp_path, monkeypatch):
-    """独立 review 发现：云端电脑唤醒期间设备打断，这句话还是会发出去，回复没人听、锁一直占着。"""
+def slow_provider(tmp_path, monkeypatch, name):
     monkeypatch.setattr(grok_mod, "GrokBotSession", FakeGrokAgent)
     monkeypatch.setattr(grok_mod, "get_hub", lambda *a, **k: None)
     FakeGrokAgent.instances, FakeGrokAgent.script, FakeGrokAgent.start_error, FakeGrokAgent.delay = [], [], None, 0.0
@@ -1104,7 +1111,14 @@ def test_abort_during_slow_start_does_not_send(tmp_path, monkeypatch):
     monkeypatch.setattr(FakeGrokAgent, "start", slow_start)
     p = grok_mod.LLMProvider({"bot_id": "bot-1", "bot_name": "孙悟空", "credentials_path": str(tmp_path / "c.json"),
                               "first_reply_filler": ""})
-    p.store = SessionStore(tmp_path / "s5.json", "grok_bot")
+    p.store = SessionStore(tmp_path / name, "grok_bot")
+    return p
+
+
+def test_abort_during_slow_start_still_hands_off(tmp_path, monkeypatch):
+    """云端电脑唤醒期间设备打断：话照样发出去（和 Bot 醒着时发出去后再打断一样），但不等回复、不占着锁，
+    直接转后台盯着，做完进待汇报箱。以前是不发，用户点了结束这件事就丢了。"""
+    p = slow_provider(tmp_path, monkeypatch, "s5.json")
     c = conn()
     c.client_abort = False
     p.on_conn_open(c)
@@ -1122,13 +1136,58 @@ def test_abort_during_slow_start_does_not_send(tmp_path, monkeypatch):
     t.join(3)
     assert out == []
     deadline = time.time() + 2
-    while time.time() < deadline and not FakeGrokAgent.instances[0].alive:
+    while time.time() < deadline and not any(a.handed_off for a in FakeGrokAgent.instances):
         time.sleep(0.02)
-    time.sleep(0.2)
-    assert FakeGrokAgent.instances[0].sent == []  # 启动完也没发
+    agent = next(a for a in FakeGrokAgent.instances if a.alive)
+    assert agent.handed_off == ["派个活"]  # 醒了照样发出去，转后台盯着
     c.client_abort = False
     assert run(p, c, "再来") == "收到。"  # 锁没被占着，下一句正常
-    assert FakeGrokAgent.instances[0].sent == ["再来"]
+    assert agent.sent == ["派个活", "再来"]
+
+
+def test_close_during_slow_start_still_hands_off(tmp_path, monkeypatch):
+    """用户点了结束（打断并断开），云端电脑还没醒：醒了照样发出去，做完进待汇报箱，下次连上念。"""
+    p = slow_provider(tmp_path, monkeypatch, "s6.json")
+    c = conn()
+    c.client_abort = False
+    p.on_conn_open(c)
+    time.sleep(0.05)
+    t = threading.Thread(target=lambda: list(p.response(c.session_id, [{"role": "user", "content": "派个活"}])))
+    t.start()
+    time.sleep(0.2)
+    c.client_abort = True
+    p.abort(c)
+    p.on_conn_close(c)
+    t.join(3)
+    deadline = time.time() + 2
+    while time.time() < deadline and not any(a.handed_off for a in FakeGrokAgent.instances):
+        time.sleep(0.02)
+    time.sleep(0.1)
+    handed = [a for a in FakeGrokAgent.instances if a.handed_off]
+    assert len(handed) == 1 and handed[0].handed_off == ["派个活"] and handed[0].closed
+
+
+async def test_hand_off_sends_then_watches(cloud, hub):
+    """hand_off：发出去后不等回复，直接转后台盯着，Bot 做完把回复交给 on_report。"""
+    s, got = reporting_session(hub)
+    s.device_key = "dev-1"
+    await s.start()
+    await s.hand_off("派个活")
+    assert len(cloud.sent) == 1 and cloud.sent[0]["prompt"].startswith("派个活")
+    assert s.watch_key in gs._watches
+    await cloud.push("agent-upserted", {"agent": {"id": "bot-1", "isRunning": True}})
+    await cloud.push("transcript", {"agentId": "bot-1", "type": "appended", "entry": reply_entry("做完了。")})
+    await cloud.push("agent-upserted", {"agent": {"id": "bot-1", "isRunning": False}})
+    await wait_until(lambda: got, timeout=3)
+    assert got == ["孙悟空做完了：做完了。"]
+
+
+async def test_ensure_box_retries_while_box_wakes(cloud, client, monkeypatch):
+    """冷启动时 EnsureSandBox 挂到电脑醒来（实测 60 多秒），单次超时不算失败，在总时限内再问。"""
+    monkeypatch.setattr(gc, "ENSURE_TIMEOUT", 0.1)
+    cloud.ensure_hold = 2
+    body = await client.ensure_box()
+    assert body["gatewayUrl"] == cloud.url and cloud.ensure_calls == 3
 
 
 # ---------- 第二位独立 reviewer 后补的用例 ----------

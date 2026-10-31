@@ -464,6 +464,18 @@ class GrokBotSession(AgentSession):
             self._in_turn = False
 
 
+    async def hand_off(self, text: str) -> None:
+        """设备已经不听了（启动期间被打断或断开），这句话照样交给 Bot：发出去后不等回复，直接转后台盯着，
+        做完的回复交给 on_report。发送前拿回来的上一件事的回复也交给 on_report，免得丢。"""
+        async for ev in self.send(text):
+            if isinstance(ev, Activity) and ev.label == "sent":
+                await self.interrupt()  # 发出去了：下面直接转后台盯着
+            elif isinstance(ev, TextDelta) and ev.text.strip() and self.on_report is not None:
+                self.on_report(ev.text)
+            elif isinstance(ev, Error):
+                self._log("warning", f"交出去的话没发成：{ev.detail[:200]}")
+
+
 # 正在后台盯着的任务：(设备, Bot id) -> AfterWatch。asyncio 对任务只有弱引用，会话被关掉、对象被回收后任务会被
 # 当垃圾清掉，这里保住它们；按键登记是为了会话关了再开（设备断连重连）时，新会话也能接上旧的
 _watches: Dict[tuple, "AfterWatch"] = {}

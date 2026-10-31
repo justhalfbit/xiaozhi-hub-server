@@ -8,6 +8,7 @@ Bot 的名字自动成为称呼。同一个账号的所有 Bot 共用一条事�
   第一句话不用再等云端电脑唤醒；
 - 对话记录在云端，不需要接续逻辑；
 - 被打断（含等超时）后 Bot 在云端继续做，做完的回复进待汇报箱（core/agent/reports.py），设备空闲时念；
+  云端电脑还在唤醒时就被打断或断开，这句话也照样发出去，发完直接转后台盯着（hand_off）；
 - 所有 grok_bot 实例共用一个后台事件循环（事件流中枢必须和会话在同一个循环里）。
 
 凭证由管理后台登录后写到 data/grokbot_credentials.json，这里只读。
@@ -117,7 +118,7 @@ class LLMProvider(AgentProvider):
                               on_report=lambda text: reports.add(key, self.bot_id, text), device_key=key)
 
     def abort(self, conn) -> None:
-        """设备打断。会话还在启动（云端电脑唤醒要几十秒）时父类无事可做，这里记下来：启动完也不发这句话了。"""
+        """设备打断。会话还在启动（云端电脑唤醒要几十秒）时父类无事可做，这里记下来：启动完发了就转后台盯着。"""
         st = self._states.get(conn.session_id)
         if st is not None:
             st.abort_gen = st.turn_gen
@@ -180,13 +181,18 @@ class LLMProvider(AgentProvider):
             out.put(Activity("init", tools_running=1))
             await agent.start()
             if st.closed:
-                await agent.close()  # 启动期间连接已经关闭
+                # 启动期间连接已经关闭（例如用户点了结束）：话照样交出去，做完进待汇报箱，下次连上念
+                logger.bind(tag=TAG).info(f"Grok Bot「{self.bot_name}」会话就绪前设备已断开，照样发出去，做完再汇报")
+                await agent.hand_off(text)
+                await agent.close()
                 raise AgentSessionError(ErrorKind.PROCESS_EXITED, "连接已关闭")
             st.agent = agent
             logger.bind(tag=TAG).info(f"Grok Bot「{self.bot_name}」会话已就绪（{time.time() - t0:.1f}s），设备 {st.key}")
         if getattr(st, "abort_gen", None) == st.turn_gen:
-            # 等启动的这段时间里设备已经打断了：这句话不发了，否则回复没人听、锁还一直占着
-            logger.bind(tag=TAG).info(f"Grok Bot「{self.bot_name}」会话就绪前设备已打断，这句话不发")
+            # 等启动的这段时间里设备已经打断了。和 Bot 醒着时发出去后再打断一样：话照样交给它，但不等回复
+            # （没人听，也别一直占着锁），发完转后台盯着，做完进待汇报箱
+            logger.bind(tag=TAG).info(f"Grok Bot「{self.bot_name}」会话就绪前设备已打断，照样发出去，做完再汇报")
+            await st.agent.hand_off(text)
             out.put(Done(interrupted=True))
             return True
         return False

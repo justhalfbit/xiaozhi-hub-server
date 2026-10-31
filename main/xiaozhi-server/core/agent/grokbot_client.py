@@ -41,6 +41,7 @@ GATEWAY_SUFFIXES = (".cursor.sh", ".cursor.com", ".cursorvm.com")
 REFRESH_AHEAD = 300  # access token 到期前这么多秒就续期
 WAKE_TIMEOUT = 180  # 云端电脑休眠时最多等多久醒来
 WAKE_POLL = 3  # 唤醒期间每隔多久问一次就绪了没
+ENSURE_TIMEOUT = 60  # 单次 EnsureSandBox 最多等多久；冷启动时会超时，WAKE_TIMEOUT 之内重试
 STREAM_READ_TIMEOUT = 45  # 事件流每 15 秒一个 ping，45 秒没字节就当断了
 STREAM_BACKOFF = (1, 2, 4, 8, 10)
 AUTH_RETRY = 60  # 登录失效时事件流多久再试一次
@@ -362,9 +363,17 @@ class GrokBotClient:
             deadline = time.monotonic() + WAKE_TIMEOUT
             refreshed = False
             while True:
-                status, hdrs, body = await self._request(
-                    "POST", self.backend + "/aiserver.v1.GrokBotService/EnsureSandBox",
-                    {"wake": wake, "supportsAsleepBox": True}, await self._backend_headers(), timeout=60)
+                try:
+                    status, hdrs, body = await self._request(
+                        "POST", self.backend + "/aiserver.v1.GrokBotService/EnsureSandBox",
+                        {"wake": wake, "supportsAsleepBox": True}, await self._backend_headers(),
+                        timeout=ENSURE_TIMEOUT)
+                except GrokBotError as e:
+                    # 冷启动时服务端会把请求挂到电脑醒来（实测 60 多秒）：超时只说明还没醒，唤醒已经在进行，再问一次
+                    if not isinstance(e.__cause__, asyncio.TimeoutError) or time.monotonic() > deadline:
+                        raise
+                    self._log("info", f"EnsureSandBox {int(ENSURE_TIMEOUT)} 秒没返回，云端电脑可能还在醒，再问一次")
+                    continue
                 if status == 401 and not refreshed:
                     # token 看着还没过期却被拒：强制续期一次再试；还不行就要重新登录
                     refreshed = True

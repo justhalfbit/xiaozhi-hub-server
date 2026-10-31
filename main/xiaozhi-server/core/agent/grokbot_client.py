@@ -44,6 +44,8 @@ WAKE_POLL = 3  # 唤醒期间每隔多久问一次就绪了没
 STREAM_READ_TIMEOUT = 45  # 事件流每 15 秒一个 ping，45 秒没字节就当断了
 STREAM_BACKOFF = (1, 2, 4, 8, 10)
 AUTH_RETRY = 60  # 登录失效时事件流多久再试一次
+# 查登录状态的 /auth/poll 是长轮询：还没批准时服务端把请求挂着不回，超时只说明"还在等批准"
+LOGIN_POLL_TIMEOUT = 60
 
 
 class GrokBotError(Exception):
@@ -217,7 +219,7 @@ class GrokBotClient:
             await session.close()
 
     async def _request(self, method: str, url: str, body=None, headers: dict = None, timeout: float = 30):
-        """返回 (状态码, 响应头, 解析后的 JSON 或原文)。网络错误抛 GrokBotError(SERVER)。"""
+        """返回 (状态码, 响应头, 解析后的 JSON 或原文)。网络错误抛 GrokBotError(SERVER)，原始异常在 __cause__。"""
         try:
             async with self.session().request(
                     method, url, json=body, headers=headers or {}, allow_redirects=False,
@@ -229,7 +231,7 @@ class GrokBotClient:
                     parsed = raw.decode(errors="replace")[:300]
                 return res.status, res.headers, parsed
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            raise GrokBotError(ErrorKind.SERVER, f"{method} {urlparse(url).path}: {e!r}")
+            raise GrokBotError(ErrorKind.SERVER, f"{method} {urlparse(url).path}: {e!r}") from e
 
     # ----- 登录 -----
 
@@ -247,7 +249,13 @@ class GrokBotClient:
     async def poll_login_once(self, flow: LoginFlow) -> Optional[bool]:
         """查一次登录状态：拿到 token 返回 True（已保存），还没批准返回 None，被拒绝返回 False。"""
         url = self.backend + "/auth/poll?" + urlencode({"uuid": flow.uuid, "verifier": flow.verifier})
-        status, _, body = await self._request("GET", url, headers={"content-type": "application/json"}, timeout=20)
+        try:
+            status, _, body = await self._request("GET", url, headers={"content-type": "application/json"},
+                                                  timeout=LOGIN_POLL_TIMEOUT)
+        except GrokBotError as e:
+            if isinstance(e.__cause__, asyncio.TimeoutError):  # 长轮询挂满了：还没批准
+                return None
+            raise
         if status == 404:
             return None
         if 200 <= status < 300 and isinstance(body, dict) and body.get("accessToken"):

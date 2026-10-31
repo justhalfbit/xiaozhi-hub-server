@@ -60,6 +60,7 @@ class FakeCloud:
         ])
         self.url = None
         self.approved = False
+        self.poll_hold = 0  # 接下来这么多次 /auth/poll 挂着不回（长轮询，还没批准）
         self.refresh_calls = 0
         self.refresh_logout = False
         self.ensure_calls = 0
@@ -94,6 +95,9 @@ class FakeCloud:
     # ----- api2 -----
 
     async def auth_poll(self, request):
+        if self.poll_hold:
+            self.poll_hold -= 1
+            await real_sleep(0.5)
         if not self.approved:
             return web.Response(status=404, text="Not found")
         return web.json_response({"accessToken": jwt(3600), "refreshToken": "r-1", "selectedTeamId": 0})
@@ -271,6 +275,22 @@ async def test_login_flow(cloud, tmp_path):
     cloud.approved = True
     assert await client.poll_login_once(flow) is True
     assert client.creds.logged_in and client.creds.team_id == "0"
+    await client.close()
+
+
+async def test_login_long_poll_timeout_means_pending(cloud, tmp_path, monkeypatch):
+    """/auth/poll 还没批准时挂着不回：超时算"还在等"，连着超时多次也不放弃，批准后照样登录成功。"""
+    monkeypatch.setattr(gc, "LOGIN_POLL_TIMEOUT", 0.1)
+
+    async def no_wait(seconds):
+        await real_sleep(0)
+    monkeypatch.setattr(gc, "_sleep", no_wait)
+    client = GrokBotClient(Credentials(tmp_path / "c.json"), backend=cloud.url, website=cloud.url)
+    flow = client.start_login()
+    cloud.poll_hold = 1
+    assert await client.poll_login_once(flow) is None
+    cloud.poll_hold, cloud.approved = 4, True  # 以前连着 3 次超时就报错放弃
+    assert await client.poll_login(flow, timeout=10) is True and client.creds.logged_in
     await client.close()
 
 

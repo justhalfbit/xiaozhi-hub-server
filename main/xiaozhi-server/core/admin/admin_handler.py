@@ -41,6 +41,7 @@ SECURITY_HEADERS = {
     "Referrer-Policy": "no-referrer",
 }
 EMOTION_EMOJI = {name: emoji for emoji, name in EMOJI_MAP.items()}
+KIOSK_ASR_MAX_BYTES = 16000 * 2 * 10  # /kiosk/asr 最多 10 秒音频
 
 
 class AdminHandler:
@@ -99,6 +100,7 @@ class AdminHandler:
                 web.get("/kiosk/llm", self.handle_kiosk_llm),
                 web.post("/kiosk/llm/use", self.handle_kiosk_llm_use),
                 web.post("/kiosk/reports", self.handle_kiosk_reports),
+                web.post("/kiosk/asr", self.handle_kiosk_asr),
             ]
         )
 
@@ -613,6 +615,24 @@ class AdminHandler:
         reports.set_quiet(device, bool(body.get("quiet")))
         playing = bool(body.get("play")) and reports.deliver_now(device)
         return self._json({"ok": True, "count": reports.count(device), "playing": playing})
+
+    async def handle_kiosk_asr(self, request: web.Request):
+        """只识别、不对话：body 是 10 秒以内的 16kHz 单声道 16 位 PCM，返回 {"text", "ms"}。
+
+        用服务已经加载、所有连接共用的本机识别模型（设备客户端用它复核唤醒词）。
+        当前识别不是本机模型（如豆包流式）时返回 501，客户端据此跳过复核。
+        """
+        if not self._from_this_machine(request):
+            return self._error("仅限本机", 403)
+        asr = getattr(self.ws_server, "_asr", None)
+        if not callable(getattr(asr, "recognize_pcm", None)):
+            return self._error("当前语音识别不是本机模型", 501)
+        pcm = await request.read()
+        if len(pcm) < 2 or len(pcm) > KIOSK_ASR_MAX_BYTES:
+            return self._error("要 10 秒以内的 16kHz 单声道 16 位 PCM", 400)
+        started = time.monotonic()
+        text = await self._blocking(asr.recognize_pcm, pcm)
+        return self._json({"ok": True, "text": text, "ms": round((time.monotonic() - started) * 1000)})
 
     # ---------- 工作原理 ----------
 

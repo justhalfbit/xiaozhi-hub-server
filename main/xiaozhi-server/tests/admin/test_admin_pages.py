@@ -345,9 +345,44 @@ async def test_kiosk_reports(kiosk):
         reports.clear()
 
 
+async def test_kiosk_asr(kiosk):
+    pcm = b"\x00\x10" * 16000  # 1 秒
+    assert (await kiosk.post("/kiosk/asr", data=pcm)).status == 501  # 服务没在跑识别
+    heard = []
+
+    class LocalASR:
+        def recognize_pcm(self, data):
+            heard.append(len(data))
+            return "小麦小麦"
+    kiosk.handler.ws_server = SimpleNamespace(_asr=LocalASR())
+    data = await (await kiosk.post("/kiosk/asr", data=pcm)).json()
+    assert data["ok"] and data["text"] == "小麦小麦" and isinstance(data["ms"], int) and heard == [32000]
+    assert (await kiosk.post("/kiosk/asr", data=b"")).status == 400
+    assert (await kiosk.post("/kiosk/asr", data=b"\x00" * (ah.KIOSK_ASR_MAX_BYTES + 2))).status == 400
+    kiosk.handler.ws_server = SimpleNamespace(_asr=object())  # 豆包之类的远程识别
+    assert (await kiosk.post("/kiosk/asr", data=pcm)).status == 501
+
+
+def test_sherpa_recognize_pcm():
+    from core.providers.asr.sherpa_onnx_local import ASRProvider
+
+    seen = {}
+
+    class Stream:
+        result = SimpleNamespace(text="小麦小麦")
+
+        def accept_waveform(self, rate, samples):
+            seen.update(rate=rate, samples=samples)
+
+    asr = ASRProvider.__new__(ASRProvider)
+    asr.model = SimpleNamespace(create_stream=Stream, decode_stream=lambda s: None)
+    assert asr.recognize_pcm(b"\x00\x40\x00\xc0\x01") == "小麦小麦"  # 多出的半个采样丢掉
+    assert seen["rate"] == 16000 and list(seen["samples"]) == [0.5, -0.5]
+
+
 async def test_kiosk_only_from_this_machine(kiosk, monkeypatch):
     calls = [("get", "/kiosk/llm", None), ("post", "/kiosk/llm/use", {"kind": "cli"}),
-             ("post", "/kiosk/reports", {"device": "dev-1"})]
+             ("post", "/kiosk/reports", {"device": "dev-1"}), ("post", "/kiosk/asr", None)]
     for method, path, body in calls:  # 本机反向代理转发来的不算本机
         r = await getattr(kiosk, method)(path, json=body, headers={"X-Forwarded-For": "203.0.113.5"})
         assert r.status == 403

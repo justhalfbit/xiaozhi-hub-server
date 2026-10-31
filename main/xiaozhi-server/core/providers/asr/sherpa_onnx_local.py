@@ -225,6 +225,15 @@ class ASRProvider(ASRProviderBase):
     def requires_file(self) -> bool:
         return True
 
+    def recognize_pcm(self, pcm: bytes) -> str:
+        """[xiaozhi-hub] 直接识别一段 16kHz 单声道 16 位 PCM，只返回文字（不纠错、不进对话）。
+        给本机设备接口 /kiosk/asr 用；模型所有连接共用，每次新建 stream，可以在线程池里并发调用。"""
+        samples = np.frombuffer(pcm[:len(pcm) // 2 * 2], dtype="<i2").astype(np.float32) / 32768
+        s = self.model.create_stream()
+        s.accept_waveform(16000, samples)
+        self.model.decode_stream(s)
+        return s.result.text
+
     async def speech_to_text(
         self, opus_data: List[bytes], session_id: str, artifacts=None
     ) -> Tuple[Optional[str], Optional[str]]:

@@ -62,6 +62,15 @@ def test_alias_written_as_string():
 conn_messages = []
 
 
+@pytest.fixture(autouse=True)
+def reply_cache(tmp_path, monkeypatch):
+    """合成好的回复存到临时目录，测试之间互不影响。"""
+    monkeypatch.setattr(call_names, "_audio_cache", {})
+    monkeypatch.setattr(call_names, "_filling", {})
+    monkeypatch.setattr(call_names, "_cache_dir", tmp_path / "call_reply_audio")
+    return tmp_path / "call_reply_audio"
+
+
 def make_conn(cfg=None):
     logger = SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None)
     return SimpleNamespace(
@@ -215,6 +224,67 @@ async def test_only_call_name_reply_audio_is_cached(spoken, monkeypatch):
     assert sent == [("sleep", call_names.CACHED_REPLY_DELAY),
                     ("FIRST", [b"opus-" + call_names.DEFAULT_REPLY.encode()], call_names.DEFAULT_REPLY),
                     ("LAST", [], None)]
+    # 声明收到 tts start 就能播的设备不用等
+    sent.clear()
+    c.features = {"ready_on_tts_start": True}
+    assert await handle_call_name(c, "嗨 cloud") is None
+    assert [x[0] for x in sent] == ["FIRST", "LAST"]
+
+
+async def test_reply_audio_warmed_up_and_kept_on_disk(spoken, monkeypatch, reply_cache):
+    """连接建立后提前合成"我在"并存盘；服务重启（内存缓存清空）后从磁盘读回，第一次只喊称呼就直接发。"""
+    import asyncio
+
+    import core.handle.sendAudioHandle as send_mod
+
+    sent, synthesized = [], []
+
+    async def fake_send_audio(conn, sentence_type, audios, text, sentence_id=None):
+        sent.append((sentence_type.name, audios, text))
+
+    def to_tts(text):
+        synthesized.append(text)
+        return [b"\x01\x02", b"opus-" + text.encode()]
+
+    monkeypatch.setattr(send_mod, "sendAudioMessage", fake_send_audio)
+    c = make_conn({"reply": "来了，什么事"})
+    c.tts = SimpleNamespace(voice="v1", to_tts=to_tts)
+    c.sample_rate, c.features = 24000, {"ready_on_tts_start": True}
+    await call_names.warm_up(c)
+    assert synthesized == ["来了 什么事"] and len(list(reply_cache.iterdir())) == 1
+    await call_names.warm_up(c)
+    assert len(synthesized) == 1  # 已经有了不再合成
+
+    monkeypatch.setattr(call_names, "_audio_cache", {})  # 相当于网关重启
+    assert await handle_call_name(c, "嗨 cloud") is None
+    assert spoken["tts"] == [] and len(synthesized) == 1
+    assert sent[0] == ("FIRST", [b"\x01\x02", "opus-来了 什么事".encode()], "来了 什么事")
+
+    # 正在预合成时喊了称呼：等它合成完，不再另外合成一遍
+    monkeypatch.setattr(call_names, "_audio_cache", {})
+    for f in reply_cache.iterdir():
+        f.unlink()
+    gate = asyncio.Event()
+
+    async def slow_to_thread(func, *args):
+        await gate.wait()
+        return func(*args)
+
+    monkeypatch.setattr(call_names.asyncio, "to_thread", slow_to_thread)
+    warming = asyncio.ensure_future(call_names._fill_cache(c, "来了 什么事"))
+    await asyncio.sleep(0)
+    speaking = asyncio.ensure_future(handle_call_name(c, "嗨 cloud"))
+    await asyncio.sleep(0)
+    gate.set()
+    assert await speaking is None
+    await warming
+    assert len(synthesized) == 2 and spoken["tts"] == [] and sent[-2][0] == "FIRST"
+
+
+async def test_warm_up_skipped_when_call_names_disabled(monkeypatch):
+    c = make_conn({"enabled": False})
+    c.tts = SimpleNamespace(voice="v1", to_tts=lambda text: pytest.fail("不该合成"))
+    await call_names.warm_up(c)
 
 
 async def test_only_call_name_speaks_pending_report_of_grok_bot(spoken):

@@ -252,9 +252,10 @@ def on_conn_open(conn: "ConnectionHandler") -> None:
     if st["current"]:
         _apply_intent(conn, st["current"], live=False)
     # 上次断开后有 Agent 在外面做完了活：等问候播完念给用户
-    from core.agent import reports
+    from core.agent import call_names, reports
 
     reports.on_conn_open(conn)
+    call_names.schedule_warm_up(conn)  # 提前准备好只喊称呼时回的"我在"
 
 
 def switch(conn: "ConnectionHandler", name: str, remember: bool = True, live: bool = True) -> bool:

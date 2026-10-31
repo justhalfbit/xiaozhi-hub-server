@@ -168,6 +168,16 @@ http://<电脑的局域网 IP>:16688/xiaozhi/ota/
 
 **热词和纠错怎么选**：某个词经常被认错时，先把正确的写法加进热词，让识别更偏向它；加了热词还是认错（比如 "Claude Code" 总被认成 "cloud code"），就在纠错表里写"认错的写法 → 正确写法"，识别出文字后直接替换。
 
+### 本机设备接口
+
+设备客户端和服务端装在同一台机器上时（例如带屏幕的语音终端），客户端可以用下面的接口在自己的屏幕上切换模型、提示待汇报，不用登录后台。只接受本机直接发来的请求：局域网里的其他电脑、经过反向代理转发来的请求（带 `X-Forwarded-For` 或 `Forwarded` 头）一律返回 403。
+
+| 接口 | 请求 | 返回 |
+| --- | --- | --- |
+| `GET /kiosk/llm` | 可选 `?device=<device-id>` | `options`：可选的模型（装了 Claude Code 时排第一，之后是填好的 API 厂商），每项有 `kind`（`cli` / `api`）、`vendor`、`label`、`entry`、`model`；`default`：后台默认模型；`selected`：带了 device 时是这台设备实际会用的模型（它上次切到的，还可用的话），否则同 `default` |
+| `POST /kiosk/llm/use` | `{"kind": "cli"}` 或 `{"kind": "api", "vendor": "deepseek"}`，可带 `"device"` | 和后台"保存并设为默认"一样切换默认模型（意图识别跟着切）；在线的设备马上换到新模型（从新对话开始，同呼名切换）；带了 device 时这台设备记住这个模型 |
+| `POST /kiosk/reports` | `{"device": "...", "quiet": false, "play": false}` | `count`：这台设备有几条待汇报；`playing`：是否已安排念。`quiet` 为 true 表示设备在睡眠时段，期间有待汇报也不主动念（每次查询都要带上）；`play` 为 true 表示用户点了要听，马上在设备的连接上念 |
+
 ## 6. 常见问题
 
 **连接**

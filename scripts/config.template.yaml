@@ -31,6 +31,8 @@ LLM:
     turn_timeout_seconds: 600       # 一个任务最长做多久；干活期间设备陪着等，连接不会断开
     stall_timeout_seconds: 30       # 连续这么久没有任何响应（卡住）就中断并提示；执行工具时不算
     idle_timeout_seconds: 300
+    background_max_seconds: 7200    # 打断、断开、单轮超时时 Claude 还在干活就后台接着做，做完进待汇报；最长做多久，0 是打断就停
+    background_after_seconds: 30    # 用过工具、或做了这么久才算长任务转后台；更短的聊天被打断直接停
     resume_window_minutes: 120
     resume_keywords: [接着上次聊, 继续上次的话题, 继续刚才的话题, 接着刚才聊]
     first_reply_filler: 好的，我看一下

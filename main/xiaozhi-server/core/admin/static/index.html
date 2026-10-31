@@ -706,6 +706,8 @@ async function renderLLM(root) {
           ${num("turn_timeout_seconds", "单轮超时（秒）", "一个任务最长做多久，默认 600，填 0 不限制")}
           ${num("stall_timeout_seconds", "无响应超时（秒）", "卡住多久就中断；执行工具时不算，填 0 不检查")}
           ${num("idle_timeout_seconds", "空闲关闭进程（秒）", "填 0 每轮结束就关闭")}
+          ${num("background_max_seconds", "后台最长（秒）", "打断、断开、单轮超时时 Claude 还在干活就转后台接着做，做完再汇报；最长做多久，默认 7200，填 0 打断就停")}
+          ${num("background_after_seconds", "算作长任务（秒）", "用过工具、或做了这么久才转后台；更短的聊天被打断直接停，默认 30")}
           ${num("resume_window_minutes", "自动接续（分钟）", "这段时间内重连接着聊，填 0 只在说接续指令时接上")}
           ${num("filler_delay_seconds", "填充语等待（秒）")}
           ${num("progress_interval_seconds", "进度提示间隔（秒）", "第一次提示前等多久，之后逐渐拉长到 4 倍；默认 30，填 0 关闭")}

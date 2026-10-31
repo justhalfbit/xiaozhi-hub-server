@@ -32,7 +32,8 @@ SECRET_FIELD = re.compile(
 ADDABLE_FIELDS = {
     "openai": {"extra_body": "json"},
     # 后来新增的配置项：老用户的配置文件里没有，也要能在后台改
-    "claude_cli": {"progress_interval_seconds": "number", "progress_reply": "text"},
+    "claude_cli": {"progress_interval_seconds": "number", "progress_reply": "text",
+                   "background_max_seconds": "number", "background_after_seconds": "number"},
 }
 
 

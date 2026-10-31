@@ -230,6 +230,14 @@ async def hub(client):
     await h.close()
 
 
+@pytest.fixture(autouse=True)
+async def stop_watches():
+    yield
+    for w in list(gs._watches.values()):
+        w.take()
+    gs._watches.clear()
+
+
 def cfg(**kw):
     base = dict(bot_id="bot-1", bot_name="孙悟空", echo_timeout=5, poll_interval=5, done_delay=0.15, no_reply_timeout=5)
     base.update(kw)
@@ -735,15 +743,15 @@ async def test_waiting_ends_turn_even_if_bot_still_busy(cloud, hub):
 
 
 async def test_idle_before_first_reply_waits_for_late_message(cloud, hub):
-    """服务端托管的 Bot 先变空闲、再追加最后一条消息：空闲后一条都没念过就多等几秒。"""
-    s = GrokBotSession(hub, cfg(first_reply_grace=1.0))
+    """服务端托管的 Bot 先变空闲、再追加最后一条消息：一条都没念过时空闲不算做完。"""
+    s = GrokBotSession(hub, cfg())
     await s.start()
 
     async def script():
         await wait_until(lambda: cloud.sent)
         await cloud.push("agent-upserted", {"agent": {"id": "bot-1", "isRunning": True}})
         await cloud.push("agent-upserted", {"agent": {"id": "bot-1", "isRunning": False}})
-        await real_sleep(0.5)  # 超过 done_delay（0.15）但没超过 first_reply_grace
+        await real_sleep(0.5)  # 超过 done_delay（0.15）
         await cloud.push("transcript", {"agentId": "bot-1", "type": "appended", "entry": reply_entry("迟到的回复。")})
 
     task = asyncio.ensure_future(script())
@@ -841,7 +849,7 @@ async def test_watch_reports_waiting_for_user(cloud, hub):
 
 async def test_watch_survives_session_close_and_idle_stream(cloud, hub):
     """设备断开（会话关闭）后后台盯着的任务还在，事件流也因为它还有订阅而不关。"""
-    s, got = reporting_session(hub)
+    s, got = reporting_session(hub, linger_max=0.3)
     await s.start()
 
     async def script():
@@ -859,7 +867,7 @@ async def test_watch_survives_session_close_and_idle_stream(cloud, hub):
     await cloud.push("agent-upserted", {"agent": {"id": "bot-1", "isRunning": False}})
     await wait_until(lambda: got, timeout=3)
     assert got == ["孙悟空做完了：好了。"]
-    await wait_until(lambda: hub._task is None, timeout=2)  # 汇报完没人订阅了，事件流关闭
+    await wait_until(lambda: hub._task is None, timeout=2)  # 汇报完再盯 linger_max，之后没人订阅了，事件流关闭
 
 
 async def test_new_send_takes_watch_prelude(cloud, hub):
@@ -876,6 +884,7 @@ async def test_new_send_takes_watch_prelude(cloud, hub):
     await task
     await cloud.push("transcript", {"agentId": "bot-1", "type": "appended", "entry": reply_entry("查到一半。")})
     await wait_until(lambda: gs._watches.get(s.watch_key) is not None and gs._watches[s.watch_key].texts, timeout=3)
+    watch_before = gs._watches[s.watch_key]
     # Bot 还在忙，用户又派新活：先念它刚才回的，之后的回复新的一轮自己念；后台任务停掉，不再汇报
     async def script2():
         await wait_until(lambda: len(cloud.sent) == 2)
@@ -886,25 +895,32 @@ async def test_new_send_takes_watch_prelude(cloud, hub):
     evs = await collect(s, "第二件事")
     await task2
     assert texts(evs) == ["孙悟空刚才回了：查到一半。", "新活好了。"] and isinstance(evs[-1], Done)
+    old = watch_before
     await real_sleep(0.3)
-    assert got == [] and s.watch_key not in gs._watches
+    assert got == [] and old.done and gs._watches.get(s.watch_key) is not old  # 旧任务停了；新的一轮做完后另有人盯
     await s.close()
 
 
-async def test_no_watch_when_turn_already_finished(cloud, hub):
-    s, got = reporting_session(hub)
+async def test_finished_turn_lingers_quietly(cloud, hub):
+    """正常做完也再盯一会儿；这期间没有新回复就什么都不汇报，到时间自己停，已念过的不再汇报。"""
+    s, got = reporting_session(hub, linger_max=0.4, poll_interval=0.1)
     await s.start()
 
     async def script():
         await wait_until(lambda: cloud.sent)
         await cloud.push("agent-upserted", {"agent": {"id": "bot-1", "isRunning": True}})
         await cloud.push("transcript", {"agentId": "bot-1", "type": "appended", "entry": reply_entry("收到。")})
+        cloud.entries.append(reply_entry("收到。"))  # 轮询也会再看到它
         await cloud.push("agent-upserted", {"agent": {"id": "bot-1", "isRunning": False}})
 
     task = asyncio.ensure_future(script())
     evs = await collect(s)
     await task
-    assert texts(evs) == ["收到。"] and not evs[-1].interrupted and s.watch_key not in gs._watches
+    assert texts(evs) == ["收到。"] and not evs[-1].interrupted
+    watch = gs._watches[s.watch_key]
+    assert watch.linger
+    await wait_until(lambda: s.watch_key not in gs._watches, timeout=3)
+    assert got == [] and watch.done
     await s.close()
 
 
@@ -1016,6 +1032,7 @@ async def test_watch_is_picked_up_by_new_session_after_close(cloud, hub):
     await s1.close()  # 设备断开
     await cloud.push("transcript", {"agentId": "bot-1", "type": "appended", "entry": reply_entry("查到一半。")})
     await wait_until(lambda: gs._watches.get(("dev-1", "bot-1")) is not None and gs._watches[("dev-1", "bot-1")].texts, timeout=3)
+    old = gs._watches[("dev-1", "bot-1")]
 
     s2 = GrokBotSession(hub, cfg(), on_report=got.append, device_key="dev-1")  # 重连后的新会话
     await s2.start()
@@ -1030,7 +1047,7 @@ async def test_watch_is_picked_up_by_new_session_after_close(cloud, hub):
     await task2
     assert texts(evs) == ["孙悟空刚才回了：查到一半。", "新活好了。"]
     await real_sleep(0.3)
-    assert got == [] and ("dev-1", "bot-1") not in gs._watches  # 旧任务已停，不再汇报
+    assert got == [] and old.done  # 旧任务已停，不再汇报
     await s2.close()
 
 
@@ -1288,3 +1305,145 @@ async def test_gateway_5xx_re_ensures_box_once(cloud, client):
     with pytest.raises(GrokBotError):
         await client.transcript_tail("bot-1", 5)  # 每个接口只重试一次，三个都不通才放弃
     assert cloud.tail_fail == 8 and cloud.window_fail == 8 and cloud.transcript_fail == 8
+
+
+# ---------- 长任务回复丢失（2026-11-01 真机：Bot 中途空闲 63 秒后才回复，本轮已按 0 条回复结束）----------
+
+async def test_idle_midway_then_busy_again_then_reply(cloud, hub):
+    """Bot 忙 → 空闲（一条回复都没有）→ 又忙 → 回复 → 空闲：中途空闲远超 done_delay 也不结束，回复当场念。"""
+    s, got = reporting_session(hub, no_reply_timeout=5, poll_interval=5)
+    await s.start()
+
+    async def script():
+        await wait_until(lambda: cloud.sent)
+        await cloud.push("agent-upserted", {"agent": {"id": "bot-1", "isRunning": True}})
+        await cloud.push("transcript", {"agentId": "bot-1", "type": "appended", "entry": echo_entry(cloud)})
+        await cloud.push("agent-upserted", {"agent": {"id": "bot-1", "isRunning": False}})
+        await real_sleep(0.6)  # 4 倍 done_delay
+        await cloud.push("agent-upserted", {"agent": {"id": "bot-1", "isRunning": True}})
+        await real_sleep(0.3)
+        await cloud.push("transcript", {"agentId": "bot-1", "type": "appended", "entry": reply_entry("查好了，总结如下。")})
+        await cloud.push("agent-upserted", {"agent": {"id": "bot-1", "isRunning": False}})
+
+    task = asyncio.ensure_future(script())
+    evs = await collect(s)
+    await task
+    assert texts(evs) == ["查好了，总结如下。"] and isinstance(evs[-1], Done) and not evs[-1].interrupted
+    assert got == []
+    await s.close()
+
+
+async def test_long_silence_goes_to_watch_then_reports(cloud, hub):
+    """Bot 忙过后一直空闲、没回话：满 no_reply_timeout 设备这边先结束（说一句会再告诉你），转后台；
+    回复到了进待汇报，提示语不算回复、不进汇报。"""
+    s, got = reporting_session(hub, no_reply_timeout=0.4, poll_interval=0.1)
+    await s.start()
+
+    async def script():
+        await wait_until(lambda: cloud.sent)
+        await cloud.push("agent-upserted", {"agent": {"id": "bot-1", "isRunning": True}})
+        await cloud.push("transcript", {"agentId": "bot-1", "type": "appended", "entry": echo_entry(cloud)})
+        await cloud.push("agent-upserted", {"agent": {"id": "bot-1", "isRunning": False}})
+
+    task = asyncio.ensure_future(script())
+    evs = await collect(s, "查资料写个总结")
+    await task
+    assert texts(evs) == [gs.NO_REPLY_NOTICE] and isinstance(evs[-1], Done)
+    watch = gs._watches[s.watch_key]
+    assert not watch.linger and got == []
+    await real_sleep(0.3)  # 后台盯着时空闲多久都不算做完，也不会再说"还没回话"
+    assert got == [] and not watch.done
+    # 一分多钟后回复才到：进待汇报
+    cloud.entries += [echo_entry(cloud, "查资料写个总结"), reply_entry("总结写好了。", "e5")]
+    await cloud.push("transcript", {"agentId": "bot-1", "type": "appended", "entry": reply_entry("总结写好了。", "e5")})
+    await wait_until(lambda: got, timeout=3)
+    assert got == ["孙悟空做完了：总结写好了。"]
+    await real_sleep(0.3)  # 轮询再看到同一条不重复汇报
+    assert got == ["孙悟空做完了：总结写好了。"]
+    await s.close()
+
+
+async def test_finished_turn_then_late_follow_up_is_reported(cloud, hub):
+    """先回一句"我去查一下"、空闲（本轮正常结束），过一会儿才发结果：结果进待汇报，开头那句不重复。"""
+    s, got = reporting_session(hub, linger_max=5)
+    await s.start()
+
+    async def script():
+        await wait_until(lambda: cloud.sent)
+        await cloud.push("agent-upserted", {"agent": {"id": "bot-1", "isRunning": True}})
+        await cloud.push("transcript", {"agentId": "bot-1", "type": "appended", "entry": reply_entry("好，我去查一下。")})
+        await cloud.push("agent-upserted", {"agent": {"id": "bot-1", "isRunning": False}})
+
+    task = asyncio.ensure_future(script())
+    evs = await collect(s)
+    await task
+    assert texts(evs) == ["好，我去查一下。"] and isinstance(evs[-1], Done) and not evs[-1].interrupted
+    assert gs._watches[s.watch_key].linger
+    await real_sleep(0.3)
+    assert got == []
+    await cloud.push("agent-upserted", {"agent": {"id": "bot-1", "isRunning": True}})
+    await cloud.push("transcript", {"agentId": "bot-1", "type": "appended", "entry": reply_entry("查到了，一共三家。", "e3")})
+    await cloud.push("agent-upserted", {"agent": {"id": "bot-1", "isRunning": False}})
+    await wait_until(lambda: got, timeout=3)
+    assert got == ["孙悟空做完了：查到了，一共三家。"]
+    # 汇报完还接着盯：再补一条也能收到
+    await cloud.push("transcript", {"agentId": "bot-1", "type": "appended", "entry": reply_entry("补充一句。", "e4")})
+    await wait_until(lambda: len(got) == 2, timeout=3)
+    assert got[1] == "孙悟空做完了：补充一句。"
+    await s.close()
+
+
+async def test_no_reply_turn_then_new_question_speaks_late_reply_first(cloud, hub):
+    """没回话转后台后，回复还没进待汇报（Bot 还忙着）用户就又问：先念那条迟到的回复，不被新一轮的基线吞掉。"""
+    s, got = reporting_session(hub, no_reply_timeout=0.3, poll_interval=0.1)
+    await s.start()
+
+    async def script():
+        await wait_until(lambda: cloud.sent)
+        await cloud.push("agent-upserted", {"agent": {"id": "bot-1", "isRunning": True}})
+        await cloud.push("transcript", {"agentId": "bot-1", "type": "appended", "entry": echo_entry(cloud)})
+        await cloud.push("agent-upserted", {"agent": {"id": "bot-1", "isRunning": False}})
+
+    task = asyncio.ensure_future(script())
+    await collect(s, "讲个故事")
+    await task
+    cloud.agents[0]["isRunning"] = True  # 轮询看到它又忙起来
+    await cloud.push("agent-upserted", {"agent": {"id": "bot-1", "isRunning": True}})
+    await cloud.push("transcript", {"agentId": "bot-1", "type": "appended", "entry": reply_entry("从前有只小刺猬。", "e5")})
+    cloud.entries += [echo_entry(cloud, "讲个故事"), reply_entry("从前有只小刺猬。", "e5")]
+    await wait_until(lambda: gs._watches[s.watch_key].texts, timeout=3)
+
+    async def script2():
+        await wait_until(lambda: len(cloud.sent) == 2)
+        await cloud.push("transcript", {"agentId": "bot-1", "type": "appended", "entry": reply_entry("有只小乌龟。", "e9")})
+        cloud.agents[0]["isRunning"] = False
+        await cloud.push("agent-upserted", {"agent": {"id": "bot-1", "isRunning": False}})
+
+    task2 = asyncio.ensure_future(script2())
+    evs = await collect(s, "讲个故事")
+    await task2
+    assert texts(evs) == ["孙悟空刚才回了：从前有只小刺猬。", "有只小乌龟。"]
+    assert got == []
+    await s.close()
+
+
+async def test_provider_timeout_interrupt_turns_into_watch(cloud, hub):
+    """provider 等超时（turn_timeout）时只会发 interrupt：一条回复都没有也要转后台盯着，回复到了进待汇报。"""
+    s, got = reporting_session(hub)
+    await s.start()
+
+    async def script():
+        await wait_until(lambda: cloud.sent)
+        await cloud.push("agent-upserted", {"agent": {"id": "bot-1", "isRunning": True}})
+        await cloud.push("agent-upserted", {"agent": {"id": "bot-1", "isRunning": False}})  # 中途空闲
+        await real_sleep(0.3)
+        await s.interrupt()
+
+    task = asyncio.ensure_future(script())
+    evs = await collect(s)
+    await task
+    assert texts(evs) == [] and evs[-1].interrupted
+    await cloud.push("transcript", {"agentId": "bot-1", "type": "appended", "entry": reply_entry("做完了。")})
+    await wait_until(lambda: got, timeout=3)
+    assert got == ["孙悟空做完了：做完了。"]
+    await s.close()

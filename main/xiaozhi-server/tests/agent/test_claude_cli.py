@@ -984,6 +984,31 @@ def test_abort_ends_turn_immediately_even_if_claude_ignores_it(provider):
     assert provider._in_background(provider._states[c.session_id])
 
 
+def test_turn_ends_when_a_newer_turn_started_even_if_client_abort_was_cleared(provider):
+    """打断后新的一轮马上开始，client_abort 被清回 False，这里还没轮询到：看代次（turn_gen）也要马上结束，
+    不能空等到单轮超时，期间占着网关的一个线程。"""
+    from core.agent.agent_session import Activity
+    from core.utils import turn_gen
+    provider.filler, provider.turn_timeout, provider.stall_timeout = "", 30, 30
+    FakeAgent.script = [[Activity("x", tools_running=1), 60.0, Done()]]
+    c = conn()
+    c.client_abort = False
+    provider.on_conn_open(c)
+    ended = threading.Event()
+
+    def consume():
+        for _ in provider.response(c.session_id, [{"role": "user", "content": "跑个长命令"}]):
+            pass
+        ended.set()
+
+    threading.Thread(target=consume, daemon=True).start()
+    time.sleep(0.5)
+    turn_gen.bump(c)          # 设备打断（client_abort 置 True 又被新一轮清掉，这里没看到）
+    provider.abort(c)
+    assert ended.wait(1), "代次变了这一轮没有马上结束"
+    assert provider._in_background(provider._states[c.session_id])   # 在跑工具：照 grok-lost-reply 的设计转后台
+
+
 def test_abort_after_turn_keeps_process(provider):
     c = conn()
     provider.on_conn_open(c)

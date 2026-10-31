@@ -397,3 +397,23 @@ def test_turn_already_stored_then_dropped_is_deleted_from_the_db():
     assert len(stored()) == 2
     reply_progress.cut(conn, played_ms=0)
     assert stored() == []
+
+
+async def test_agent_interrupted_while_thinking_keeps_question_and_stays_silent():
+    """Claude Code / Grok Bot：被打断后它们自己转后台（做完进待汇报，不经过这里）；
+    这里只保证旧一轮迟到的字不送合成，记录里提问留着、回复记"……"。"""
+    llm = ThinkingLLM()
+    llm.AGENT_LABEL = "Claude Code"
+    h = make_conn(llm)
+    gen = turn_gen.bump(h)
+    t = threading.Thread(target=h.chat, args=("第一个问题",), kwargs={"turn": gen})
+    t.start()
+    await asyncio.to_thread(llm.thinking.wait, 5)
+    h.client_is_speaking = True
+    await handleAbortMessage(h, played_ms=0, drop_audio=True)
+    h.client_abort = False                       # 新的一轮开始了
+    await asyncio.to_thread(h.chat, "第二个问题", 0, turn_gen.bump(h))
+    llm.release.set()
+    await asyncio.to_thread(t.join, 5)
+    assert "旧的回答，不该播。" not in tts_texts(h)
+    assert contents(h) == [("user", "第一个问题"), ("assistant", "……"), ("user", "第二个问题"), ("assistant", "新的回答。")]

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from core.connection import ConnectionHandler
 from core.utils.util import audio_to_data
+from core.agent import clear_command
 from core.agent.call_names import handle_call_name
 from core.handle.abortHandle import handleAbortMessage
 from core.handle.intentHandler import handle_user_intent, speak_txt
@@ -95,6 +96,11 @@ async def startToChat(conn: "ConnectionHandler", text):
 
     # [xiaozhi-hub] 呼名：句首"嗨 Claude"先去掉称呼；只有称呼时直接回复，不发给模型
     actual_text = await handle_call_name(conn, actual_text)
+    if actual_text is None:
+        return
+
+    # [xiaozhi-hub] "清除聊天记录"：先问一遍，说确定才清（不交给模型，各种模型都能用）
+    actual_text = await clear_command.handle(conn, actual_text)
     if actual_text is None:
         return
 

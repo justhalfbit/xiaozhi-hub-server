@@ -397,6 +397,62 @@ async def test_kiosk_asr(kiosk):
     assert (await kiosk.post("/kiosk/asr", data=pcm)).status == 501
 
 
+async def test_kiosk_chat_history_and_clear(kiosk, tmp_path, monkeypatch):
+    from core.agent import chat_history
+
+    monkeypatch.setattr(chat_history, "get_project_dir", lambda: str(tmp_path))
+    store = chat_history.db()
+    store.insert("dev-1", "DeepSeekLLM", "user", "我叫小明")
+    store.insert("dev-1", "DeepSeekLLM", "assistant", "你好小明")
+    store.insert("dev-1", "ClaudeCLI", "user", "看看日志")
+    store.insert("dev-2", "DeepSeekLLM", "user", "别人的")
+    assert (await kiosk.get("/kiosk/chat/history")).status == 400
+    data = await (await kiosk.get("/kiosk/chat/history?device=dev-1&limit=1")).json()
+    assert data["ok"] and {k: [m["text"] for m in v] for k, v in data["models"].items()} == \
+        {"DeepSeekLLM": ["你好小明"], "ClaudeCLI": ["看看日志"]}
+    assert (await kiosk.get("/kiosk/chat/history?device=dev-1&limit=x")).status == 400
+
+    store.set_memory("dev-1", "- 用户叫小明", "summary", progress={"DeepSeekLLM": 1})
+    data = await (await kiosk.post("/kiosk/chat/clear", json={"device": "dev-1", "memory_only": True})).json()
+    assert data == {"ok": True, "deleted": 0, "agents": []}
+    assert store.memory("dev-1")["summary"] == "" and store.progress("dev-1") == {"DeepSeekLLM": 1}
+    assert (await kiosk.post("/kiosk/chat/clear", json={})).status == 400
+    data = await (await kiosk.post("/kiosk/chat/clear", json={"device": "dev-1"})).json()
+    assert data == {"ok": True, "deleted": 3, "agents": ["Claude"]}
+    assert (await (await kiosk.get("/kiosk/chat/history?device=dev-1")).json())["models"] == {}
+    assert store.models("dev-2") == ["DeepSeekLLM"]
+
+
+async def test_memory_page(client, tmp_path):
+    from core.agent import chat_history
+
+    store = chat_history.db()
+    store.insert("dev-1", "DeepSeekLLM", "user", "我叫小明")
+    store.insert("dev-1", "ClaudeCLI", "user", "看看日志")
+    store.set_memory("dev-1", "- 用户叫小明", "summary")
+    data = await (await client.get("/admin/api/memory")).json()
+    assert data["ok"] and data["settings"]["max_messages"] == 30
+    [dev] = data["devices"]
+    assert dev["device"] == "dev-1" and dev["memory"]["summary"] == "- 用户叫小明" and dev["memory"]["source"] == "summary"
+    assert dev["memory"]["updated"] and dev["online"] is False
+    assert {(m["entry"], m["count"], m["agent"]) for m in dev["models"]} == {("DeepSeekLLM", 1, False), ("ClaudeCLI", 1, True)}
+
+    v = dev["memory"]["version"]
+    r = await client.post("/admin/api/memory/save", json={"device": "dev-1", "summary": "- 用户叫小红", "version": v})
+    assert r.status == 200 and (await r.json())["memory"]["summary"] == "- 用户叫小红"
+    assert store.memory("dev-1")["source"] == "manual"
+    r = await client.post("/admin/api/memory/save", json={"device": "dev-1", "summary": "旧的", "version": v})
+    assert r.status == 409 and (await r.json())["memory"]["summary"] == "- 用户叫小红"
+    r = await client.post("/admin/api/memory/save", json={"device": "dev-1", "summary": ""})
+    assert r.status == 200 and store.memory("dev-1")["summary"] == ""
+    assert (await client.post("/admin/api/memory/save", json={"device": "dev-1"})).status == 400
+    assert (await client.post("/admin/api/memory/save", json={"device": "dev-1", "summary": "长" * 5001})).status == 400
+
+    await client.post("/admin/api/logout", json={})
+    assert (await client.get("/admin/api/memory")).status == 401
+    assert (await client.post("/admin/api/memory/save", json={"device": "dev-1", "summary": "x"})).status == 401
+
+
 def test_sherpa_recognize_pcm():
     from core.providers.asr.sherpa_onnx_local import ASRProvider
 
@@ -416,7 +472,8 @@ def test_sherpa_recognize_pcm():
 
 async def test_kiosk_only_from_this_machine(kiosk, monkeypatch):
     calls = [("get", "/kiosk/llm", None), ("post", "/kiosk/llm/use", {"kind": "cli"}),
-             ("post", "/kiosk/reports", {"device": "dev-1"}), ("post", "/kiosk/asr", None)]
+             ("post", "/kiosk/reports", {"device": "dev-1"}), ("post", "/kiosk/asr", None),
+             ("get", "/kiosk/chat/history?device=dev-1", None), ("post", "/kiosk/chat/clear", {"device": "dev-1"})]
     for method, path, body in calls:  # 本机反向代理转发来的不算本机
         r = await getattr(kiosk, method)(path, json=body, headers={"X-Forwarded-For": "203.0.113.5"})
         assert r.status == 403

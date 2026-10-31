@@ -2,7 +2,7 @@
 
 - 每个连接自己决定用哪个模型：切换时只换这个连接的 conn.llm，不影响其他设备；
 - 各聊各的：每个模型在这个连接里有自己的一份对话记录（conn.dialogue 跟着换），切换时不带上下文过去；
-  claude_cli 本来就按设备保存会话；API 模型的记录只在本次连接内保留；
+  claude_cli 本来就按设备保存会话；API 模型的记录按设备和模型存进 data/chat.db，新连接时载入最近一段（chat_history）；
 - 每台设备上次用的模型存到 data/agent_sessions.json，重连、服务重启后仍有效；
 - 模型实例按条目名缓存、所有连接共用（和原来共享 ws_server._llm 一样）。后台默认模型直接用 ws_server._llm；
   其他模型第一次被叫到时才创建。条目配置变了（后台保存后热加载）就让旧实例退役，下次叫到时重建，
@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Optional
 
 from config.config_loader import get_project_dir
 from config.logger import setup_logging
+from core.agent import chat_history
 from core.agent.session_store import SessionStore
 
 if TYPE_CHECKING:
@@ -156,6 +157,7 @@ def _dialogue_for(conn: "ConnectionHandler", name: str):
     if dialogue is None:
         dialogue = Dialogue()
         dialogue.dialogue = [m for m in conn.dialogue.dialogue if m.role == "system" or m.is_temporary]
+        chat_history.load(conn, dialogue, name)
         st["dialogues"][name] = dialogue
     prompt = getattr(conn, "prompt", None)
     if prompt:
@@ -167,6 +169,7 @@ def on_conn_open(conn: "ConnectionHandler") -> None:
     """连接建立时：通知默认实例，再切到这台设备上次用的模型（还可用的话）。"""
     st = _state(conn)
     st["current"] = default_name(conn)
+    chat_history.load(conn, conn.dialogue, st["current"])
     if conn.llm is not None:
         _attach(conn, conn.llm)
     name = remembered(conn)

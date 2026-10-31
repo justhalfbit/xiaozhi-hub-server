@@ -24,7 +24,7 @@ from config.logger import setup_logging
 from core.admin import auth, catalog, config_store, connections, pages, pipeline
 from core.admin.grokbot import GrokBotAdmin
 from core.admin.status import _claude_version, collect_status
-from core.agent import llm_router, reports
+from core.agent import chat_history, llm_router, reports
 from core.agent.agent_session import ErrorKind
 from core.agent.grokbot_client import GrokBotError
 from core.utils.modules_initialize import initialize_modules
@@ -66,6 +66,8 @@ class AdminHandler:
                 web.post("/admin/api/logout", self.handle_logout),
                 web.get("/admin/api/status", self.handle_status),
                 web.get("/admin/api/devices", self.handle_devices),
+                web.get("/admin/api/memory", self.handle_memory),
+                web.post("/admin/api/memory/save", self.handle_memory_save),
                 web.post("/admin/api/devices/{session_id}/emotion", self.handle_emotion_one),
                 web.post("/admin/api/devices/{session_id}/emotion-test", self.handle_emotion_test),
                 web.post("/admin/api/devices/{session_id}/emotion-test/stop", self.handle_emotion_stop),
@@ -101,6 +103,8 @@ class AdminHandler:
                 web.post("/kiosk/llm/use", self.handle_kiosk_llm_use),
                 web.post("/kiosk/reports", self.handle_kiosk_reports),
                 web.post("/kiosk/asr", self.handle_kiosk_asr),
+                web.get("/kiosk/chat/history", self.handle_kiosk_chat_history),
+                web.post("/kiosk/chat/clear", self.handle_kiosk_chat_clear),
             ]
         )
 
@@ -648,6 +652,41 @@ class AdminHandler:
         text = await self._blocking(asr.recognize_pcm, pcm)
         return self._json({"ok": True, "text": text, "ms": round((time.monotonic() - started) * 1000)})
 
+    async def handle_kiosk_chat_history(self, request: web.Request):
+        """?device=<device-id>[&limit=N]：这台设备存下来的聊天记录，给屏幕显示。
+
+        返回 {"models": {条目名: [{id, role: user|bot, text, time, interrupted}]}}，每个模型最近 limit 条
+        （默认 chat_history.display_limit）。"""
+        if not self._from_this_machine(request):
+            return self._error("仅限本机", 403)
+        device = request.query.get("device") or ""
+        if not device:
+            return self._error("缺少 device", 400)
+        cfg = chat_history.settings(await self._blocking(self._merged))
+        try:
+            limit = max(1, min(int(request.query.get("limit") or cfg["display_limit"]), 500))
+        except ValueError:
+            return self._error("limit 要是数字", 400)
+        models = await self._blocking(chat_history.history, device, limit)
+        return self._json({"ok": True, "models": models})
+
+    async def handle_kiosk_chat_clear(self, request: web.Request):
+        """{"device", "memory_only"?}：清除这台设备的聊天记录（所有模型），和语音"清除聊天记录"同一套。
+
+        只清本机：库里的记录和记忆、在线连接里网关这边的对话；Claude Code、Grok Bot 自己的会话和记忆不碰。
+        memory_only：只清记忆，记录留着。返回 {"deleted", "agents": 聊过的 Claude Code / Grok Bot}。"""
+        if not self._from_this_machine(request):
+            return self._error("仅限本机", 403)
+        body = await self._read_json(request)
+        device = str(body.get("device") or "")
+        if not device:
+            return self._error("缺少 device", 400)
+        online = [c for c in (connections.get(i["session_id"]) for i in connections.snapshot()
+                              if i["device_id"] == device) if c is not None]
+        merged = await self._blocking(self._merged)
+        result = await self._blocking(chat_history.clear, device, merged, bool(body.get("memory_only")), online)
+        return self._json({"ok": True, **result})
+
     # ---------- 工作原理 ----------
 
     async def handle_pipeline(self, request: web.Request):
@@ -873,6 +912,39 @@ class AdminHandler:
         task = run["task"]
         return {"running": not task.done(), "stopped": task.cancelled(), "index": run["index"], "total": run["total"],
                 "emotion": run["emotion"], "emoji": EMOTION_EMOJI.get(run["emotion"], "")}
+
+    # ---------- 记忆（聊天记录总结） ----------
+
+    async def handle_memory(self, request: web.Request):
+        """每台设备的记忆全文、更新时间、存了哪些模型的记录。"""
+        self._require_login(request)
+        merged = await self._blocking(self._merged)
+        cfg = chat_history.settings(merged)
+        online = {d["device_id"] for d in connections.snapshot() if d.get("device_id")}
+        devices = await self._blocking(chat_history.describe_memories, merged)
+        for d in devices:
+            d["online"] = d["device"] in online
+        return self._json({"ok": True, "devices": devices,
+                           "settings": {k: cfg[k] for k in ("enabled", "summary", "max_messages", "max_tokens",
+                                                            "summary_min", "summary_chars")}})
+
+    async def handle_memory_save(self, request: web.Request):
+        """{"device", "summary", "version"?}：保存手改的记忆（summary 为空就是清空），下一次请求就用新的。
+        带 version 时，打开编辑后自动总结更新过就不保存，返回 409 和现在的记忆。"""
+        self._require_login(request)
+        body = await self._read_json(request)
+        device = str(body.get("device") or "")
+        summary = body.get("summary")
+        if not device or not isinstance(summary, str):
+            return self._error("缺少 device 或 summary", 400)
+        if len(summary) > 5000:
+            return self._error("记忆最多 5000 字", 400)
+        version = body.get("version")
+        ok, memory = await self._blocking(chat_history.set_memory, device, summary,
+                                          int(version) if isinstance(version, int) else None)
+        if not ok:
+            return self._json({"ok": False, "error": "你编辑期间记忆被自动总结更新了，请看过新内容再改", "memory": memory}, 409)
+        return self._json({"ok": True, "memory": memory})
 
     async def handle_devices(self, request: web.Request):
         self._require_login(request)

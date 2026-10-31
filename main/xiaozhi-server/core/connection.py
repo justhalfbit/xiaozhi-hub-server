@@ -46,6 +46,7 @@ from core.utils.voiceprint_provider import VoiceprintProvider
 from core.utils.util import get_system_error_response
 from core.utils import reply_progress, textUtils
 from core.utils.tool_markup import ToolMarkupFilter, strip_tool_markup
+from core.agent import chat_history
 
 
 TAG = __name__
@@ -1068,6 +1069,9 @@ class ConnectionHandler:
             return self._chat(query, depth, sentence_id)
         finally:
             reply_progress.finish_turn(self, sentence_id)
+            # [xiaozhi-hub] 这一轮写进 data/chat.db；截掉的旧对话攒够了就在后台总结成记忆
+            chat_history.sync(self)
+            chat_history.maybe_summarize(self)
 
     def _put_reply(self, sentence_id, text):
         """[xiaozhi-hub] 把这一轮的回复写进对话；被打断后不写（由 reply_progress 写播出去的部分）。"""
@@ -1145,6 +1149,9 @@ class ConnectionHandler:
                     self.memory.query_memory(query), self.loop
                 )
                 memory_str = future.result()
+            # [xiaozhi-hub] 没配记忆模块（nomem）时，用聊天记录里被截掉部分的总结
+            if not memory_str:
+                memory_str = chat_history.memory_for(self) or memory_str
 
             # 仅在该说话人首次出现时把身份注入 system，之后靠对话历史首轮保留，
             # 避免每轮在 system 重复出现名字诱导模型反复称呼
@@ -1610,6 +1617,7 @@ class ConnectionHandler:
             from core.agent import llm_router
             hub_connections.unregister(self)
             llm_router.on_conn_close(self)
+            chat_history.sync_all(self)
 
             # 清理 VAD 连接资源
             if (

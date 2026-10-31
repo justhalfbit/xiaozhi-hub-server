@@ -36,6 +36,18 @@ SEGMENT_MIN_BYTES = 16000 * 2  # [xiaozhi-hub] 边说边识别：不到 1 秒的
 SEGMENT_CUT_BYTES = 16000 * 2 * 15 // 100
 
 
+async def send_vad_event(conn: "ConnectionHandler", state: str):
+    """[xiaozhi-hub] 给 hello 里声明了 features.vad_end 的客户端发 {"type": "vad", "state": ...}：
+    end = 判定说完、开始识别（界面显示"正在识别"）；empty = 这句什么也没识别出来（咳嗽、太短、只有回声、
+    识别出错），客户端不用再等文字，马上提示"没听清"。"""
+    if not (conn.features or {}).get("vad_end"):
+        return
+    try:
+        await conn.websocket.send(json.dumps({"type": "vad", "state": state, "session_id": conn.session_id}))
+    except Exception:
+        pass
+
+
 def join_segments(texts: List[str]) -> str:
     """[xiaozhi-hub] 拼接分段识别的文字：前一段末尾的句号换成逗号（停顿处多半是一句话中间）。"""
     out = ""
@@ -102,12 +114,7 @@ class ASRProviderBase(ABC):
 
             # 自动模式下通过VAD检测到语音停止时触发识别
             if conn.asr.interface_type != InterfaceType.STREAM and conn.client_voice_stop:
-                # [xiaozhi-hub] 告诉要这个事件的客户端：判定说完了，开始识别（界面显示"正在识别"）
-                if (conn.features or {}).get("vad_end"):
-                    try:
-                        await conn.websocket.send(json.dumps({"type": "vad", "state": "end", "session_id": conn.session_id}))
-                    except Exception:
-                        pass
+                await send_vad_event(conn, "end")  # [xiaozhi-hub]
                 # [xiaozhi-hub] 判定说完要等约 0.8 秒静音，这段静音不用识别：只留最后有声音之后的 0.3 秒
                 # （识别耗时和音频长短成正比，板子上约省 0.25 秒；0.3 秒以内结尾的字不受影响）
                 voice_end = getattr(conn, "asr_voice_end", 0) or len(conn.asr_audio)
@@ -120,6 +127,8 @@ class ASRProviderBase(ABC):
                     done = len(pcm_bytes) if segments and voice_end <= start else \
                         sum(len(f) for f in conn.asr_audio[:start])
                     await self.handle_voice_stop(conn, [pcm_bytes], segments=segments, segmented_bytes=done)
+                else:
+                    await send_vad_event(conn, "empty")  # [xiaozhi-hub] 太短（咳一声）：不识别
                 conn.reset_audio_states()
 
     def _maybe_decode_segment(self, conn: "ConnectionHandler"):
@@ -265,8 +274,11 @@ class ASRProviderBase(ABC):
                 enqueue_asr_report(conn, enhanced_text, audio_snapshot)
                 # 使用自定义模块进行上报
                 await startToChat(conn, enhanced_text)
+            else:
+                await send_vad_event(conn, "empty")  # [xiaozhi-hub] 没识别出字，或只是回复的回声
         except Exception as e:
             logger.bind(tag=TAG).error(f"处理语音停止失败: {e}")
+            await send_vad_event(conn, "empty")  # [xiaozhi-hub]
             import traceback
 
             logger.bind(tag=TAG).debug(f"异常详情: {traceback.format_exc()}")

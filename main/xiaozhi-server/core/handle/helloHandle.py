@@ -58,7 +58,11 @@ async def handleHelloMessage(conn: "ConnectionHandler", msg_json):
             conn.logger.bind(tag=TAG).debug("客户端启用了服务端AEC")
             conn.client_aec = True
 
-    await conn.websocket.send(json.dumps(conn.welcome_msg))
+    welcome = conn.welcome_msg
+    if features and features.get("vad_end"):
+        # [xiaozhi-hub] 告诉客户端这个网关会发 VAD 事件（含"什么也没识别出来"），它不必干等兜底超时
+        welcome = {**welcome, "features": {**(welcome.get("features") or {}), "vad_end": True}}
+    await conn.websocket.send(json.dumps(welcome))
 
     # The device waits for the server hello before processing MCP messages.
     if features and features.get("mcp"):

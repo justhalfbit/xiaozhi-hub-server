@@ -19,6 +19,7 @@ from core.handle.reportHandle import enqueue_asr_report
 from core.utils.util import remove_punctuation_and_length
 from core.handle.receiveAudioHandle import handleAudioMessage
 from core.agent.asr_text import correct_and_record  # [xiaozhi-hub]
+from core.utils import reply_echo  # [xiaozhi-hub]
 from typing import Optional, Tuple, List, NamedTuple, TYPE_CHECKING
 
 
@@ -165,6 +166,14 @@ class ASRProviderBase(ABC):
             # 检查文本长度
             text_len, _ = remove_punctuation_and_length(content_for_length_check)
             self.stop_ws_connection()
+
+            # [xiaozhi-hub] 回复期间识别出的是回复自己的回声（开着回声消除时麦克风不关）就丢掉
+            if text_len > 0 and reply_echo.during_reply(conn):
+                logger.bind(tag=TAG).info(
+                    f"回复期间识别: {content_for_length_check} | 峰值 {reply_echo.level_db(asr_audio_task):.1f} dBFS")
+                if reply_echo.is_echo(conn, content_for_length_check):
+                    logger.bind(tag=TAG).info(f"忽略回声识别: {content_for_length_check}")
+                    text_len = 0
 
             if text_len > 0:
                 audio_snapshot = asr_audio_task.copy()

@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from core.connection import ConnectionHandler
-from core.utils import textUtils
+from core.utils import reply_echo, textUtils
 from core.utils.util import audio_to_data
 from core.providers.tts.dto.dto import SentenceType
 from core.utils.audioRateController import AudioRateController
@@ -50,6 +50,7 @@ async def sendAudioMessage(conn: "ConnectionHandler", sentenceType, audios, text
             # 新句子或流控器未初始化，立即发送
             await send_tts_message(conn, "sentence_start", text)
 
+    reply_echo.note_reply(conn, text)  # [xiaozhi-hub] 记下回复内容，回复期间识别出的回声据此丢掉
     await sendAudio(conn, audios)
     # 发送句子开始消息
     if sentenceType is not SentenceType.MIDDLE:
@@ -326,6 +327,7 @@ async def send_tts_message(conn: "ConnectionHandler", state, text=None):
             await sendAudio(conn, audios)
         # 等待所有音频包发送完成
         await _wait_for_audio_completion(conn)
+        reply_echo.note_reply(conn, None)  # [xiaozhi-hub] 回声过滤的窗口从音频发完时算起
 
         # 检查是否是当前轮次
         if current_sentence_id != conn.sentence_id:

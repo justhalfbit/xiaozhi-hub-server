@@ -1,3 +1,4 @@
+import asyncio
 import glob
 import hashlib
 import time
@@ -248,7 +249,8 @@ class ASRProvider(ASRProviderBase):
             s = self.model.create_stream()
             samples, sample_rate = self.read_wave(file_path)
             s.accept_waveform(sample_rate, samples)
-            self.model.decode_stream(s)
+            # [xiaozhi-hub] 放到线程里解码：长句要好几秒，期间主事件循环（其他连接、后台接口）不被卡住
+            await asyncio.to_thread(self.model.decode_stream, s)
             text = s.result.text
             logger.bind(tag=TAG).debug(
                 f"语音识别耗时: {time.time() - start_time:.3f}s | 结果: {text}"

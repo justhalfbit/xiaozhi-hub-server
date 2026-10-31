@@ -29,6 +29,8 @@ if TYPE_CHECKING:
 TAG = __name__
 logger = setup_logging()
 
+ASR_TAIL_BYTES = 16000 * 2 * 3 // 10  # [xiaozhi-hub] 送去识别的尾部静音：0.3 秒 16kHz 16 位
+
 
 class ASRProviderBase(ABC):
     def __init__(self):
@@ -67,6 +69,8 @@ class ASRProviderBase(ABC):
         else:
             # 自动/实时模式：使用VAD检测
             conn.asr_audio.append(pcm_frame)
+            if audio_have_voice:
+                conn.asr_voice_end = len(conn.asr_audio)  # [xiaozhi-hub] 最后一帧有声音的位置
 
             # 如果没有语音，且之前也没有声音，缓存部分音频
             if not audio_have_voice and not conn.client_have_voice:
@@ -75,8 +79,16 @@ class ASRProviderBase(ABC):
 
             # 自动模式下通过VAD检测到语音停止时触发识别
             if conn.asr.interface_type != InterfaceType.STREAM and conn.client_voice_stop:
-                # 直接使用asr_audio中的PCM数据
-                pcm_bytes = b"".join(conn.asr_audio)
+                # [xiaozhi-hub] 告诉要这个事件的客户端：判定说完了，开始识别（界面显示"正在识别"）
+                if (conn.features or {}).get("vad_end"):
+                    try:
+                        await conn.websocket.send(json.dumps({"type": "vad", "state": "end", "session_id": conn.session_id}))
+                    except Exception:
+                        pass
+                # [xiaozhi-hub] 判定说完要等约 0.8 秒静音，这段静音不用识别：只留最后有声音之后的 0.3 秒
+                # （识别耗时和音频长短成正比，板子上约省 0.25 秒；0.3 秒以内结尾的字不受影响）
+                voice_end = getattr(conn, "asr_voice_end", 0) or len(conn.asr_audio)
+                pcm_bytes = b"".join(conn.asr_audio[:voice_end]) + b"".join(conn.asr_audio[voice_end:])[:ASR_TAIL_BYTES]
                 # 检查是否有足够的音频数据（每帧1920字节，15帧约28800字节）
                 if len(pcm_bytes) > 1920 * 15:
                     await self.handle_voice_stop(conn, [pcm_bytes])

@@ -59,6 +59,22 @@ log:
 delete_audio: true
 # 没有语音输入多久后断开连接(秒)，默认2分钟，即120秒
 close_connection_no_voice_time: 120
+
+# [xiaozhi-hub] 聊天记录落盘（data/chat.db，按设备和模型存，网关重启、断开后还在），见 core/agent/chat_history.py
+chat_history:
+  enabled: true
+  # 普通 API 模型每次最多带最近这么多条（用户、助手、工具消息都算），再加一道 token 上限（估算）。
+  # 工具调用和它的结果不会被拆开。Claude Code、Grok Bot 的上下文在它们自己的会话里，只存记录给屏幕显示
+  max_messages: 30
+  max_tokens: 8000
+  # 截掉的旧对话在后台总结成记忆，放进系统提示的 <memory>；攒够 summary_min 条才总结一次
+  summary: true
+  summary_min: 6
+  summary_chars: 500
+  # 总结用哪个 LLM 条目，留空用当前这个模型
+  summary_llm: ""
+  # 给屏幕显示时每个模型最多返回多少条
+  display_limit: 100
 # TTS请求超时时间(秒)
 tts_timeout: 15
 # 工具调用超时时间(秒)

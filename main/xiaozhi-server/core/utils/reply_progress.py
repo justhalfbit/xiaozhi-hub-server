@@ -113,8 +113,14 @@ def cut(conn, played_ms=None) -> None:
         if turn is None:
             return
         turn["cut"], turn["interrupted"] = heard, True
-        if turn["done"]:
+        applied = turn["done"]
+        if applied:
             _apply(conn, turn)
+    if applied:
+        # 这一轮已经存进 data/chat.db（chat() 结束时），改写后同步过去
+        from core.agent import chat_history
+
+        chat_history.sync(conn)
 
 
 def can_store(conn, sentence_id) -> bool:

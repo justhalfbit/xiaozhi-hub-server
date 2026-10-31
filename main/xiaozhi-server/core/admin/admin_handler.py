@@ -24,7 +24,7 @@ from config.logger import setup_logging
 from core.admin import auth, catalog, config_store, connections, pages, pipeline
 from core.admin.grokbot import GrokBotAdmin
 from core.admin.status import _claude_version, collect_status
-from core.agent import llm_router, reports
+from core.agent import chat_history, llm_router, reports
 from core.agent.agent_session import ErrorKind
 from core.agent.grokbot_client import GrokBotError
 from core.utils.modules_initialize import initialize_modules
@@ -101,6 +101,8 @@ class AdminHandler:
                 web.post("/kiosk/llm/use", self.handle_kiosk_llm_use),
                 web.post("/kiosk/reports", self.handle_kiosk_reports),
                 web.post("/kiosk/asr", self.handle_kiosk_asr),
+                web.get("/kiosk/chat/history", self.handle_kiosk_chat_history),
+                web.post("/kiosk/chat/clear", self.handle_kiosk_chat_clear),
             ]
         )
 
@@ -647,6 +649,41 @@ class AdminHandler:
         started = time.monotonic()
         text = await self._blocking(asr.recognize_pcm, pcm)
         return self._json({"ok": True, "text": text, "ms": round((time.monotonic() - started) * 1000)})
+
+    async def handle_kiosk_chat_history(self, request: web.Request):
+        """?device=<device-id>[&limit=N]：这台设备存下来的聊天记录，给屏幕显示。
+
+        返回 {"models": {条目名: [{id, role: user|bot, text, time, interrupted}]}}，每个模型最近 limit 条
+        （默认 chat_history.display_limit）。"""
+        if not self._from_this_machine(request):
+            return self._error("仅限本机", 403)
+        device = request.query.get("device") or ""
+        if not device:
+            return self._error("缺少 device", 400)
+        cfg = chat_history.settings(await self._blocking(self._merged))
+        try:
+            limit = max(1, min(int(request.query.get("limit") or cfg["display_limit"]), 500))
+        except ValueError:
+            return self._error("limit 要是数字", 400)
+        models = await self._blocking(chat_history.history, device, limit)
+        return self._json({"ok": True, "models": models})
+
+    async def handle_kiosk_chat_clear(self, request: web.Request):
+        """{"device", "memory_only"?}：清除这台设备的聊天记录（所有模型），和语音"清除聊天记录"同一套。
+
+        库里的记录和总结记忆、在线连接的对话都清掉；Claude Code 下次新开会话；聊过的 Grok Bot 在云端重置对话。
+        memory_only：只清总结记忆，记录留着。"""
+        if not self._from_this_machine(request):
+            return self._error("仅限本机", 403)
+        body = await self._read_json(request)
+        device = str(body.get("device") or "")
+        if not device:
+            return self._error("缺少 device", 400)
+        online = [c for c in (connections.get(i["session_id"]) for i in connections.snapshot()
+                              if i["device_id"] == device) if c is not None]
+        merged = await self._blocking(self._merged)
+        result = await self._blocking(chat_history.clear, device, merged, bool(body.get("memory_only")), online)
+        return self._json({"ok": True, **result})
 
     # ---------- 工作原理 ----------
 

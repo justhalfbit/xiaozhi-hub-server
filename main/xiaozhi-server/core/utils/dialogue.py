@@ -3,6 +3,8 @@ import re
 from typing import List, Dict
 from datetime import datetime
 
+MEMORY_INTRO = "以下是和用户更早的聊天的摘要（那些聊天内容已经不在上下文里），需要时参考："
+
 
 class Message:
     def __init__(
@@ -25,6 +27,8 @@ class Message:
 class Dialogue:
     def __init__(self):
         self.dialogue: List[Message] = []
+        # [xiaozhi-hub] 发给模型时只带最近一段：(最多条数, 约多少 token)，None 表示整份全发（chat_history.load 设置）
+        self.window = None
         # 获取当前时间
         self.current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -119,6 +123,9 @@ class Dialogue:
                     full_prompt,
                     flags=re.DOTALL,
                 )
+                # [xiaozhi-hub] 本项目的提示词模板没有 <memory>：有记忆时追加在最后
+                if memory_str and "<memory>" not in full_prompt:
+                    full_prompt += f"\n\n<memory>\n{MEMORY_INTRO}\n{memory_str}\n</memory>"
 
             # 追加说话人信息
             try:
@@ -156,6 +163,10 @@ class Dialogue:
 
         # 第三段：实际对话历史（不含 few-shot）
         actual_messages = [m for m in non_system_messages if not m.is_temporary]
+        if self.window:
+            from core.agent.chat_history import select_window
+
+            actual_messages = actual_messages[select_window(actual_messages, *self.window):]
         complete_actual = self._ensure_tool_calls_complete(actual_messages)
         for m in complete_actual:
             self.getMessages(m, dialogue)

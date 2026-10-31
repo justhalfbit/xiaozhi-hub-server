@@ -462,3 +462,15 @@ def _hub_no_console_log():
         if type(getattr(handler, "_sink", None)).__name__ == "StreamSink":
             logger.remove(handler_id)
     yield
+
+
+# [xiaozhi-hub] 聊天记录落盘（core/agent/chat_history）：每个测试用自己的临时库，不碰 data/chat.db
+@pytest.fixture(autouse=True)
+def _hub_chat_db(tmp_path):
+    from core.agent import chat_history
+
+    store = chat_history.ChatDB(tmp_path / "chat.db")
+    chat_history.set_db(store)
+    yield store
+    chat_history.set_db(None)
+    store.close()

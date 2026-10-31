@@ -410,6 +410,9 @@ ASR:
     model_type: transducer
     # [xiaozhi-hub] 4 线程比 2 线程识别快约 20%（板子 8 核，说完才识别，几秒内用满 4 核）
     num_threads: 4
+    # [xiaozhi-hub] 边说边识别：句中停顿 300 毫秒就先识别前面这段，说完只剩最后一段，长句快 1.5～3 秒。
+    # 代价是跨段没有上下文，偶尔认错同音字（合成声 36 条长句字错率 0.09% → 0.46%，多出来的都是"她/他/它"）。填 0 关闭
+    segment_pause_ms: 300
     # 热词在后台“语音识别”页维护，所有支持热词的识别共用（配置顶层的 asr_hotwords，默认列表见 core/agent/asr_text.py）
   DoubaoASR:
     # 可以在这里申请相关Key等信息

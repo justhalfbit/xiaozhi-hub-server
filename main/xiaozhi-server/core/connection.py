@@ -1741,6 +1741,8 @@ class ConnectionHandler:
         # Clear ASR buffers
         self.asr_audio.clear()
         self.asr_voice_end = 0
+        self.asr_segment_start = 0
+        self.asr_segments = []
 
         self.logger.bind(tag=TAG).debug("All audio states reset.")
 

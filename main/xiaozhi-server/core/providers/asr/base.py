@@ -30,6 +30,26 @@ TAG = __name__
 logger = setup_logging()
 
 ASR_TAIL_BYTES = 16000 * 2 * 3 // 10  # [xiaozhi-hub] 送去识别的尾部静音：0.3 秒 16kHz 16 位
+SEGMENT_MIN_BYTES = 16000 * 2  # [xiaozhi-hub] 边说边识别：不到 1 秒的段不单独识别（太短没有上下文）
+# [xiaozhi-hub] 切在最后有声音之后 0.15 秒：停顿确认时（静音满 segment_pause_ms）下一个字可能已经开头了，
+# VAD 判定有声音要滞后约 0.1 秒，切在当下会把它的开头切进上一段（"我， 我要"）
+SEGMENT_CUT_BYTES = 16000 * 2 * 15 // 100
+
+
+def join_segments(texts: List[str]) -> str:
+    """[xiaozhi-hub] 拼接分段识别的文字：前一段末尾的句号换成逗号（停顿处多半是一句话中间）。"""
+    out = ""
+    for t in texts:
+        t = (t or "").strip()
+        if not t:
+            continue
+        if out:
+            out = out.rstrip("。.")
+            if out and out[-1] not in "，,？?！!；;、":
+                out += "，"
+            out += " "
+        out += t
+    return out
 
 
 class ASRProviderBase(ABC):
@@ -77,6 +97,9 @@ class ASRProviderBase(ABC):
                 conn.asr_audio = conn.asr_audio[-10:]
                 return
 
+            if conn.asr.interface_type != InterfaceType.STREAM and not conn.client_voice_stop:
+                self._maybe_decode_segment(conn)
+
             # 自动模式下通过VAD检测到语音停止时触发识别
             if conn.asr.interface_type != InterfaceType.STREAM and conn.client_voice_stop:
                 # [xiaozhi-hub] 告诉要这个事件的客户端：判定说完了，开始识别（界面显示"正在识别"）
@@ -91,18 +114,55 @@ class ASRProviderBase(ABC):
                 pcm_bytes = b"".join(conn.asr_audio[:voice_end]) + b"".join(conn.asr_audio[voice_end:])[:ASR_TAIL_BYTES]
                 # 检查是否有足够的音频数据（每帧1920字节，15帧约28800字节）
                 if len(pcm_bytes) > 1920 * 15:
-                    await self.handle_voice_stop(conn, [pcm_bytes])
+                    segments = getattr(conn, "asr_segments", None) or []
+                    start = getattr(conn, "asr_segment_start", 0)
+                    # 最后一段切完后没再说话：剩下的只是静音，不用再识别
+                    done = len(pcm_bytes) if segments and voice_end <= start else \
+                        sum(len(f) for f in conn.asr_audio[:start])
+                    await self.handle_voice_stop(conn, [pcm_bytes], segments=segments, segmented_bytes=done)
                 conn.reset_audio_states()
 
+    def _maybe_decode_segment(self, conn: "ConnectionHandler"):
+        """[xiaozhi-hub] 边说边识别：句中停顿够长（segment_pause_ms）就把这一段先送去识别，
+        说完时只剩最后一段要识别。识别耗时和音频长短成正比，长句说完后快 1.5～3 秒；
+        代价是跨段没有上下文，偶尔认错同音字（如"她"认成"他"）。只用于能直接识别 PCM 的本地模型。"""
+        pause_ms = getattr(self, "segment_pause_ms", 0)
+        if not pause_ms or not hasattr(self, "recognize_pcm") or not conn.client_have_voice:
+            return
+        start = getattr(conn, "asr_segment_start", 0)
+        voice_end = getattr(conn, "asr_voice_end", 0)
+        if voice_end <= start:
+            return  # 这次停顿已经切过了，或者上次切完还没再说话
+        silent = sum(len(f) for f in conn.asr_audio[voice_end:])
+        if silent < pause_ms * 32:
+            return
+        end, kept = voice_end, 0
+        while end < len(conn.asr_audio) and kept < SEGMENT_CUT_BYTES:
+            kept += len(conn.asr_audio[end])
+            end += 1
+        pcm = b"".join(conn.asr_audio[start:end])
+        if len(pcm) < SEGMENT_MIN_BYTES:
+            return
+        future = asyncio.get_running_loop().run_in_executor(None, self.recognize_pcm, pcm)
+        conn.asr_segments = (getattr(conn, "asr_segments", None) or []) + [future]
+        conn.asr_segment_start = end
+        logger.bind(tag=TAG).debug(f"边说边识别：第 {len(conn.asr_segments)} 段 {len(pcm) / 32000:.1f} 秒")
+
     # 处理语音停止
-    async def handle_voice_stop(self, conn: "ConnectionHandler", asr_audio_task: List[bytes]):
-        """并行处理ASR和声纹识别"""
+    async def handle_voice_stop(self, conn: "ConnectionHandler", asr_audio_task: List[bytes],
+                                segments=None, segmented_bytes: int = 0):
+        """并行处理ASR和声纹识别
+
+        [xiaozhi-hub] segments：说话期间已经送去识别的前几段（future），asr_audio_task 的前 segmented_bytes
+        字节就是它们；这里只识别剩下的部分，再按顺序拼起来。"""
         try:
             total_start_time = time.monotonic()
 
             # 数据已经是PCM直接使用
             pcm_data = asr_audio_task
             combined_pcm_data = b"".join(pcm_data)
+            if segments:
+                asr_audio_task = [combined_pcm_data[segmented_bytes:]]
 
             # 预先准备WAV数据
             wav_data = None
@@ -110,9 +170,15 @@ class ASRProviderBase(ABC):
                 wav_data = self._pcm_to_wav(combined_pcm_data)
 
             # 定义ASR任务
-            asr_task = self.speech_to_text_wrapper(
-                asr_audio_task, conn.session_id
-            )
+            if segments and len(asr_audio_task[0]) < 3200:
+                # [xiaozhi-hub] 最后的停顿处已经切过段：全都识别过了
+                async def nothing():
+                    return "", None
+                asr_task = nothing()
+            else:
+                asr_task = self.speech_to_text_wrapper(
+                    asr_audio_task, conn.session_id
+                )
 
             if conn.voiceprint_provider and wav_data:
                 voiceprint_task = conn.voiceprint_provider.identify_speaker(
@@ -132,6 +198,13 @@ class ASRProviderBase(ABC):
                 raw_text = ""
             else:
                 raw_text, _ = asr_result
+            if segments:
+                earlier = await asyncio.gather(*segments, return_exceptions=True)
+                texts = ["" if isinstance(t, Exception) else t for t in earlier]
+                raw_text = join_segments(texts + [raw_text or ""])
+                logger.bind(tag=TAG).info(
+                    f"边说边识别：{len(segments)} 段说话时已识别，说完只识别最后 "
+                    f"{len(asr_audio_task[0]) / 32000:.1f} 秒，用时 {time.monotonic() - total_start_time:.2f} 秒")
             # [xiaozhi-hub] 识别后纠错替换（如 cloud code → Claude Code），并记一条最近识别记录供管理后台查看
             raw_text = correct_and_record(conn, raw_text)
 
@@ -182,13 +255,13 @@ class ASRProviderBase(ABC):
             # [xiaozhi-hub] 回复期间识别出的是回复自己的回声（开着回声消除时麦克风不关）就丢掉
             if text_len > 0 and reply_echo.during_reply(conn):
                 logger.bind(tag=TAG).info(
-                    f"回复期间识别: {content_for_length_check} | 峰值 {reply_echo.level_db(asr_audio_task):.1f} dBFS")
+                    f"回复期间识别: {content_for_length_check} | 峰值 {reply_echo.level_db(pcm_data):.1f} dBFS")
                 if reply_echo.is_echo(conn, content_for_length_check):
                     logger.bind(tag=TAG).info(f"忽略回声识别: {content_for_length_check}")
                     text_len = 0
 
             if text_len > 0:
-                audio_snapshot = asr_audio_task.copy()
+                audio_snapshot = pcm_data.copy()
                 enqueue_asr_report(conn, enhanced_text, audio_snapshot)
                 # 使用自定义模块进行上报
                 await startToChat(conn, enhanced_text)

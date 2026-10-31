@@ -18,7 +18,7 @@ class FakeASR(ASRProviderBase):
     async def speech_to_text(self, *args, **kwargs):
         return "", None
 
-    async def handle_voice_stop(self, conn, asr_audio_task):
+    async def handle_voice_stop(self, conn, asr_audio_task, **kwargs):
         self.got = b"".join(asr_audio_task)
 
 
@@ -60,3 +60,91 @@ def test_no_vad_end_without_the_feature():
     asyncio.run(feed(asr, conn, voiced=50, silent=10))   # silence shorter than the kept tail: all of it
     assert len(asr.got) == 60 * len(FRAME)
     assert conn.websocket.sent == []
+
+
+class SegASR(FakeASR):
+    """边说边识别：有 recognize_pcm、开了 segment_pause_ms 的本地识别。"""
+    segment_pause_ms = 300
+
+    def __init__(self):
+        super().__init__()
+        self.segments = []
+
+    def recognize_pcm(self, pcm):
+        self.segments.append(len(pcm) // len(FRAME))
+        return f"第{len(self.segments)}段。"
+
+    async def handle_voice_stop(self, conn, asr_audio_task, segments=None, segmented_bytes=0):
+        self.got = b"".join(asr_audio_task)
+        self.texts = [await f for f in segments]
+        self.segmented = segmented_bytes // len(FRAME)
+
+
+async def feed_frames(asr, conn, plan):
+    """plan: [(有声帧数, 静音帧数), ...]，最后一个静音的最后一帧判定说完。"""
+    for k, (voiced, silent) in enumerate(plan):
+        for _ in range(voiced):
+            conn.client_have_voice = True
+            await asr.receive_audio(conn, FRAME, True)
+        for i in range(silent):
+            conn.client_voice_stop = k == len(plan) - 1 and i == silent - 1
+            await asr.receive_audio(conn, FRAME, False)
+
+
+def test_pauses_are_recognised_while_talking():
+    asr = SegASR()
+    conn = make_conn(asr, {})
+    # 1.2 s 说话、0.1 s 停顿（不切）、0.6 s、0.4 s 停顿（切）、1.2 s、0.9 s 静音（0.3 s 时切，说完时什么都不剩）
+    # 每次切在最后有声音之后 0.15 秒（8 帧）
+    asyncio.run(feed_frames(asr, conn, [(60, 5), (30, 20), (60, 45)]))
+    assert asr.segments == [60 + 5 + 30 + 8, 12 + 60 + 8]
+    assert asr.texts == ["第1段。", "第2段。"]
+    whole = (60 + 5 + 30 + 20 + 60 + 15) * len(FRAME)   # 整句照常交给 handle_voice_stop
+    assert len(asr.got) == whole
+    assert asr.segmented * len(FRAME) == whole            # 都识别过了，说完不用再识别
+
+
+def test_short_pieces_are_not_cut():
+    asr = SegASR()
+    conn = make_conn(asr, {})
+    asyncio.run(feed_frames(asr, conn, [(20, 20), (60, 45)]))   # 0.4 s 说话 + 0.3 s 停顿不到 1 秒
+    assert asr.segments == [20 + 20 + 60 + 8]                   # 第一次停顿没切，最后整句一段
+
+
+def test_join_segments():
+    from core.providers.asr.base import join_segments
+    assert join_segments(["帮我查一下明天上海的天气。", "顺便告诉我带不带伞。"]) == "帮我查一下明天上海的天气， 顺便告诉我带不带伞。"
+    assert join_segments(["你好吗？", "", "我很好。"]) == "你好吗？ 我很好。"
+    assert join_segments(["", "只有一段。"]) == "只有一段。"
+
+
+def test_voice_stop_recognises_only_the_rest(monkeypatch):
+    import core.providers.asr.base as base
+    said = []
+
+    async def to_chat(conn, text):
+        said.append(text)
+    monkeypatch.setattr(base, "startToChat", to_chat)
+    monkeypatch.setattr(base, "correct_and_record", lambda conn, text: text)
+    monkeypatch.setattr(base, "enqueue_asr_report", lambda *a: None)
+    monkeypatch.setattr(base.reply_echo, "during_reply", lambda conn: False)
+
+    class Rest(FakeASR):
+        rest = None
+
+        async def speech_to_text_wrapper(self, pcm, session_id):
+            self.rest = len(b"".join(pcm))
+            return "后半句。", None
+        handle_voice_stop = ASRProviderBase.handle_voice_stop
+        stop_ws_connection = lambda self: None
+
+    async def run():
+        asr = Rest()
+        conn = make_conn(asr, {})
+        conn.voiceprint_provider = None
+        first = asyncio.get_running_loop().create_future()
+        first.set_result("前半句。")
+        await asr.handle_voice_stop(conn, [b"\0" * 64000], segments=[first], segmented_bytes=40000)
+        return asr.rest
+    assert asyncio.run(run()) == 24000
+    assert said == ["前半句， 后半句。"]

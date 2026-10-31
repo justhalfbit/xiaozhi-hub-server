@@ -68,6 +68,8 @@ class ASRProvider(ASRProviderBase):
         self.output_dir = config.get("output_dir")
         self.model_type = config.get("model_type", "sense_voice")  # 支持 paraformer
         self.delete_audio_file = delete_audio_file
+        # [xiaozhi-hub] 边说边识别：句中停顿这么久就先识别前面这段（毫秒，0 关闭），见 ASRProviderBase
+        self.segment_pause_ms = int(config.get("segment_pause_ms") or 0)
 
         # 确保输出目录存在
         os.makedirs(self.output_dir, exist_ok=True)

@@ -10,16 +10,15 @@
 - 被窗口截掉的部分在后台增量总结成一段记忆（summarize），放进系统提示的 <memory>。记忆按设备一份，
   这台设备所有普通 API 模型共用（记的是关于用户的事）；管理后台能查看、手改、清空（set_memory，马上生效）。
   只拿库里的真实对话去总结：上游 mem_local_short 把整份 dialogue 交给模型，工具调用示例（假对话）会混进记忆；
-- Claude Code、Grok Bot 的上下文在它们自己的会话里（网关只发最后一句），这里只存记录给屏幕显示，
-  不载入、不截断、不总结；
-- 清除（clear）：删库里这台设备的记录、清空记忆、清在线连接的对话，Claude Code 删掉会话映射并关掉进程（下次新开会话），
-  Grok Bot 调云端的"重置对话"（Bot、它的记忆和文件都保留，对话从头开始）。
+- Claude Code、Grok Bot 的上下文和记忆在它们自己的会话里（网关只发最后一句），这里只存记录给屏幕显示，
+  不载入、不截断、不总结、不注入记忆；
+- 清除（clear）：只清本机——删库里这台设备的记录、清空记忆、清在线连接里网关这边的对话；
+  Claude Code、Grok Bot 自己的会话和记忆不碰。
 
 配置（config.yaml 的 chat_history）：enabled、max_messages、max_tokens、summary、summary_min、summary_chars、
 summary_llm（总结用哪个 LLM 条目，空则用当前模型）、display_limit。
 """
 
-import concurrent.futures
 import json
 import sqlite3
 import threading
@@ -587,89 +586,33 @@ def _clear_dialogue(dialogue) -> None:
 
 
 def clear_dialogues(connections) -> None:
-    """清在线连接里所有模型的对话（留系统提示和示例），Claude Code / Grok Bot 关掉会话、下次新开。"""
+    """清在线连接里网关这边各模型的对话（留系统提示和示例）。Claude Code、Grok Bot 自己的会话不碰。"""
     for conn in connections:
         st = getattr(conn, "hub_route", None) or {}
         dialogues = [getattr(conn, "dialogue", None)] + list((st.get("dialogues") or {}).values())
         for d in dialogues:
             if d is not None:
                 _clear_dialogue(d)
-        for instance in st.get("used") or []:
-            if callable(getattr(instance, "reset_session", None)):
-                try:
-                    instance.reset_session(conn)
-                except Exception as e:
-                    logger.bind(tag=TAG).error(f"重置 {type(instance).__name__} 会话失败: {e}")
         reply_turns = getattr(conn, "reply_turns", None)
         if reply_turns:
             reply_turns.clear()
 
 
-def clear(device: str, config: dict, memory_only: bool = False, connections=None, grok_wait: float = 8) -> dict:
-    """清除这台设备的聊天记录（所有模型）。connections：在线连接列表（core.admin.connections 的连接对象）。
+def clear(device: str, config: dict, memory_only: bool = False, connections=None) -> dict:
+    """清除这台设备在网关本机存的聊天记录（所有模型）和记忆。connections：在线连接列表。
 
-    返回 {"deleted": 条数, "grok": [{"entry", "label", "reset": bool, "pending"?, "error"?}]}：
-    这台设备和哪个 Grok Bot 聊过，就让它在云端重置对话（pending = 等了 grok_wait 秒还没做完，在后台接着做）。"""
+    只清本机：Claude Code、Grok Bot 有自己的上下文和记忆（在它们的会话里、在云端），不插手
+    （用户 2026-11-01 定）。返回 {"deleted": 条数, "agents": [这台设备聊过的 Claude Code / Grok Bot 的名字]}，
+    用来告诉用户它们那边没动。"""
     from core.agent import llm_router
-    from core.agent.session_store import SessionStore
 
     store = db()
     if memory_only:
         store.clear_memory(device)
         logger.bind(tag=TAG).info(f"设备 {device}：已清除记忆")
-        return {"deleted": 0, "grok": []}
-    talked = set(store.models(device))
+        return {"deleted": 0, "agents": []}
+    agents = sorted({llm_router.model_label(m) for m in store.models(device) if is_agent(config, m)})
     deleted = store.clear(device)
     clear_dialogues(connections or [])
-    # Claude Code：设备不在线时也要删掉映射，下次新开会话
-    SessionStore(Path(get_project_dir()) / "data" / "agent_sessions.json", "claude_cli").forget(device)
-    grok, futures = [], []
-    for name in sorted(talked):
-        if model_kind(config, name) != "grok_bot":
-            continue
-        item = {"entry": name, "label": llm_router.model_label(name), "reset": False}
-        grok.append(item)
-        try:
-            futures.append((item, reset_grok(config, name)))
-        except Exception as e:
-            item["error"] = str(e)[:200]
-    # 云端电脑休眠时要先唤醒，可能很久：最多等 grok_wait 秒，没做完的在后台接着做
-    deadline = time.monotonic() + grok_wait
-    for item, fut in futures:
-        try:
-            fut.result(max(deadline - time.monotonic(), 0))
-            item["reset"] = True
-        except concurrent.futures.TimeoutError:
-            item["pending"] = True
-        except Exception as e:
-            item["error"] = str(e)[:200] or type(e).__name__
-    for item in grok:
-        if item.get("error"):
-            logger.bind(tag=TAG).error(f"重置 Grok Bot {item['entry']} 的云端对话失败: {item['error']}")
-    logger.bind(tag=TAG).info(f"设备 {device}：已清除 {deleted} 条聊天记录和记忆" +
-                              (f"，Grok Bot：{grok}" if grok else ""))
-    return {"deleted": deleted, "grok": grok}
-
-
-def reset_grok(config: dict, name: str) -> "concurrent.futures.Future":
-    """让这个 Grok Bot 在云端重置对话（桌面 App 的"重置对话"，方法 startFreshConversation：
-    Bot、它的记忆、文件、例行任务都保留，对话历史从头开始）。返回 Future。"""
-    import asyncio
-    import os
-
-    from core.agent.grokbot_client import default_credentials_path, get_hub
-    from core.providers.llm.grok_bot.grok_bot import shared_loop
-
-    entry = (config.get("LLM") or {}).get(name) or {}
-    bot_id = str(entry.get("bot_id") or "").strip()
-    if not bot_id:
-        raise ValueError("没有 bot_id")
-    raw_path = str(entry.get("credentials_path") or "").strip()
-    cred = Path(os.path.expanduser(raw_path)) if raw_path else default_credentials_path()
-    backend = str(entry.get("backend_url") or "").strip() or None
-
-    async def go():
-        hub = get_hub(cred, logger=logger.bind(tag=TAG), backend=backend)
-        await hub.client.call("startFreshConversation", {"id": bot_id})
-
-    return asyncio.run_coroutine_threadsafe(go(), shared_loop())
+    logger.bind(tag=TAG).info(f"设备 {device}：已清除本机存的 {deleted} 条聊天记录和记忆")
+    return {"deleted": deleted, "agents": agents}

@@ -263,15 +263,6 @@ class LLMProvider(LLMProviderBase):
             # 卡在工具调用里时 interrupt 可能无效，兜底防止下一句话一直排队等这一轮
             asyncio.run_coroutine_threadsafe(self._abandon_if_stuck(st, st.turn_gen), self._loop)
 
-    def reset_session(self, conn) -> None:
-        """清除聊天记录：关掉这台设备的进程、忘掉会话映射，下一句话新开会话（grok_bot 继承：关掉会话，云端由调用方重置）。"""
-        st = self._states.get(conn.session_id)
-        if st is None:
-            return
-        self.store.forget(st.key)
-        if st.agent:
-            asyncio.run_coroutine_threadsafe(self._close_agent(st, "清除聊天记录"), self._loop)
-
     def on_conn_close(self, conn) -> None:
         with self._states_lock:
             st = self._states.pop(conn.session_id, None)

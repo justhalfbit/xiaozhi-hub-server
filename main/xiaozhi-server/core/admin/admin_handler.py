@@ -673,8 +673,8 @@ class AdminHandler:
     async def handle_kiosk_chat_clear(self, request: web.Request):
         """{"device", "memory_only"?}：清除这台设备的聊天记录（所有模型），和语音"清除聊天记录"同一套。
 
-        库里的记录和总结记忆、在线连接的对话都清掉；Claude Code 下次新开会话；聊过的 Grok Bot 在云端重置对话。
-        memory_only：只清总结记忆，记录留着。"""
+        只清本机：库里的记录和记忆、在线连接里网关这边的对话；Claude Code、Grok Bot 自己的会话和记忆不碰。
+        memory_only：只清记忆，记录留着。返回 {"deleted", "agents": 聊过的 Claude Code / Grok Bot}。"""
         if not self._from_this_machine(request):
             return self._error("仅限本机", 403)
         body = await self._read_json(request)

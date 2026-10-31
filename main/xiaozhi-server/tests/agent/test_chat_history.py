@@ -1,6 +1,5 @@
 """聊天记录落盘（core/agent/chat_history）和语音清除（core/agent/clear_command）。"""
 import asyncio
-import concurrent.futures
 import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -309,16 +308,15 @@ def test_clear_removes_records_memory_and_live_dialogues(project):
     chat_history.db().set_memory("dev-1", "记忆", "summary")
     claude = SessionStore(project / "data" / "agent_sessions.json", "claude_cli")
     claude.touch("dev-1", "sess-1")
-    claude.touch("dev-2", "sess-2")
     agent = MagicMock()
     conn.hub_route = {"used": [agent], "dialogues": {}}
 
     result = chat_history.clear("dev-1", CONFIG, connections=[conn])
-    assert result == {"deleted": 8, "grok": []}
+    assert result == {"deleted": 8, "agents": []}
     assert sent(conn) == [] and chat_history.memory_for(conn) == ""
     assert [m.role for m in conn.dialogue.dialogue] == ["system", "user", "assistant"]  # 系统提示和示例留着
-    agent.reset_session.assert_called_once_with(conn)
-    assert claude.get("dev-1") is None and claude.get("dev-2")
+    # 只清本机：Claude Code 的会话（映射、进程）不碰
+    assert agent.method_calls == [] and claude.get("dev-1")["session_id"] == "sess-1"
     assert chat_history.history("dev-2", 10)
     # 清除后接着聊照常存
     chat(conn, "新问题", "新回答")
@@ -340,46 +338,20 @@ def test_clear_memory_only_keeps_records_and_does_not_resummarize(project):
     assert len(chat_history.history("dev-1", 100)["DeepSeekLLM"]) == 10
 
 
-def _future(result=None, error=None, done=True):
-    fut = concurrent.futures.Future()
-    if done:
-        fut.set_exception(error) if error else fut.set_result(result)
-    return fut
-
-
-@pytest.mark.parametrize("fut,expect", [
-    (_future(), {"reset": True}),
-    (_future(error=RuntimeError("HTTP 500")), {"reset": False, "error": "HTTP 500"}),
-    (_future(done=False), {"reset": False, "pending": True}),
-])
-def test_clear_resets_grok_bots_this_device_talked_to(project, monkeypatch, fut, expect):
+def test_clear_leaves_agents_alone_and_names_them(project, monkeypatch):
+    """Claude Code、Grok Bot 有自己的上下文和记忆：清除只删本机存的记录，不调它们任何东西。"""
     conn = make_conn()
     chat_history.load(conn, conn.dialogue, "GrokBot_小助手")
     chat(conn, "帮我查下", "好的")
-    called = []
-    monkeypatch.setattr(chat_history, "reset_grok", lambda config, name: called.append(name) or fut)
-    result = chat_history.clear("dev-1", CONFIG, connections=[conn], grok_wait=0.05)
-    assert called == ["GrokBot_小助手"]
-    assert result["grok"] == [{"entry": "GrokBot_小助手", "label": "小助手", **expect}]
+    cli = make_conn()
+    chat_history.load(cli, cli.dialogue, "ClaudeCLI")
+    chat(cli, "看看日志", "好的")
+    result = chat_history.clear("dev-1", CONFIG, connections=[conn, cli])
+    assert result == {"deleted": 4, "agents": ["Claude", "小助手"]}
+    assert chat_history.history("dev-1", 10) == {}
     text = clear_command.result_text(result)
-    assert text.startswith(clear_command.DONE) and "小助手" in text
-
-
-def test_clear_does_not_touch_grok_bots_never_used(project, monkeypatch):
-    monkeypatch.setattr(chat_history, "reset_grok", lambda *a: pytest.fail("不该重置"))
-    assert chat_history.clear("dev-1", CONFIG)["grok"] == []
-
-
-def test_claude_cli_reset_session_forgets_mapping_and_closes_process(tmp_path):
-    from core.providers.llm.claude_cli.claude_cli import ConnState, LLMProvider
-
-    provider = LLMProvider.__new__(LLMProvider)
-    provider.store = SessionStore(tmp_path / "s.json", "claude_cli")
-    provider.store.touch("dev-1", "sess-1")
-    provider._states = {"s-dev-1": ConnState(key="dev-1")}
-    provider.reset_session(SimpleNamespace(session_id="s-dev-1"))
-    assert provider.store.get("dev-1") is None
-    provider.reset_session(SimpleNamespace(session_id="unknown"))  # 没用过它的连接：什么也不做
+    assert text.startswith(clear_command.DONE) and "Claude和小助手自己那边的对话没有动" in text
+    assert clear_command.result_text({"deleted": 2, "agents": []}) == clear_command.DONE
 
 
 # ---------- 语音指令 ----------
@@ -420,7 +392,7 @@ def spoken(monkeypatch):
 
     async def fake_clear(conn):
         said.append("<clear>")
-        return {"deleted": 3, "grok": []}
+        return {"deleted": 3, "agents": []}
 
     async def fake_notify(conn):
         said.append("<notify>")

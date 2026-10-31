@@ -414,11 +414,11 @@ async def test_kiosk_chat_history_and_clear(kiosk, tmp_path, monkeypatch):
 
     store.set_memory("dev-1", "- 用户叫小明", "summary", progress={"DeepSeekLLM": 1})
     data = await (await kiosk.post("/kiosk/chat/clear", json={"device": "dev-1", "memory_only": True})).json()
-    assert data == {"ok": True, "deleted": 0, "grok": []}
+    assert data == {"ok": True, "deleted": 0, "agents": []}
     assert store.memory("dev-1")["summary"] == "" and store.progress("dev-1") == {"DeepSeekLLM": 1}
     assert (await kiosk.post("/kiosk/chat/clear", json={})).status == 400
     data = await (await kiosk.post("/kiosk/chat/clear", json={"device": "dev-1"})).json()
-    assert data == {"ok": True, "deleted": 3, "grok": []}
+    assert data == {"ok": True, "deleted": 3, "agents": ["Claude"]}
     assert (await (await kiosk.get("/kiosk/chat/history?device=dev-1")).json())["models"] == {}
     assert store.models("dev-2") == ["DeepSeekLLM"]
 

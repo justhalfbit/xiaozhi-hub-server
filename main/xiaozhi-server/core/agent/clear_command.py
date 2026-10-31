@@ -49,16 +49,11 @@ def is_cancel(text: str) -> bool:
 
 
 def result_text(result: dict) -> str:
-    """清除结果的语音回复（Grok Bot 的云端对话另外说一句）。"""
-    parts = [DONE]
-    for g in result.get("grok") or []:
-        if g.get("reset"):
-            parts.append(f"{g['label']} 在云端的对话也重新开始了")
-        elif g.get("pending"):
-            parts.append(f"{g['label']} 在云端的对话正在重置")
-        else:
-            parts.append(f"{g['label']} 在云端的对话没能重置，还在云端")
-    return "。".join(parts)
+    """清除结果的语音回复。聊过 Claude Code / Grok Bot 时说一句它们那边没动（清的只是本机的记录）。"""
+    agents = result.get("agents") or []
+    if agents:
+        return f"{DONE}。{'和'.join(agents)}自己那边的对话没有动"
+    return DONE
 
 
 async def handle(conn: "ConnectionHandler", text: str):
@@ -93,7 +88,7 @@ async def clear_now(conn: "ConnectionHandler") -> dict:
     if not device:
         # 没有 device-id 的连接没存过记录：只清这个连接的对话
         chat_history.clear_dialogues([conn])
-        return {"deleted": 0, "grok": []}
+        return {"deleted": 0, "agents": []}
     online = [c for c in (connections.get(i["session_id"]) for i in connections.snapshot()
                           if i["device_id"] == device) if c is not None]
     if conn not in online:

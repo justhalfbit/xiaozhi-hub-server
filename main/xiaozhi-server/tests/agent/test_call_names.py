@@ -254,6 +254,11 @@ async def test_reply_audio_warmed_up_and_kept_on_disk(spoken, monkeypatch, reply
     assert synthesized == ["来了 什么事"] and len(list(reply_cache.iterdir())) == 1
     await call_names.warm_up(c)
     assert len(synthesized) == 1  # 已经有了不再合成
+    c.tts.post_gain = 1.5
+    await call_names.warm_up(c)
+    assert len(synthesized) == 2  # 后台调了音量：存盘的那份不能再用
+    c.tts.post_gain = None
+    del synthesized[1:]
 
     monkeypatch.setattr(call_names, "_audio_cache", {})  # 相当于网关重启
     assert await handle_call_name(c, "嗨 cloud") is None

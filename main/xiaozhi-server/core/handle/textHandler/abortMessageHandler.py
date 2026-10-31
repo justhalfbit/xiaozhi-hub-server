@@ -13,4 +13,4 @@ class AbortTextMessageHandler(TextMessageHandler):
         return TextMessageType.ABORT
 
     async def handle(self, conn, msg_json: Dict[str, Any]) -> None:
-        await handleAbortMessage(conn)
+        await handleAbortMessage(conn, msg_json.get("played_ms"))

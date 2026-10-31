@@ -44,7 +44,7 @@ from config.manage_api_client import DeviceNotFoundException, DeviceBindExceptio
 from core.utils.prompt_manager import PromptManager
 from core.utils.voiceprint_provider import VoiceprintProvider
 from core.utils.util import get_system_error_response
-from core.utils import textUtils
+from core.utils import reply_progress, textUtils
 
 
 TAG = __name__
@@ -1059,6 +1059,25 @@ class ConnectionHandler:
         self.dialogue.update_system_message(self.prompt)
 
     def chat(self, query, depth=0):
+        # [xiaozhi-hub] 一轮结束时，被打断的回复在对话里换成播出去的部分（reply_progress）
+        if depth > 0:
+            return self._chat(query, depth)
+        sentence_id = str(uuid.uuid4().hex)
+        try:
+            return self._chat(query, depth, sentence_id)
+        finally:
+            reply_progress.finish_turn(self, sentence_id)
+
+    def _put_reply(self, sentence_id, text):
+        """[xiaozhi-hub] 把这一轮的回复写进对话；被打断后不写（由 reply_progress 写播出去的部分）。"""
+        if reply_progress.can_store(self, sentence_id):
+            self.dialogue.put(Message(role="assistant", content=text))
+
+    def _superseded(self, sentence_id):
+        """[xiaozhi-hub] 这一轮已被打断或已开始新的一轮：旧的一轮不能再往合成和对话里塞内容。"""
+        return self.client_abort or self.sentence_id != sentence_id
+
+    def _chat(self, query, depth=0, sentence_id=None):
         # 保存当前任务的sentence_id到局部变量，避免被新任务覆盖
         current_sentence_id = None
 
@@ -1067,9 +1086,11 @@ class ConnectionHandler:
 
         # 为最顶层时新建会话ID和发送FIRST请求
         if depth == 0:
-            current_sentence_id = str(uuid.uuid4().hex)
+            current_sentence_id = sentence_id or str(uuid.uuid4().hex)
             self.sentence_id = current_sentence_id  # 更新共享属性
-            self.dialogue.put(Message(role="user", content=query))
+            user_msg = Message(role="user", content=query)
+            self.dialogue.put(user_msg)
+            reply_progress.note_turn(self, current_sentence_id, user_msg)
             self.tts.tts_text_queue.put(
                 TTSMessageDTO(
                     sentence_id=current_sentence_id,
@@ -1160,7 +1181,7 @@ class ConnectionHandler:
         emotion_flag = True
         try:
             for response in llm_responses:
-                if self.client_abort:
+                if self._superseded(current_sentence_id):
                     break
                 if self.intent_type == "function_call" and functions is not None:
                     content, tools_call = response
@@ -1302,7 +1323,7 @@ class ConnectionHandler:
                             # 写入对话历史
                             da_response = self._clean_response_garbage(da_response)
                             self.tts.store_tts_text(current_sentence_id, da_response)
-                            self.dialogue.put(Message(role="assistant", content=da_response))
+                            self._put_reply(current_sentence_id, da_response)
 
                     if not real_tool_calls:
                         if depth == 0:
@@ -1327,7 +1348,7 @@ class ConnectionHandler:
                 if len(response_message) > 0:
                     streamed_text = "".join(response_message)
                     self.tts.store_tts_text(current_sentence_id, streamed_text)
-                    self.dialogue.put(Message(role="assistant", content=streamed_text))
+                    self._put_reply(current_sentence_id, streamed_text)
                 response_message.clear()
 
                 # 收集所有工具调用的 Future
@@ -1375,13 +1396,14 @@ class ConnectionHandler:
 
                 # 统一处理工具调用结果
                 if tool_results:
-                    self._handle_function_result(tool_results, depth=depth, streamed_text=streamed_text)
+                    self._handle_function_result(tool_results, depth=depth, streamed_text=streamed_text,
+                                                 sentence_id=current_sentence_id)
 
         # 存储对话内容
         if len(response_message) > 0:
             text_buff = "".join(response_message)
             self.tts.store_tts_text(current_sentence_id, text_buff)
-            self.dialogue.put(Message(role="assistant", content=text_buff))
+            self._put_reply(current_sentence_id, text_buff)
 
         if depth == 0:
             self.tts.tts_text_queue.put(
@@ -1400,7 +1422,8 @@ class ConnectionHandler:
 
         return True
 
-    def _handle_function_result(self, tool_results, depth, streamed_text=""):
+    def _handle_function_result(self, tool_results, depth, streamed_text="", sentence_id=None):
+        sentence_id = sentence_id or self.sentence_id
         need_llm_tools = []
         record_tools = []
 
@@ -1415,10 +1438,10 @@ class ConnectionHandler:
                     self.logger.bind(tag=TAG).debug(
                         f"Skipping duplicate TTS for tool {tool_call_data['name']}, already streamed"
                     )
-                else:
+                elif not self._superseded(sentence_id):
                     self.tts.tts_one_sentence(self, ContentType.TEXT, content_detail=text)
                     self.tts.store_tts_text(self.sentence_id, text)
-                self.dialogue.put(Message(role="assistant", content=text))
+                self._put_reply(sentence_id, text)
             elif result.action == Action.REQLLM:
                 need_llm_tools.append((result, tool_call_data))
             elif result.action == Action.RECORD:
@@ -1470,7 +1493,7 @@ class ConnectionHandler:
                 if resp:
                     response_parts.append(resp)
             if response_parts:
-                self.dialogue.put(Message(role="assistant", content="，".join(response_parts)))
+                self._put_reply(sentence_id, "，".join(response_parts))
 
         if need_llm_tools:
             all_tool_calls = [
@@ -1506,7 +1529,9 @@ class ConnectionHandler:
                         )
                     )
 
-            self.chat(None, depth=depth + 1)
+            # [xiaozhi-hub] 工具执行期间被打断：结果照样留在对话里，但不再为这一轮去问模型
+            if not self._superseded(sentence_id):
+                self.chat(None, depth=depth + 1)
 
     def _report_worker(self):
         """聊天记录上报工作线程"""

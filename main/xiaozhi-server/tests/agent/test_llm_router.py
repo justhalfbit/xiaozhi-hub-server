@@ -160,3 +160,81 @@ def test_default_model_uses_server_instance(env):
     llm_router.on_conn_open(conn)
     assert llm_router.switch(conn, "ClaudeCLI") and conn.llm is env.created[0]
     assert llm_router.switch(conn, "DeepSeekLLM") and conn.llm is env.server._llm
+
+
+# ---------- 意图识别跟着这台设备的模型走 ----------
+
+def intent_config(default="ClaudeCLI", intent="nointent", api_intent=None):
+    cfg = server_config()
+    cfg["selected_module"] = {"LLM": default, "Intent": intent}
+    cfg["LLM"]["ClaudeAPI"] = {"type": "openai", "base_url": "https://api.anthropic.com/v1/", "model_name": "claude",
+                               "api_key": "sk-ant"}
+    cfg["LLM"]["GrokBot_孙悟空"] = {"type": "grok_bot", "bot_id": "bot-1"}
+    cfg["Intent"] = {"nointent": {"type": "nointent"}, "function_call": {"type": "function_call", "functions": []}}
+    if api_intent:
+        cfg["admin"] = {"api_intent": api_intent}
+    return cfg
+
+
+def test_intent_mode():
+    cfg = intent_config()  # 后台默认 Claude Code（意图识别只能是 nointent）
+    assert llm_router.intent_mode(cfg, "ClaudeCLI") == "nointent"
+    assert llm_router.intent_mode(cfg, "DeepSeekLLM") == "function_call"
+    assert llm_router.intent_mode(cfg, "ClaudeAPI") == "nointent"  # Claude 在 function_call 下有问题
+    assert llm_router.intent_mode(intent_config(api_intent="nointent"), "DeepSeekLLM") == "nointent"  # 后台选过
+    cfg = intent_config(default="DeepSeekLLM", intent="function_call")
+    assert llm_router.intent_mode(cfg, "ClaudeCLI") == "nointent"
+    assert llm_router.intent_mode(cfg, "GrokBot_孙悟空") == "nointent"
+    assert llm_router.intent_mode(cfg, "DeepSeekLLM") == "function_call"  # 默认模型照后台的设置
+    cfg = intent_config(default="DeepSeekLLM", intent="nointent", api_intent="function_call")
+    assert llm_router.intent_mode(cfg, "DeepSeekLLM") == "nointent"
+    cfg["Intent"]["intent_llm"] = {"type": "intent_llm"}
+    cfg["selected_module"]["Intent"] = "intent_llm"
+    assert llm_router.intent_mode(cfg, "ClaudeCLI") is None  # 后台用的是别的意图识别：不按设备改
+
+
+def intent_conn(env, sid="s1", device="dev-1"):
+    conn = make_conn(env, sid, device)
+    conn.config = {"selected_module": dict(env.server.config["selected_module"]),
+                   "Intent": env.server.config["Intent"]}
+    conn.intent_type = "nointent"
+    conn.func_handler = None
+    conn.loop = None
+    conn.fewshot = 0
+
+    def inject():
+        conn.fewshot += 1
+        conn.dialogue.put(Message(role="user", content="工具示例", is_temporary=True))
+    conn._inject_tool_call_fewshot = inject
+    return conn
+
+
+def test_device_intent_follows_its_model_without_touching_global(env, monkeypatch):
+    import core.providers.tools.unified_tool_handler as tools
+
+    monkeypatch.setattr(tools, "UnifiedToolHandler", lambda conn: SimpleNamespace(conn=conn))
+    env.server.config = intent_config()
+    conn = intent_conn(env)
+    conn.dialogue.dialogue = [m for m in conn.dialogue.dialogue if not m.is_temporary]  # nointent 下没有工具示例
+    llm_router.on_conn_open(conn)
+    assert conn.config["selected_module"]["Intent"] == "nointent"
+
+    assert llm_router.switch(conn, "DeepSeekLLM")
+    assert conn.intent_type == "function_call" and conn.config["selected_module"]["Intent"] == "function_call"
+    assert conn.func_handler is not None and conn.fewshot == 1  # 第一次用插件：补建工具处理器和工具示例
+    handler = conn.func_handler
+    assert llm_router.switch(conn, "ClaudeCLI") and conn.intent_type == "nointent"
+    assert llm_router.switch(conn, "DeepSeekLLM") and conn.intent_type == "function_call"
+    assert conn.func_handler is handler and conn.fewshot == 1  # 切回来沿用
+    assert env.server.config["selected_module"] == {"LLM": "ClaudeCLI", "Intent": "nointent"}  # 全局不变
+
+    other = intent_conn(env, "s2", "dev-2")
+    llm_router.on_conn_open(other)
+    assert other.config["selected_module"]["Intent"] == "nointent"  # 别的设备不受影响
+
+    # 重连：沿用上次的模型，意图识别在组件初始化前就按它改好（_initialize_intent 照着建）
+    again = intent_conn(env, "s3")
+    llm_router.on_conn_open(again)
+    assert again.hub_route["current"] == "DeepSeekLLM"
+    assert again.config["selected_module"]["Intent"] == "function_call"
+    assert again.intent_type == "nointent" and again.func_handler is None

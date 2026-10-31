@@ -148,3 +148,56 @@ def test_voice_stop_recognises_only_the_rest(monkeypatch):
         return asr.rest
     assert asyncio.run(run()) == 24000
     assert said == ["前半句， 后半句。"]
+
+
+def test_too_short_tells_the_client_nothing_was_heard():
+    asr = FakeASR()
+    conn = make_conn(asr, {"vad_end": True})
+    asyncio.run(feed(asr, conn, voiced=10, silent=45))   # 0.2 s 的咳嗽：太短，不识别
+    assert asr.got is None
+    assert [m["state"] for m in conn.websocket.sent] == ["end", "empty"]
+
+
+def _patch_chat(monkeypatch, said):
+    import core.providers.asr.base as base
+
+    async def to_chat(conn, text):
+        said.append(text)
+    monkeypatch.setattr(base, "startToChat", to_chat)
+    monkeypatch.setattr(base, "correct_and_record", lambda conn, text: text)
+    monkeypatch.setattr(base, "enqueue_asr_report", lambda *a: None)
+    monkeypatch.setattr(base.reply_echo, "during_reply", lambda conn: False)
+
+
+class Says(FakeASR):
+    def __init__(self, text):
+        super().__init__()
+        self.text = text
+
+    async def speech_to_text_wrapper(self, pcm, session_id):
+        return self.text, None
+    handle_voice_stop = ASRProviderBase.handle_voice_stop
+    stop_ws_connection = lambda self: None
+
+
+def test_empty_text_tells_the_client(monkeypatch):
+    said = []
+    _patch_chat(monkeypatch, said)
+    for text, features, sent in (("", {"vad_end": True}, ["empty"]), ("。", {"vad_end": True}, ["empty"]),
+                                 ("", {"mcp": True}, []), ("你好", {"vad_end": True}, [])):
+        conn = make_conn(Says(text), features)
+        conn.voiceprint_provider = None
+        asyncio.run(conn.asr.handle_voice_stop(conn, [b"\0" * 64000]))
+        assert [m["state"] for m in conn.websocket.sent] == sent, text
+    assert said == ["你好"]
+
+
+def test_hello_says_the_hub_sends_vad_events():
+    from unittest.mock import MagicMock
+    from core.handle.helloHandle import handleHelloMessage
+    shared = {"type": "hello", "transport": "websocket", "audio_params": {"sample_rate": 24000}}
+    for features, expect in (({"vad_end": True}, {"vad_end": True}), ({"emoji": False}, None)):
+        conn = SimpleNamespace(welcome_msg=shared, websocket=FakeWS(), logger=MagicMock(), features=None)
+        asyncio.run(handleHelloMessage(conn, {"type": "hello", "features": features}))
+        assert conn.websocket.sent[0].get("features") == expect
+    assert "features" not in shared   # 共用的欢迎消息不被改掉

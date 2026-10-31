@@ -103,12 +103,16 @@ def chats(monkeypatch):
 
 async def test_recognition_finishing_after_abort_is_dropped(chats):
     h, asr = make_conn(), SlowASR()
+    h.features = {"vad_end": True}
     task = asyncio.create_task(asr.handle_voice_stop(h, [b"\0" * 32000]))
     await asr.started.wait()
     await handleAbortMessage(h, drop_audio=True)     # 识别中喊了唤醒词
     asr.release.set()
     await task
     assert chats == []
+    # 只有打断的确认，没有"没识别出字"（设备已经在听下一句了）
+    sent = [json.loads(c.args[0]) for c in h.websocket.send.call_args_list]
+    assert [(m["type"], m.get("state")) for m in sent] == [("tts", "stop")]
 
 
 async def test_recognition_without_abort_goes_to_the_model(chats):
@@ -340,3 +344,56 @@ def test_openai_abort_cuts_a_stalled_stream_at_once(monkeypatch):
         llm.abort(SimpleNamespace(session_id="other"))
     finally:
         server.shutdown()
+
+
+# ---------- 聊天记录落盘：被打断丢掉的这一轮不存库 ----------
+
+CHAT_CONFIG = {
+    "LLM": {"DeepSeekLLM": {"type": "openai", "model_name": "deepseek-chat", "base_url": "https://x", "api_key": "sk-1"}},
+    "chat_history": {"max_messages": 30, "max_tokens": 8000, "summary": False},
+}
+
+
+def stored(device="dev-1"):
+    from core.agent import chat_history
+    return [(r["role"], r["content"]) for r in chat_history.db().recent(device, "DeepSeekLLM", 100)]
+
+
+async def test_question_interrupted_while_thinking_is_never_stored():
+    from core.agent import chat_history
+
+    llm = ThinkingLLM()
+    h = make_conn(llm)
+    h.config, h.device_id = CHAT_CONFIG, "dev-1"
+    chat_history.load(h, h.dialogue, "DeepSeekLLM")
+    gen = turn_gen.bump(h)
+    t = threading.Thread(target=h.chat, args=("第一个问题",), kwargs={"turn": gen})
+    t.start()
+    await asyncio.to_thread(llm.thinking.wait, 5)
+    h.client_is_speaking = True
+    await handleAbortMessage(h, played_ms=0, drop_audio=True)
+    llm.release.set()
+    await asyncio.to_thread(t.join, 5)          # 旧的 chat() 结束时也会同步一次库
+    h.client_abort = False
+    await asyncio.to_thread(h.chat, "第二个问题", 0, turn_gen.bump(h))
+    assert stored() == [("user", "第二个问题"), ("assistant", "新的回答。")]
+
+
+def test_turn_already_stored_then_dropped_is_deleted_from_the_db():
+    """回复整段生成完、存了库，可一个字都还没播出就被打断：库里也删掉。"""
+    from core.agent import chat_history
+    from core.utils import reply_progress
+    from core.utils.dialogue import Message
+
+    conn = SimpleNamespace(device_id="dev-1", session_id="s", config=CHAT_CONFIG, dialogue=Dialogue(),
+                           logger=MagicMock(), hub_route=None, sentence_id="t1")
+    chat_history.load(conn, conn.dialogue, "DeepSeekLLM")
+    user = Message(role="user", content="讲个故事")
+    conn.dialogue.put(user)
+    reply_progress.note_turn(conn, "t1", user)
+    conn.dialogue.put(Message(role="assistant", content="从前有座山。"))
+    reply_progress.finish_turn(conn, "t1")
+    chat_history.sync(conn)
+    assert len(stored()) == 2
+    reply_progress.cut(conn, played_ms=0)
+    assert stored() == []

@@ -540,3 +540,21 @@ def test_notify_cleared_message():
     conn.websocket = WS()
     run(clear_command._notify_cleared(conn))
     assert sent_msgs == [{"type": "chat_history", "state": "cleared", "session_id": "s-dev-1"}]
+
+
+def test_summary_finished_after_a_clear_is_dropped(project):
+    conn = make_conn()
+    chat_history.load(conn, conn.dialogue, "DeepSeekLLM")
+    for i in range(5):
+        chat(conn, f"问{i}", f"答{i}")
+    cfg = chat_history.settings(CONFIG)
+
+    class ClearingLLM(FakeLLM):
+        def response_no_stream(self, system_prompt, user_prompt, **kwargs):
+            chat_history.clear("dev-1", CONFIG)   # 总结期间用户清除了，又接着聊
+            for i in range(5):
+                chat(conn, f"新{i}", f"新答{i}")
+            return "- 旧记忆"
+
+    assert not chat_history.summarize_now(ClearingLLM(), "dev-1", "DeepSeekLLM", cfg)
+    assert chat_history.memory_for(conn) == ""

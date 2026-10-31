@@ -472,5 +472,11 @@ def _hub_chat_db(tmp_path):
     store = chat_history.ChatDB(tmp_path / "chat.db")
     chat_history.set_db(store)
     yield store
+    # 等后台总结线程（maybe_summarize）跑完再关库，免得它在关掉的库上操作
+    import time
+
+    deadline = time.monotonic() + 3
+    while chat_history._summarizing and time.monotonic() < deadline:
+        time.sleep(0.01)
     chat_history.set_db(None)
     store.close()

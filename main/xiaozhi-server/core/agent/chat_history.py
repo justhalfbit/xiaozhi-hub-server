@@ -153,6 +153,9 @@ class ChatDB:
             args.append(int(limit))
         return [_row(r) for r in self._exec(sql, args).fetchall()]
 
+    def exists(self, msg_id: int) -> bool:
+        return self._exec("SELECT 1 FROM messages WHERE id=?", (int(msg_id),)).fetchone() is not None
+
     def models(self, device) -> List[str]:
         return [r[0] for r in self._exec("SELECT DISTINCT model FROM messages WHERE device=?", (device,)).fetchall()]
 
@@ -382,7 +385,7 @@ def summarize_now(llm, device: str, name: str, cfg: dict) -> bool:
     store = db()
     if store.memory(device, name)["upto"] != mem["upto"]:
         return False  # 总结期间被清除了
-    if not store.after(device, name, rows[-1]["id"] - 1, limit=1):
+    if not store.exists(rows[-1]["id"]):
         return False  # 这批记录已被清除
     store.set_memory(device, name, text[:limit], rows[-1]["id"])
     logger.bind(tag=TAG).info(f"设备 {device} 模型 {name}：总结了 {len(rows)} 条较早的对话，记忆 {len(text)} 字")

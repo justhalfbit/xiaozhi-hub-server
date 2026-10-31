@@ -44,7 +44,7 @@ from config.manage_api_client import DeviceNotFoundException, DeviceBindExceptio
 from core.utils.prompt_manager import PromptManager
 from core.utils.voiceprint_provider import VoiceprintProvider
 from core.utils.util import get_system_error_response
-from core.utils import reply_progress, textUtils
+from core.utils import reply_progress, textUtils, turn_gen
 from core.utils.tool_markup import ToolMarkupFilter, strip_tool_markup
 from core.agent import chat_history
 
@@ -1060,11 +1060,18 @@ class ConnectionHandler:
         # 更新系统prompt至上下文
         self.dialogue.update_system_message(self.prompt)
 
-    def chat(self, query, depth=0):
+    def chat(self, query, depth=0, turn=None):
         # [xiaozhi-hub] 一轮结束时，被打断的回复在对话里换成播出去的部分（reply_progress）
         if depth > 0:
             return self._chat(query, depth)
+        # [xiaozhi-hub] turn：开始这一轮时的代次（turn_gen）。排队等线程期间被打断了就不做
+        if turn is None:
+            turn = turn_gen.current(self)
+        elif turn_gen.stale(self, turn):
+            self.logger.bind(tag=TAG).info(f"这一轮还没开始就被打断了，不问模型: {query}")
+            return None
         sentence_id = str(uuid.uuid4().hex)
+        turn_gen.bind(self, sentence_id, turn)
         try:
             return self._chat(query, depth, sentence_id)
         finally:
@@ -1075,12 +1082,11 @@ class ConnectionHandler:
 
     def _put_reply(self, sentence_id, text):
         """[xiaozhi-hub] 把这一轮的回复写进对话；被打断后不写（由 reply_progress 写播出去的部分）。"""
-        if reply_progress.can_store(self, sentence_id):
-            self.dialogue.put(Message(role="assistant", content=text))
+        reply_progress.put(self, sentence_id, Message(role="assistant", content=text))
 
     def _superseded(self, sentence_id):
         """[xiaozhi-hub] 这一轮已被打断或已开始新的一轮：旧的一轮不能再往合成和对话里塞内容。"""
-        return self.client_abort or self.sentence_id != sentence_id
+        return self.client_abort or self.sentence_id != sentence_id or turn_gen.stale(self, sentence_id=sentence_id)
 
     def _chat(self, query, depth=0, sentence_id=None):
         # 保存当前任务的sentence_id到局部变量，避免被新任务覆盖
@@ -1105,7 +1111,8 @@ class ConnectionHandler:
             )
         else:
             # 递归调用时，使用当前的sentence_id
-            current_sentence_id = self.sentence_id
+            # [xiaozhi-hub] 由调用方带进来：打断后 self.sentence_id 已经换掉，不能再拿它当这一轮的
+            current_sentence_id = sentence_id or self.sentence_id
 
         # 设置最大递归深度，避免无限循环，可根据实际需求调整
         MAX_DEPTH = 5
@@ -1278,6 +1285,10 @@ class ConnectionHandler:
                     f"回复文字里去掉了 {markup_filter.removed} 个工具调用标记"
                 )
         except Exception as e:
+            if self._superseded(current_sentence_id):
+                # [xiaozhi-hub] 打断时主动断开了模型的流式请求（llm.abort），读流报错是预期的，不播报错误
+                self.logger.bind(tag=TAG).info(f"这一轮已被打断，模型请求已断开: {type(e).__name__}")
+                return None
             self.logger.bind(tag=TAG).error(f"LLM stream processing error: {e}")
             self.tts.tts_text_queue.put(
                 TTSMessageDTO(
@@ -1296,6 +1307,11 @@ class ConnectionHandler:
                     )
                 )
             return
+        # [xiaozhi-hub] 被打断或已开始新的一轮：模型说到一半的工具调用不再执行（参数可能都没收全），也不写对话
+        if self._superseded(current_sentence_id):
+            self.logger.bind(tag=TAG).info(
+                "这一轮已被打断，丢掉模型后面的输出" + (f"，不执行工具 {[tc['name'] for tc in tool_calls_list]}" if tool_call_flag else ""))
+            return None
         # 处理function call
         if tool_call_flag:
             bHasError = False
@@ -1507,13 +1523,13 @@ class ConnectionHandler:
                 }
                 for idx, (_, tool_call_data) in enumerate(record_tools)
             ]
-            self.dialogue.put(Message(role="assistant", tool_calls=all_tool_calls))
+            reply_progress.put(self, sentence_id, Message(role="assistant", tool_calls=all_tool_calls), reply=False)
 
             # 写入每条工具的执行结果，记录"工具返回了什么"
             for result, tool_call_data in record_tools:
                 text = result.result or ""
-                self.dialogue.put(
-                    Message(
+                reply_progress.put(
+                    self, sentence_id, reply=False, message=Message(
                         role="tool",
                         tool_call_id=(
                             str(uuid.uuid4())
@@ -1550,13 +1566,13 @@ class ConnectionHandler:
                 }
                 for idx, (_, tool_call_data) in enumerate(need_llm_tools)
             ]
-            self.dialogue.put(Message(role="assistant", tool_calls=all_tool_calls))
+            reply_progress.put(self, sentence_id, Message(role="assistant", tool_calls=all_tool_calls), reply=False)
 
             for result, tool_call_data in need_llm_tools:
                 text = result.result
                 if text is not None and len(text) > 0:
-                    self.dialogue.put(
-                        Message(
+                    reply_progress.put(
+                        self, sentence_id, reply=False, message=Message(
                             role="tool",
                             tool_call_id=(
                                 str(uuid.uuid4())
@@ -1569,7 +1585,7 @@ class ConnectionHandler:
 
             # [xiaozhi-hub] 工具执行期间被打断：结果照样留在对话里，但不再为这一轮去问模型
             if not self._superseded(sentence_id):
-                self.chat(None, depth=depth + 1)
+                self._chat(None, depth=depth + 1, sentence_id=sentence_id)
 
     def _report_worker(self):
         """聊天记录上报工作线程"""

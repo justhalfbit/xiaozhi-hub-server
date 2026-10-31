@@ -19,7 +19,7 @@ from core.handle.reportHandle import enqueue_asr_report
 from core.utils.util import remove_punctuation_and_length
 from core.handle.receiveAudioHandle import handleAudioMessage
 from core.agent.asr_text import correct_and_record  # [xiaozhi-hub]
-from core.utils import reply_echo  # [xiaozhi-hub]
+from core.utils import reply_echo, turn_gen  # [xiaozhi-hub]
 from typing import Optional, Tuple, List, NamedTuple, TYPE_CHECKING
 
 
@@ -166,6 +166,8 @@ class ASRProviderBase(ABC):
         字节就是它们；这里只识别剩下的部分，再按顺序拼起来。"""
         try:
             total_start_time = time.monotonic()
+            # [xiaozhi-hub] 识别要 1～2 秒，期间设备可能打断了这一句（唤醒词、按钮）：识别完代次变了就丢掉
+            gen = turn_gen.current(conn)
 
             # 数据已经是PCM直接使用
             pcm_data = asr_audio_task
@@ -269,12 +271,17 @@ class ASRProviderBase(ABC):
                     logger.bind(tag=TAG).info(f"忽略回声识别: {content_for_length_check}")
                     text_len = 0
 
+            if text_len > 0 and turn_gen.stale(conn, gen):
+                logger.bind(tag=TAG).info(f"识别中被打断，丢掉这句: {content_for_length_check}")
+                text_len = 0
+
             if text_len > 0:
                 audio_snapshot = pcm_data.copy()
                 enqueue_asr_report(conn, enhanced_text, audio_snapshot)
                 # 使用自定义模块进行上报
-                await startToChat(conn, enhanced_text)
-            else:
+                await startToChat(conn, enhanced_text, gen=gen)
+            elif not turn_gen.stale(conn, gen):
+                # 被打断丢掉的不用说：设备已经在听下一句了
                 await send_vad_event(conn, "empty")  # [xiaozhi-hub] 没识别出字，或只是回复的回声
         except Exception as e:
             logger.bind(tag=TAG).error(f"处理语音停止失败: {e}")

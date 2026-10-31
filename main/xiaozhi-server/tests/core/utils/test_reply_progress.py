@@ -86,13 +86,54 @@ def test_cut_before_reply_was_stored_blocks_it_and_writes_heard_part():
     assert contents(conn) == [("user", "讲个故事"), ("assistant", "从前有……")]
 
 
-def test_cut_while_thinking_keeps_question_answer_order():
+def test_cut_while_thinking_drops_the_unanswered_question():
     conn = make_conn()
     start_turn(conn, "t1")
     reply_progress.cut(conn, played_ms=0)
+    assert contents(conn) == []                # 打断当时就去掉，不等 chat() 结束
     reply_progress.finish_turn(conn, "t1")
     start_turn(conn, "t2", "算了，换个问题")
-    assert contents(conn) == [("user", "讲个故事"), ("assistant", "……"), ("user", "算了，换个问题")]
+    assert contents(conn) == [("user", "算了，换个问题")]
+
+
+def test_cut_while_an_agent_thinks_keeps_the_question():
+    # Claude Code / Grok Bot 被打断后还会在后台接着做，做完进待汇报：提问要留着
+    conn = make_conn()
+    conn.llm = SimpleNamespace(AGENT_LABEL="Claude Code")
+    start_turn(conn, "t1", "帮我看看这个仓库")
+    reply_progress.cut(conn, played_ms=0)
+    reply_progress.finish_turn(conn, "t1")
+    assert contents(conn) == [("user", "帮我看看这个仓库"), ("assistant", "……")]
+
+
+def test_cut_while_thinking_keeps_a_turn_that_already_ran_tools():
+    conn = make_conn()
+    start_turn(conn, "t1", "把音量调到五十再讲个笑话")
+    d = conn.dialogue
+    d.put(Message(role="assistant", tool_calls=[{"id": "c1"}]))
+    reply_progress.cut(conn, played_ms=0)
+    # 工具结果在打断之后才回来：调用和结果不能拆开
+    assert reply_progress.put(conn, "t1", Message(role="tool", tool_call_id="c1", content="ok"), reply=False)
+    assert not reply_progress.put(conn, "t1", Message(role="assistant", content="调好了"))
+    reply_progress.finish_turn(conn, "t1")
+    start_turn(conn, "t2", "下一个问题")
+    assert [(m.role, m.content) for m in d.dialogue] == [
+        ("user", "把音量调到五十再讲个笑话"), ("assistant", None), ("tool", "ok"), ("assistant", "……"),
+        ("user", "下一个问题")]
+
+
+def test_tool_results_after_the_cut_go_back_into_their_turn():
+    conn = make_conn()
+    start_turn(conn, "t1", "查一下天气")
+    speak(conn, "t1", [("好的我查一下", 10)], last=False)
+    conn.dialogue.put(Message(role="assistant", content="好的我查一下"))
+    reply_progress.cut(conn, played_ms=600)
+    start_turn(conn, "t2", "算了")                    # 新问题先到了
+    reply_progress.put(conn, "t1", Message(role="assistant", tool_calls=[{"id": "c1"}]), reply=False)
+    reply_progress.put(conn, "t1", Message(role="tool", tool_call_id="c1", content="晴"), reply=False)
+    reply_progress.finish_turn(conn, "t1")
+    assert contents(conn) == [("user", "查一下天气"), ("assistant", None), ("tool", "晴"),
+                              ("assistant", "好的我查一下……"), ("user", "算了")]
 
 
 def test_cut_lands_before_the_next_question():
@@ -193,7 +234,7 @@ def test_superseded_turn_stops_and_does_not_store_its_reply():
     go_on.set()
     t.join(5)
     assert [(m.role, m.content) for m in h.dialogue.dialogue] == [
-        ("user", "第一个问题"), ("assistant", "……"), ("user", "第二个问题"), ("assistant", "新的回答。")]
+        ("user", "第二个问题"), ("assistant", "新的回答。")]
     # 旧的一轮在新问题开始后没再把字交给合成
     texts = [c.args[0].content_detail for c in h.tts.tts_text_queue.put.call_args_list
              if getattr(c.args[0], "content_detail", None)]

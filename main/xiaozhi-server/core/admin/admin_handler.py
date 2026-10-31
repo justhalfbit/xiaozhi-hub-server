@@ -551,7 +551,7 @@ class AdminHandler:
         return request.remote in ("127.0.0.1", "::1")
 
     async def handle_kiosk_llm(self, request: web.Request):
-        """可选的模型（配好的 API 厂商，装了 Claude Code 的话排第一个）和当前选中的。
+        """可选的模型（装了 Claude Code 的话排第一个，然后是配好的 API 厂商、勾选的 Grok Bot）和当前选中的。
 
         带 ?device=<device-id> 时，selected 是这台设备实际会用的模型：它上次切到的（呼名或在这里切换），
         还可用的话；default 始终是后台默认模型。
@@ -568,6 +568,8 @@ class AdminHandler:
         if install.get("installed"):
             options.insert(0, {"kind": "cli", "vendor": "claude-code", "label": "Claude Code",
                                "entry": pages.CLAUDE_CLI_ENTRY, "model": data["claude"]["values"].get("model", "")})
+        options += [{"kind": "grok", "vendor": "grok_bot", "label": b["bot_name"], "entry": b["entry"], "model": "Grok Bot"}
+                    for b in data["grok"]["bots"] if llm_router.model_ready(merged, b["entry"])]
         selected = data["selected"]
         device = request.query.get("device")
         if device:
@@ -581,18 +583,30 @@ class AdminHandler:
         """切换默认模型（同后台"保存并设为默认"），在线的连接也马上跟着切（新模型从新对话开始，同呼名切换）。
 
         body 带 device 时，这台设备记住这个模型：它上次呼名切到的模型不会在重连时又把它切回去。
+        Grok Bot（{"kind": "grok", "entry": "GrokBot_…", "device": …}）不当默认模型（后台也不能设）：
+        和喊它的称呼一样，只把这台设备切过去并记住。
         """
         if not self._from_this_machine(request):
             return self._error("仅限本机", 403)
         body = await self._read_json(request)
-        name, result = await self._use_llm(body)
-        if name is None:
-            return result
-        if body.get("device"):
-            await self._blocking(llm_router.store().put, str(body["device"]), {"model": name})
+        device = str(body.get("device") or "")
+        if body.get("kind") == "grok":
+            if not device:
+                return self._error("缺少 device", 400)
+            merged = await self._blocking(self._merged)
+            name = str(body.get("entry") or "")
+            if name not in {b["entry"] for b in pages.grok_entries(merged)} or not llm_router.model_ready(merged, name):
+                return self._error("没有这个 Grok Bot，请先在管理后台的 Grok Bot 页勾选", 404)
+            result = {"ok": True, "applied": True, "note": "已切换，这台设备之后都用它"}
+        else:
+            name, result = await self._use_llm(body)
+            if name is None:
+                return result
+        if device:
+            await self._blocking(llm_router.store().put, device, {"model": name})
         for item in connections.snapshot():
             conn = connections.get(item["session_id"])
-            if conn is None:
+            if conn is None or (body.get("kind") == "grok" and item["device_id"] != device):
                 continue
             try:
                 await self._blocking(llm_router.switch, conn, name, remember=False)

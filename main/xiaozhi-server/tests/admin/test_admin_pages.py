@@ -330,6 +330,40 @@ async def test_kiosk_llm_use_moves_live_connections(kiosk, cfg_path, monkeypatch
         connections.unregister(fake)
 
 
+async def test_kiosk_grok_bot_is_per_device(kiosk, cfg_path, monkeypatch):
+    """Grok Bot 也列出来；选它和喊称呼一样：只切这台设备、记住它，默认模型不变。"""
+    switched = []
+    monkeypatch.setattr(llm_router, "switch", lambda conn, name, remember=True: switched.append((conn.session_id, name, remember)))
+    custom = config_store.load_custom(cfg_path)
+    custom["LLM"]["GrokBot_孙悟空"] = {"type": "grok_bot", "bot_id": "bot-1", "bot_name": "孙悟空"}
+    custom["LLM"]["GrokBot_没勾好"] = {"type": "grok_bot", "bot_name": "没勾好"}
+    config_store.save_custom(custom, cfg_path)
+    await kiosk.post("/admin/api/logout", json={})
+    data = await (await kiosk.get("/kiosk/llm?device=dev-1")).json()
+    assert data["options"][-1] == {"kind": "grok", "vendor": "grok_bot", "label": "孙悟空",
+                                   "entry": "GrokBot_孙悟空", "model": "Grok Bot"}
+    assert all(o["entry"] != "GrokBot_没勾好" for o in data["options"])  # 没有 bot_id 的不列
+    mine = SimpleNamespace(session_id="s-1", device_id="dev-1", client_ip="127.0.0.1")
+    other = SimpleNamespace(session_id="s-2", device_id="dev-2", client_ip="127.0.0.1")
+    connections.register(mine)
+    connections.register(other)
+    try:
+        body = {"kind": "grok", "vendor": "grok_bot", "entry": "GrokBot_孙悟空", "device": "dev-1"}
+        r = await kiosk.post("/kiosk/llm/use", json=body)
+        assert r.status == 200 and (await r.json())["ok"]
+        assert switched == [("s-1", "GrokBot_孙悟空", False)]  # 别的设备不动
+        assert merged(cfg_path)["selected_module"]["LLM"] == "ClaudeCLI"  # 默认模型不变
+        assert llm_router.store().get("dev-1")["model"] == "GrokBot_孙悟空"
+        data = await (await kiosk.get("/kiosk/llm?device=dev-1")).json()
+        assert data["selected"] == "GrokBot_孙悟空" and data["default"] == "ClaudeCLI"
+        assert (await kiosk.post("/kiosk/llm/use", json={**body, "device": ""})).status == 400
+        assert (await kiosk.post("/kiosk/llm/use", json={**body, "entry": "GrokBot_没勾好"})).status == 404
+        assert (await kiosk.post("/kiosk/llm/use", json={**body, "entry": "DeepSeekLLM"})).status == 404
+    finally:
+        connections.unregister(mine)
+        connections.unregister(other)
+
+
 async def test_kiosk_reports(kiosk):
     reports.clear()
     try:

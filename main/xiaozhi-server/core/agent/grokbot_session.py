@@ -544,7 +544,7 @@ class AfterWatch:
         if self.linger:
             self.session._log("info", f"本轮做完了，再盯 {int(cfg.linger_max // 60)} 分钟，接住它补发的")
         else:
-            self.session._log("info", f"还没拿到回复，后台盯着它，最多 {int(cfg.watch_max // 60)} 分钟")
+            self.session._log("info", f"它还没做完，后台盯着，最多 {int(cfg.watch_max // 60)} 分钟")
 
     async def _run(self) -> None:
         cfg = self.session.config

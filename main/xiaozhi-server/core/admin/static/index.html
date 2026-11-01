@@ -825,7 +825,7 @@ async function renderLLM(root) {
     const result = (html) => ($("api-result").innerHTML = html);
     const bad = (msg) => result(`<span style="color:var(--err)">${esc(msg)}</span>`);
     $("api-test").onclick = (e) => busy(e.target, async () => {
-      result('<span class="muted">正在发一句话测试…</span>');
+      result('<span class="muted">正在发一句话测试（推理型模型要先想一会儿，最多等一分钟）…</span>');
       try {
         const r = await api(`llm/vendors/${x.id}/test`, values());
         result(`<span style="color:var(--ok)">✓ 连接正常，${r.seconds < 1 ? "不到 1 秒" : r.seconds + " 秒"}收到回复“${esc(r.reply)}”</span>`);

@@ -39,8 +39,9 @@ _POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="admin")
 
 # 测试连接最多等这么久：连不上（地址被墙时连接不报错、一直没回应）就尽快告诉用户，也不占着线程。
 # connect 只管建立连接（TCP + TLS，走代理、连国外也就一两秒）；模型想多久算在 read 里，
-# 它是两段数据之间最多等多久，回复要 8 秒也没问题
-TEST_TIMEOUT = {"connect": 10.0, "read": 15.0, "write": 5.0, "pool": 2.0}
+# 它是两段数据之间最多等多久。测试用流式请求、收到第一个字就停，推理型模型（如 deepseek-reasoner）
+# 先想十几秒再出字也等得到
+TEST_TIMEOUT = {"connect": 10.0, "read": 60.0, "write": 5.0, "pool": 2.0}
 logger = setup_logging()
 COOKIE_NAME = "xz_admin"
 STATIC_DIR = Path(__file__).parent / "static"
@@ -534,21 +535,35 @@ class AdminHandler:
 
     @staticmethod
     def _test_llm(config: dict) -> dict:
+        import httpx
         import openai
         from core.providers.llm.openai.openai import LLMProvider
 
         started = time.time()
+        reply = ""
         try:
             provider = LLMProvider({**config, "timeout": TEST_TIMEOUT})
             provider.client.max_retries = 0   # 默认失败后再试 2 次
-            reply = provider.response_no_stream("你是语音助手，回答尽量简短。", "只回复一个字：好")
+            parts = provider.response("", [{"role": "system", "content": "你是语音助手，回答尽量简短。"},
+                                           {"role": "user", "content": "只回复一个字：好"}])
+            try:
+                for part in parts:   # 收到第一个字就够了：地址、Key、模型都没问题
+                    if part.strip():
+                        reply = part
+                        break
+            finally:
+                parts.close()   # 断开没读完的流
         except openai.AuthenticationError:
             return {"ok": False, "error": "API Key 不对或已失效"}
         except openai.NotFoundError:
             return {"ok": False, "error": "找不到这个模型或接口地址，请检查模型名称和接口地址"}
         except openai.RateLimitError:
             return {"ok": False, "error": "请求太频繁或额度用完了"}
-        except (openai.APIConnectionError, openai.APITimeoutError):
+        except (openai.APIConnectionError, httpx.TransportError) as e:
+            # 读超时：连接建立了、请求也发出去了，是模型那边迟迟不出字，不是网络不通
+            if isinstance(e, httpx.ReadTimeout) or isinstance(e.__cause__, httpx.ReadTimeout):
+                return {"ok": False, "error": f"接口连上了，但模型 {TEST_TIMEOUT['read']:.0f} 秒都没有回应。"
+                                              "可能是模型想得太久或服务太忙，稍后再试；一直这样就换个模型"}
             return {"ok": False, "error": "连不上接口地址，请检查地址和网络；国外的服务在国内可能要走代理，或者换国内的服务"}
         except openai.APIStatusError as e:
             return {"ok": False, "error": f"接口返回错误 {e.status_code}：{str(e.message)[:200]}"}

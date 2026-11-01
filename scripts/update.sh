@@ -93,14 +93,15 @@ after_pull() {
     bash "$ROOT/scripts/install.sh" || fail "安装没有完成。按上面的提示处理后，重新运行 bash \"$ROOT/scripts/update.sh\" 即可接着装"
     return
   fi
+  local reinstalled=0
   if deps_changed "$old"; then
+    reinstalled=1
     step "补装依赖和模型"
     # 先删掉完成标记：这一步失败又没能退回原版本时，下次运行 update.sh 会发现并重新补装
     rm -f "$INSTALLED"
     if ! HUB_UPDATING=1 bash "$ROOT/scripts/install.sh"; then
       roll_back "$old" || fail "安装步骤失败，退回原来的版本也没有成功。按上面的提示处理后，重新运行 bash \"$ROOT/scripts/update.sh\" 即可补装"
-      # 原来的版本是装完整的，新装上的包不影响它
-      : >"$INSTALLED"
+      restore_deps || fail "安装步骤失败，已退回原来的版本，但依赖没能装回原来的版本，服务没有重启（正在运行的不受影响，下次重启可能起不来）。按上面的提示处理后，运行 bash \"$ROOT/scripts/install.sh\" 装回依赖"
       fail "安装步骤失败，已退回原来的版本（$(git log -1 --format='%h，%cd' --date=short)），服务没有重启。按上面的提示处理后再更新"
     fi
   else
@@ -113,6 +114,9 @@ after_pull() {
     if ! HUB_READY_TIMEOUT="${HUB_READY_TIMEOUT:-300}" bash "$ROOT/scripts/autostart.sh" restart; then
       step "新版本没有启动成功，退回原来的版本"
       roll_back "$old" || fail "退回原来的版本也没有成功，后台服务现在可能起不来。请按上面的报错处理"
+      if [[ "$reinstalled" == 1 ]]; then
+        restore_deps || fail "已退回原来的版本，但依赖没能装回原来的版本，后台服务现在可能起不来。按上面的提示处理后，运行 bash \"$ROOT/scripts/install.sh\" 装回依赖"
+      fi
       HUB_READY_TIMEOUT="${HUB_READY_TIMEOUT:-300}" bash "$ROOT/scripts/autostart.sh" restart \
         || fail "已退回原来的版本，但后台服务仍然没有启动成功。请按上面的报错处理"
       fail "新版本没有启动成功，已退回原来的版本（$(git log -1 --format='%h，%cd' --date=short)）并重启。报错见上面"
@@ -138,6 +142,15 @@ roll_back() {
   local old="$1"
   [[ -n "$old" ]] && git cat-file -e "${old}^{commit}" 2>/dev/null || return 1
   git reset -q --keep "$old"
+}
+
+# 依赖清单是写死版本的，新版本补装时可能把某些包升级了，旧代码配新依赖不一定跑得起来：
+# 退回代码后在原来的版本上再补装一次，把虚拟环境装回原来的版本（uv 缓存里有原来的包，一般不用联网）
+restore_deps() {
+  step "把依赖装回原来的版本"
+  # 装回失败时不留完成标记，下次运行 update.sh 会发现并重新补装
+  rm -f "$INSTALLED"
+  HUB_UPDATING=1 bash "$ROOT/scripts/install.sh"
 }
 
 step() { printf "\n\033[1m==> %s\033[0m\n" "$*"; }

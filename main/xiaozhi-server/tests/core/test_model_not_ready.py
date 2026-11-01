@@ -62,3 +62,20 @@ def test_switched_model_counts_not_the_default():
 
 def test_unknown_model_is_not_blocked():
     assert llm_router.not_ready_reply(SimpleNamespace(config={})) is None
+
+
+def test_key_filled_in_while_connected_gets_a_fresh_instance(monkeypatch):
+    # heard the prompt, filled the key in the admin page, asked again before the connection closed:
+    # the connection's instance was built with the placeholder key
+    h = make_handler("DeepSeekLLM")
+    stale = h.llm
+    h._chat("你好")
+    stale.response.assert_not_called()
+    fresh = MagicMock()
+    fresh.response.return_value = iter(["好的"])
+    h.config["LLM"] = {**LLM, "DeepSeekLLM": {**LLM["DeepSeekLLM"], "api_key": "sk-real"}}
+    monkeypatch.setattr(llm_router, "get_instance", lambda conn, name: fresh)
+    h.tts.reset_mock()
+    h._chat("你好")
+    assert h.llm is fresh and spoken(h) == "好的"
+    stale.response.assert_not_called()

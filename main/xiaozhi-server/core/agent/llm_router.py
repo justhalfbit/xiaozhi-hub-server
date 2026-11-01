@@ -86,10 +86,21 @@ NOT_READY_REPLY = "还没配置大模型，请在电脑上打开网关后台填�
 def not_ready_reply(conn: "ConnectionHandler") -> Optional[str]:
     """这个连接正在用的模型没填好（刚刷机、Key 还是占位文字）时，直接回给用户的话；填好了返回 None。
     不拦的话会拿空 Key 去请求，等出错才说"现在有点忙"。不知道在用哪个模型时不拦。"""
-    name = _state(conn)["current"] or default_name(conn)
-    if not name or model_ready(_server_config(conn), name):
+    st = _state(conn)
+    name = st["current"] or default_name(conn)
+    if not name:
         return None
-    return NOT_READY_REPLY
+    if not model_ready(_server_config(conn), name):
+        st["not_ready"] = True
+        return NOT_READY_REPLY
+    if st.pop("not_ready", False):
+        # 用户听到提示后在后台填好了，连接还没断：手上的实例是拿占位 Key 建的，换成按新配置建的
+        instance = get_instance(conn, name)
+        if instance is not conn.llm:
+            _attach(conn, instance)
+            conn.llm = instance
+            logger.bind(tag=TAG).info(f"设备 {_device_key(conn)} 的模型 {name} 刚配置好，换用新实例")
+    return None
 
 
 INTENT_MODES = ("nointent", "function_call")

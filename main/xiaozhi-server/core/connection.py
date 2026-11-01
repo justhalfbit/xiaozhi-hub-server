@@ -46,7 +46,7 @@ from core.utils.voiceprint_provider import VoiceprintProvider
 from core.utils.util import get_system_error_response
 from core.utils import reply_progress, textUtils, turn_gen
 from core.utils.tool_markup import ToolMarkupFilter, strip_tool_markup
-from core.agent import chat_history
+from core.agent import chat_history, llm_router
 
 
 TAG = __name__
@@ -1099,6 +1099,18 @@ class ConnectionHandler:
         if depth == 0:
             current_sentence_id = sentence_id or str(uuid.uuid4().hex)
             self.sentence_id = current_sentence_id  # 更新共享属性
+            # [xiaozhi-hub] 模型还没配置好：马上告诉用户，不去请求、也不写进对话
+            not_ready = llm_router.not_ready_reply(self)
+            if not_ready:
+                self.logger.bind(tag=TAG).warning(f"模型还没配置好，不请求: {query}")
+                for sentence_type, content_type, detail in (
+                        (SentenceType.FIRST, ContentType.ACTION, None),
+                        (SentenceType.MIDDLE, ContentType.TEXT, not_ready),
+                        (SentenceType.LAST, ContentType.ACTION, None)):
+                    self.tts.tts_text_queue.put(TTSMessageDTO(
+                        sentence_id=current_sentence_id, sentence_type=sentence_type,
+                        content_type=content_type, content_detail=detail))
+                return None
             user_msg = Message(role="user", content=query)
             self.dialogue.put(user_msg)
             reply_progress.note_turn(self, current_sentence_id, user_msg)

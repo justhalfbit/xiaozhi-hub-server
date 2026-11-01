@@ -80,6 +80,18 @@ def model_ready(config: dict, name: str) -> bool:
     return True
 
 
+NOT_READY_REPLY = "还没配置大模型，请在电脑上打开网关后台填好 API Key。"
+
+
+def not_ready_reply(conn: "ConnectionHandler") -> Optional[str]:
+    """这个连接正在用的模型没填好（刚刷机、Key 还是占位文字）时，直接回给用户的话；填好了返回 None。
+    不拦的话会拿空 Key 去请求，等出错才说"现在有点忙"。不知道在用哪个模型时不拦。"""
+    name = _state(conn)["current"] or default_name(conn)
+    if not name or model_ready(_server_config(conn), name):
+        return None
+    return NOT_READY_REPLY
+
+
 INTENT_MODES = ("nointent", "function_call")
 AGENT_TYPES = ("claude_cli", "grok_bot")  # 自己处理工具和对话的 Agent：不走 function_call
 

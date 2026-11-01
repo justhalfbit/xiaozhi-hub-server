@@ -10,11 +10,16 @@
 """
 
 import asyncio
+import hashlib
 import re
+import struct
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import TYPE_CHECKING
+
+from config.config_loader import get_project_dir
 
 if TYPE_CHECKING:
     from core.connection import ConnectionHandler
@@ -24,7 +29,8 @@ TAG = __name__
 DEFAULT_MODELS = {"ClaudeCLI": ["claude", "cloud", "clod", "clot", "克劳德"]}
 DEFAULT_REPLY = "我在"
 # 发缓存的音频前等一会儿：设备收到 tts start 后要先切到说话状态（会清空解码队列），切换完成前收到的音频会被丢掉。
-# 正常合成时中间有约 2 秒的合成时间，不会碰到；缓存的音频紧跟着就到，不等的话设备只显示文字、没有声音
+# 正常合成时中间有约 2 秒的合成时间，不会碰到；缓存的音频紧跟着就到，不等的话设备只显示文字、没有声音。
+# 在 hello 里声明 ready_on_tts_start 的设备按顺序处理消息和音频，收到 tts start 马上就能播，不用等
 CACHED_REPLY_DELAY = 0.5
 
 
@@ -141,21 +147,99 @@ class Learner:
 learner = Learner()
 
 
-# 固定回复合成好的音频：(TTS 类型, 音色, 采样率, 文字) -> opus 包。EdgeTTS 合成一句要 2 秒左右，缓存后直接发
+# 固定回复合成好的音频：(TTS 类型, 音色, 采样率, 文字) -> opus 包。EdgeTTS 合成一句要 1～2 秒，缓存后直接发。
+# 同时存到 data/call_reply_audio/，服务重启后不用重新合成；连接建立后 warm_up 会提前合成好（见 warm_up）
 _audio_cache = {}
+_filling = {}  # 正在合成的：key -> Task
+_cache_dir = Path(get_project_dir()) / "data" / "call_reply_audio"
 
 
 def _cache_key(conn: "ConnectionHandler", text: str):
-    return (type(conn.tts).__name__, getattr(conn.tts, "voice", None), getattr(conn, "sample_rate", None), text)
+    # 存盘后后台改了音色、语速、音量（含 post_gain）都要重新合成，所以这些都算进来
+    tts = conn.tts
+    return (type(tts).__name__, getattr(tts, "voice", None), getattr(tts, "speech_rate", None),
+            getattr(tts, "volume", None), getattr(tts, "pitch_rate", None), getattr(tts, "post_gain", None),
+            getattr(conn, "sample_rate", None), text)
+
+
+def _cache_file(key) -> Path:
+    return _cache_dir / (hashlib.sha1(repr(key).encode("utf-8")).hexdigest() + ".opus")
+
+
+def _load_cached(key):
+    """内存里没有时从磁盘读回（每个包前面 4 字节长度）。"""
+    packets = _audio_cache.get(key)
+    if packets is not None:
+        return packets
+    try:
+        data = _cache_file(key).read_bytes()
+    except OSError:
+        return None
+    packets, i = [], 0
+    while i + 4 <= len(data):
+        (n,) = struct.unpack_from(">I", data, i)
+        packets.append(data[i + 4:i + 4 + n])
+        i += 4 + n
+    if i != len(data) or not packets:
+        return None  # 文件不完整：当作没有，重新合成
+    _audio_cache[key] = packets
+    return packets
+
+
+def _save_cached(key, packets) -> None:
+    _cache_dir.mkdir(parents=True, exist_ok=True)
+    path = _cache_file(key)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_bytes(b"".join(struct.pack(">I", len(p)) + bytes(p) for p in packets))
+    tmp.replace(path)
 
 
 async def _fill_cache(conn: "ConnectionHandler", text: str) -> None:
-    try:
-        packets = await asyncio.to_thread(conn.tts.to_tts, text)
-        if packets:
-            _audio_cache[_cache_key(conn, text)] = packets
-    except Exception as e:
-        conn.logger.bind(tag=TAG).warning(f"缓存呼名回复的音频失败: {e}")
+    key = _cache_key(conn, text)
+    if key in _filling:
+        return await asyncio.shield(_filling[key])
+
+    async def fill():
+        try:
+            packets = await asyncio.to_thread(conn.tts.to_tts, text)
+            if packets:
+                _audio_cache[key] = packets
+                await asyncio.to_thread(_save_cached, key, packets)
+        except Exception as e:
+            conn.logger.bind(tag=TAG).warning(f"缓存呼名回复的音频失败: {e}")
+        finally:
+            _filling.pop(key, None)
+
+    _filling[key] = asyncio.ensure_future(fill())
+    await asyncio.shield(_filling[key])
+
+
+def reply_text(cfg: dict) -> str:
+    """只喊称呼时回的话。"""
+    return one_segment((cfg or {}).get("reply") or "") or DEFAULT_REPLY
+
+
+async def warm_up(conn: "ConnectionHandler") -> None:
+    """连接建立后在后台准备好只喊称呼时的回复：磁盘上有就读进内存，没有就等语音合成就绪后合成一次。
+    第一次只喊称呼时就不用现合成了（网关重启后的第一次也一样）。"""
+    cfg = conn.config.get("call_names") or {}
+    if not cfg.get("enabled", True):
+        return
+    deadline = time.monotonic() + 30
+    while not conn.tts and time.monotonic() < deadline:
+        await asyncio.sleep(0.2)
+    if not conn.tts:
+        return
+    text = reply_text(cfg)
+    if await asyncio.to_thread(_load_cached, _cache_key(conn, text)) is None:
+        await _fill_cache(conn, text)
+
+
+def schedule_warm_up(conn: "ConnectionHandler") -> None:
+    """可以在任意线程里调用（llm_router.on_conn_open 在线程池里执行）。"""
+    loop = getattr(conn, "loop", None)
+    if loop is not None and loop.is_running() and getattr(conn, "config", None) is not None:
+        asyncio.run_coroutine_threadsafe(warm_up(conn), loop)
 
 
 async def _speak(conn: "ConnectionHandler", heard: str, reply: str, cache: bool = False) -> bool:
@@ -178,10 +262,19 @@ async def _speak(conn: "ConnectionHandler", heard: str, reply: str, cache: bool 
     conn.client_abort = False
     conn.sentence_id = str(uuid.uuid4().hex)
     conn.dialogue.put(Message(role="user", content=heard))
-    packets = _audio_cache.get(_cache_key(conn, reply)) if cache else None
+    packets = None
+    if cache:
+        key = _cache_key(conn, reply)
+        if key in _filling:  # warm_up 正在合成：等它（比重新合成一遍快）
+            try:
+                await asyncio.wait_for(asyncio.shield(_filling[key]), timeout=3)
+            except Exception:
+                pass
+        packets = _load_cached(key)
     if packets:
         # 和唤醒词回复的播放方式一样
-        await asyncio.sleep(CACHED_REPLY_DELAY)
+        if not (getattr(conn, "features", None) or {}).get("ready_on_tts_start"):
+            await asyncio.sleep(CACHED_REPLY_DELAY)
         await sendAudioMessage(conn, SentenceType.FIRST, packets, reply)
         await sendAudioMessage(conn, SentenceType.LAST, [], None)
         conn.dialogue.put(Message(role="assistant", content=reply))
@@ -236,7 +329,7 @@ async def handle_call_name(conn: "ConnectionHandler", text: str):
         conn.logger.bind(tag=TAG).info(f"呼名 {model}：去掉称呼后交给模型：{rest}")
         return rest
 
-    reply = one_segment(cfg.get("reply") or "") or DEFAULT_REPLY
+    reply = reply_text(cfg)
     # 切回一个在外面干活的 Bot（Grok Bot）：它做完的活还没念过的，跟在"我在"后面一起念
     bot_id, pending = _pending_report(conn, model)
     if pending:

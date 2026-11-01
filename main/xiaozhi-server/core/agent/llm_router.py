@@ -8,7 +8,9 @@
   其他模型第一次被叫到时才创建。条目配置变了（后台保存后热加载）就让旧实例退役，下次叫到时重建，
   在线连接继续用旧实例，重连后用新的；
 - 切到别的模型后，原来那个模型不会马上释放：claude_cli 的进程等空闲超时再关，方便切回来；
-  连接关闭时，这个连接用过的每个模型都会收到 on_conn_close。
+  连接关闭时，这个连接用过的每个模型都会收到 on_conn_close；
+- 意图识别也跟着这个连接的模型走（见 intent_mode）：Claude Code、Grok Bot 不用插件，API 模型用插件，
+  只改这个连接自己的配置副本，不动后台的全局设置。
 """
 
 import asyncio
@@ -76,6 +78,74 @@ def model_ready(config: dict, name: str) -> bool:
     if kind == "grok_bot" and not str(entry.get("bot_id") or "").strip():
         return False
     return True
+
+
+INTENT_MODES = ("nointent", "function_call")
+AGENT_TYPES = ("claude_cli", "grok_bot")  # 自己处理工具和对话的 Agent：不走 function_call
+
+
+def _entry_type(config: dict, section: str, name: Optional[str]) -> Optional[str]:
+    entry = (config.get(section) or {}).get(name)
+    return entry.get("type", name) if isinstance(entry, dict) else None
+
+
+def intent_mode(config: dict, name: str) -> Optional[str]:
+    """一个连接用 name 这个模型时意图识别该用哪种，规则同后台切默认模型时的联动（pages.desired_intent）。
+
+    - 用的就是后台默认模型：和后台的设置一致；
+    - Claude Code、Grok Bot：nointent；
+    - 其他 API 模型：后台在 API 模式下选过的，没选过时 Claude 用 nointent、其他用 function_call。
+    后台的意图识别不是这两种（如 intent_llm）时返回 None：不按设备改。
+    """
+    selected = _entry_type(config, "Intent", (config.get("selected_module") or {}).get("Intent"))
+    if selected not in INTENT_MODES:
+        return None
+    if name == (config.get("selected_module") or {}).get("LLM"):
+        return selected
+    if _entry_type(config, "LLM", name) in AGENT_TYPES:
+        return "nointent"
+    pref = (config.get("admin") or {}).get("api_intent")
+    if pref in INTENT_MODES:
+        return pref
+    from core.admin import catalog
+
+    return "nointent" if name == catalog.VENDOR_BY_ID["claude"]["entry"] else "function_call"
+
+
+def _intent_entry(config: dict, mode: str) -> Optional[str]:
+    """意图识别模式对应的条目名（上游里条目名和类型同名，用户改过名时按类型找）。"""
+    intents = config.get("Intent") or {}
+    if _entry_type(config, "Intent", mode) == mode:
+        return mode
+    return next((n for n, e in intents.items() if isinstance(e, dict) and e.get("type") == mode), None)
+
+
+def _apply_intent(conn: "ConnectionHandler", name: str, live: bool = True) -> None:
+    """让这个连接的意图识别跟着它的模型走。只改连接自己的配置副本（conn.config），不动全局设置。
+
+    live=False：连接还在建立，组件还没初始化，改了配置后 _initialize_intent 会照着建好；
+    live=True：已经在对话中，同时改 intent_type，第一次用上插件时补建工具处理器和工具调用示例。
+    """
+    mode = intent_mode(_server_config(conn), name)
+    entry = _intent_entry(conn.config, mode) if mode else None
+    if entry is None:
+        return
+    conn.config.setdefault("selected_module", {})["Intent"] = entry
+    if not live or getattr(conn, "intent_type", None) == mode:
+        return
+    conn.intent_type = mode
+    if mode == "function_call":
+        conn.load_function_plugin = True
+        if getattr(conn, "func_handler", None) is None:
+            from core.providers.tools.unified_tool_handler import UnifiedToolHandler
+
+            conn.func_handler = UnifiedToolHandler(conn)
+            loop = getattr(conn, "loop", None)
+            if loop is not None:
+                asyncio.run_coroutine_threadsafe(conn.func_handler._initialize(), loop)
+        if not any(m.is_temporary for m in conn.dialogue.dialogue):
+            conn._inject_tool_call_fewshot()
+    logger.bind(tag=TAG).info(f"设备 {_device_key(conn)} 的意图识别跟着模型改为 {mode}")
 
 
 def model_label(name: str) -> str:
@@ -175,18 +245,21 @@ def on_conn_open(conn: "ConnectionHandler") -> None:
     name = remembered(conn)
     if name and name != st["current"] and model_ready(_server_config(conn), name):
         try:
-            switch(conn, name, remember=False)
+            switch(conn, name, remember=False, live=False)
             logger.bind(tag=TAG).info(f"设备 {_device_key(conn)} 沿用上次的模型 {name}")
         except Exception as e:
             logger.bind(tag=TAG).error(f"切换到上次的模型 {name} 失败，使用默认模型: {e}")
+    if st["current"]:
+        _apply_intent(conn, st["current"], live=False)
     # 上次断开后有 Agent 在外面做完了活：等问候播完念给用户
-    from core.agent import reports
+    from core.agent import call_names, reports
 
     reports.on_conn_open(conn)
+    call_names.schedule_warm_up(conn)  # 提前准备好只喊称呼时回的"我在"
 
 
-def switch(conn: "ConnectionHandler", name: str, remember: bool = True) -> bool:
-    """把这个连接切到指定模型。模型没配置好时返回 False，不切换。"""
+def switch(conn: "ConnectionHandler", name: str, remember: bool = True, live: bool = True) -> bool:
+    """把这个连接切到指定模型，意图识别跟着改（live 见 _apply_intent）。模型没配置好时返回 False，不切换。"""
     if not model_ready(_server_config(conn), name):
         return False
     st = _state(conn)
@@ -199,6 +272,8 @@ def switch(conn: "ConnectionHandler", name: str, remember: bool = True) -> bool:
         conn.llm = instance
         logger.bind(tag=TAG).info(f"设备 {_device_key(conn)} 切换模型：{st['current']} → {name}")
         st["current"] = name
+        if live:
+            _apply_intent(conn, name)
     if remember:
         store().put(_device_key(conn), {"model": name})
     return True

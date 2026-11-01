@@ -421,12 +421,13 @@ class AdminHandler:
 
     # ---------- 大模型 ----------
 
-    def _claude_install(self, merged: dict) -> dict:
+    def _claude_install(self, merged: dict, version: bool = True) -> dict:
+        """version=False 只看装没装：查版本要运行一次 claude --version（设备上约半秒）。"""
         from core.providers.llm.claude_cli.claude_cli import find_claude_cli
 
         entry = (merged.get("LLM") or {}).get(pages.CLAUDE_CLI_ENTRY) or {}
         cli = find_claude_cli(entry.get("cli_path") or None)
-        return {"installed": bool(cli), "path": cli or "", "version": _claude_version(cli) if cli else ""}
+        return {"installed": bool(cli), "path": cli or "", "version": _claude_version(cli) if cli and version else ""}
 
     async def handle_llm(self, request: web.Request):
         self._require_login(request)
@@ -563,60 +564,85 @@ class AdminHandler:
         if not self._from_this_machine(request):
             return self._error("仅限本机", 403)
         merged = await self._blocking(self._merged)
+        return self._json({"ok": True, **await self._kiosk_models(merged, request.query.get("device"))})
+
+    async def _kiosk_models(self, merged: dict, device: str = None) -> dict:
         data = pages.describe_llm(merged)
         options = [
             {"kind": "api", "vendor": v["id"], "label": v["label"], "entry": v["entry"], "model": v["model"]}
             for v in data["vendors"] if v.get("configured")
         ]
-        install = await self._blocking(self._claude_install, merged)
+        install = await self._blocking(self._claude_install, merged, version=False)
         if install.get("installed"):
             options.insert(0, {"kind": "cli", "vendor": "claude-code", "label": "Claude Code",
                                "entry": pages.CLAUDE_CLI_ENTRY, "model": data["claude"]["values"].get("model", "")})
         options += [{"kind": "grok", "vendor": "grok_bot", "label": b["bot_name"], "entry": b["entry"], "model": "Grok Bot"}
                     for b in data["grok"]["bots"] if llm_router.model_ready(merged, b["entry"])]
         selected = data["selected"]
-        device = request.query.get("device")
         if device:
             name = (llm_router.store().get(device) or {}).get("model")
             if name and llm_router.model_ready(merged, name) and any(o["entry"] == name for o in options):
                 selected = name
-        return self._json({"ok": True, "selected": selected, "default": data["selected"],
-                           "kind": data["kind"], "vendor": data["vendor"], "options": options})
+        return {"selected": selected, "default": data["selected"], "kind": data["kind"], "vendor": data["vendor"],
+                "options": options}
 
     async def handle_kiosk_llm_use(self, request: web.Request):
-        """切换默认模型（同后台"保存并设为默认"），在线的连接也马上跟着切（新模型从新对话开始，同呼名切换）。
+        """把这台设备切到 body 指定的模型（{"kind": "cli"}、{"kind": "api", "vendor": …}、{"kind": "grok", "entry": …}，
+        都带 "device"），同呼名切换：只这台设备切过去并记住，在线的连接马上跟着切（新模型从新对话开始），
+        意图识别跟着这台设备的模型走（llm_router.intent_mode）。后台默认模型和全局意图识别不变，
+        不写配置、不重建默认实例；默认模型只在管理后台改。
 
-        body 带 device 时，这台设备记住这个模型：它上次呼名切到的模型不会在重连时又把它切回去。
-        Grok Bot（{"kind": "grok", "entry": "GrokBot_…", "device": …}）不当默认模型（后台也不能设）：
-        和喊它的称呼一样，只把这台设备切过去并记住。
+        返回切换后的模型列表（同 GET /kiosk/llm?device=…），设备不用再查一次。
         """
         if not self._from_this_machine(request):
             return self._error("仅限本机", 403)
         body = await self._read_json(request)
         device = str(body.get("device") or "")
-        if body.get("kind") == "grok":
-            if not device:
-                return self._error("缺少 device", 400)
-            merged = await self._blocking(self._merged)
+        if not device:
+            return self._error("缺少 device", 400)
+        merged = await self._blocking(self._merged)
+        kind = body.get("kind")
+        if kind == "grok":
             name = str(body.get("entry") or "")
             if name not in {b["entry"] for b in pages.grok_entries(merged)} or not llm_router.model_ready(merged, name):
                 return self._error("没有这个 Grok Bot，请先在管理后台的 Grok Bot 页勾选", 404)
-            result = {"ok": True, "applied": True, "note": "已切换，这台设备之后都用它"}
+        elif kind == "cli":
+            name = pages.CLAUDE_CLI_ENTRY
+            if name not in (merged.get("LLM") or {}):
+                return self._error(f"配置里没有 {name}", 404)
         else:
-            name, result = await self._use_llm(body)
-            if name is None:
-                return result
-        if device:
-            await self._blocking(llm_router.store().put, device, {"model": name})
+            vendor = catalog.VENDOR_BY_ID.get(str(body.get("vendor") or ""))
+            if vendor is None:
+                return self._error("不支持这个厂商", 404)
+            name = vendor["entry"]
+            if not pages.describe_vendor(vendor, merged)["configured"]:
+                return self._error(f"{vendor['label']} 还没配置好，请先填写接口地址、模型和 API Key 并保存", 400)
+        # 后台保存过、但没设成默认的条目，运行中的配置里还是旧的（或没有）：补进去，切换时照它创建实例
+        running = self.config.setdefault("LLM", {})
+        if running.get(name) != merged["LLM"][name]:
+            running[name] = copy.deepcopy(merged["LLM"][name])
+        before = llm_router.store().get(device)
+        await self._blocking(llm_router.store().put, device, {"model": name})
         for item in connections.snapshot():
             conn = connections.get(item["session_id"])
-            if conn is None or (body.get("kind") == "grok" and item["device_id"] != device):
+            if conn is None or item["device_id"] != device:
                 continue
             try:
-                await self._blocking(llm_router.switch, conn, name, remember=False)
+                ok = await self._blocking(llm_router.switch, conn, name, remember=False)
+                error = "" if ok is not False else "模型没有配置好"
             except Exception as e:
-                self.logger.bind(tag=TAG).error(f"在线连接 {item['session_id']} 切换模型失败: {e}")
-        return self._json(result)
+                ok, error = False, str(e).strip() or type(e).__name__
+            if ok is False:
+                self.logger.bind(tag=TAG).error(f"在线连接 {item['session_id']} 切换模型 {name} 失败: {error}")
+                if before:   # 恢复成原来记住的
+                    await self._blocking(llm_router.store().put, device,
+                                         {k: v for k, v in before.items() if k != "last_active"})
+                else:
+                    await self._blocking(llm_router.store().forget, device)
+                return self._error(f"切换失败：{error}", 500)
+        self.logger.bind(tag=TAG).info(f"设备 {device} 切换模型为 {name}（只这台设备）")
+        return self._json({"ok": True, "applied": True, "note": "已切换，这台设备之后都用它",
+                           **await self._kiosk_models(merged, device)})
 
     async def handle_kiosk_reports(self, request: web.Request):
         """{"device", "quiet", "play"}：返回这台设备有几条待汇报。
@@ -892,6 +918,8 @@ class AdminHandler:
                         notes.append((await self._apply("Intent"))["note"])
             if pages.llm_kind(merged) != "cli":
                 await self._blocking(pages.remember_api_intent, mode, self.config_path)
+                # 设备切到非默认的 API 模型时按它选意图识别（llm_router.intent_mode），要马上用上新的选择
+                self.config.setdefault("admin", {})["api_intent"] = mode
             result = await self._switch("Intent", pages.intent_entry_name(merged, mode))
         except KeyError:
             return self._error(f"配置里没有 {mode}", 404)

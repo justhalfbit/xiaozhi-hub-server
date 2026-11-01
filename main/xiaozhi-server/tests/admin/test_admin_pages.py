@@ -284,7 +284,7 @@ def kiosk(client, tmp_path, monkeypatch):
     from core.agent.session_store import SessionStore
 
     monkeypatch.setattr(llm_router, "_store", SessionStore(tmp_path / "agent_sessions.json", "last_model"))
-    monkeypatch.setattr(ah.AdminHandler, "_claude_install", lambda self, merged: {"installed": True})
+    monkeypatch.setattr(ah.AdminHandler, "_claude_install", lambda self, merged, version=True: {"installed": True})
     return client
 
 
@@ -306,26 +306,62 @@ async def test_kiosk_llm_list_and_device_model(kiosk):
     assert (await (await kiosk.get("/kiosk/llm?device=dev-1")).json())["selected"] == "ClaudeCLI"
 
 
-async def test_kiosk_llm_use_moves_live_connections(kiosk, cfg_path, monkeypatch):
+async def test_kiosk_llm_use_is_per_device(kiosk, cfg_path, monkeypatch):
+    """设备上切模型同呼名切换：只切这台设备（在线连接马上跟着切）、记住它；后台默认模型和意图识别不变，
+    运行中的默认实例不重建；直接返回切换后的模型列表。"""
     switched = []
     monkeypatch.setattr(llm_router, "switch", lambda conn, name, remember=True: switched.append((conn.session_id, name, remember)))
+    rebuilt = []
+    monkeypatch.setattr(ah, "initialize_modules", lambda *a, **k: rebuilt.append(k) or {})
     await kiosk.post("/admin/api/llm/vendors/deepseek",
                      json={"base_url": "https://api.deepseek.com", "model": "deepseek-chat", "api_key": "sk-ds-123456789"})
     await kiosk.post("/admin/api/logout", json={})
+    before = cfg_path.read_text(encoding="utf-8")
+    mine = SimpleNamespace(session_id="s-8", device_id="dev-8", client_ip="127.0.0.1")
+    other = SimpleNamespace(session_id="s-9", device_id="dev-9", client_ip="127.0.0.1")
+    connections.register(mine)
+    connections.register(other)
+    try:
+        r = await kiosk.post("/kiosk/llm/use", json={"kind": "api", "vendor": "deepseek", "device": "dev-8"})
+        data = await r.json()
+        assert r.status == 200 and data["ok"]
+        assert data["selected"] == "DeepSeekLLM" and data["default"] == "ClaudeCLI"  # 返回切换后的列表
+        assert [o["entry"] for o in data["options"]] == ["ClaudeCLI", "DeepSeekLLM"]
+        assert switched == [("s-8", "DeepSeekLLM", False)]  # 别的设备不动
+        assert llm_router.store().get("dev-8")["model"] == "DeepSeekLLM"
+        assert cfg_path.read_text(encoding="utf-8") == before and rebuilt == []  # 不写配置、不重建默认实例
+        # 后台保存了但没设成默认的条目补进运行中的配置，切换时照它创建实例
+        assert kiosk.handler.config["LLM"]["DeepSeekLLM"]["model_name"] == "deepseek-chat"
+        assert kiosk.handler.config["selected_module"] == {"LLM": "ClaudeCLI", "Intent": "nointent"}
+
+        r = await kiosk.post("/kiosk/llm/use", json={"kind": "cli", "device": "dev-8"})
+        assert r.status == 200 and switched[-1] == ("s-8", "ClaudeCLI", False)
+        assert (await r.json())["selected"] == "ClaudeCLI"
+        r = await kiosk.post("/kiosk/llm/use", json={"kind": "api", "vendor": "openai", "device": "dev-8"})
+        assert r.status == 400 and "还没配置好" in (await r.json())["error"] and len(switched) == 2
+        assert (await kiosk.post("/kiosk/llm/use", json={"kind": "cli"})).status == 400  # 要说明是哪台设备
+    finally:
+        connections.unregister(mine)
+        connections.unregister(other)
+
+
+async def test_kiosk_llm_use_failure_keeps_old_model(kiosk, monkeypatch):
+    def boom(conn, name, remember=True):
+        raise RuntimeError("claude 启动失败")
+    monkeypatch.setattr(llm_router, "switch", boom)
+    await kiosk.post("/admin/api/llm/vendors/deepseek",
+                     json={"base_url": "https://api.deepseek.com", "model": "deepseek-chat", "api_key": "sk-ds-123456789"})
+    await kiosk.post("/admin/api/logout", json={})
+    llm_router.store().put("dev-8", {"model": "DeepSeekLLM"})
     fake = SimpleNamespace(session_id="s-8", device_id="dev-8", client_ip="127.0.0.1")
     connections.register(fake)
     try:
-        r = await kiosk.post("/kiosk/llm/use", json={"kind": "api", "vendor": "deepseek", "device": "dev-8"})
-        assert r.status == 200 and (await r.json())["ok"]
-        assert merged(cfg_path)["selected_module"]["LLM"] == "DeepSeekLLM"
-        assert merged(cfg_path)["selected_module"]["Intent"] == "function_call"  # 和后台切换一样联动意图识别
-        assert switched == [("s-8", "DeepSeekLLM", False)]  # 在线连接马上跟着切
-        assert llm_router.store().get("dev-8")["model"] == "DeepSeekLLM"  # 这台设备记住它
-        r = await kiosk.post("/kiosk/llm/use", json={"kind": "api", "vendor": "openai"})
-        assert r.status == 400 and "还没配置好" in (await r.json())["error"] and len(switched) == 1
-        r = await kiosk.post("/kiosk/llm/use", json={"kind": "cli"})
-        assert r.status == 200 and switched[-1] == ("s-8", "ClaudeCLI", False)
-        assert llm_router.store().get("dev-8")["model"] == "DeepSeekLLM"  # 没带 device 不改记住的
+        r = await kiosk.post("/kiosk/llm/use", json={"kind": "cli", "device": "dev-8"})
+        assert r.status == 500 and "claude 启动失败" in (await r.json())["error"]
+        assert llm_router.store().get("dev-8")["model"] == "DeepSeekLLM"  # 还记着原来的
+        llm_router.store().forget("dev-8")
+        r = await kiosk.post("/kiosk/llm/use", json={"kind": "cli", "device": "dev-8"})
+        assert r.status == 500 and llm_router.store().get("dev-8") is None
     finally:
         connections.unregister(fake)
 

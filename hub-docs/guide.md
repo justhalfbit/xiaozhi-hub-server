@@ -175,7 +175,7 @@ http://<电脑的局域网 IP>:16688/xiaozhi/ota/
 | 接口 | 请求 | 返回 |
 | --- | --- | --- |
 | `GET /kiosk/llm` | 可选 `?device=<device-id>` | `options`：可选的模型（装了 Claude Code 时排第一，之后是填好的 API 厂商、勾选的 Grok Bot），每项有 `kind`（`cli` / `api` / `grok`）、`vendor`（Grok Bot 是 `grok_bot`）、`label`（Grok Bot 是 Bot 名）、`entry`、`model`；`default`：后台默认模型；`selected`：带了 device 时是这台设备实际会用的模型（它上次切到的，还可用的话），否则同 `default` |
-| `POST /kiosk/llm/use` | `{"kind": "cli"}` 或 `{"kind": "api", "vendor": "deepseek"}`，可带 `"device"` | 和后台"保存并设为默认"一样切换默认模型（意图识别跟着切）；在线的设备马上换到新模型（从新对话开始，同呼名切换）；带了 device 时这台设备记住这个模型。Grok Bot 用 `{"kind": "grok", "entry": "GrokBot_<名字>", "device": "..."}`：不改默认模型（后台也不能把 Bot 设为默认），和喊它的称呼一样只切这台设备并记住，必须带 device |
+| `POST /kiosk/llm/use` | `{"kind": "cli", "device": "..."}`、`{"kind": "api", "vendor": "deepseek", "device": "..."}` 或 `{"kind": "grok", "entry": "GrokBot_<名字>", "device": "..."}`，必须带 device | 和喊称呼一样只切这台设备并记住：它在线的连接马上换到新模型（从新对话开始），意图识别跟着这台设备的模型走（Claude Code、Grok Bot 不用插件，API 模型照后台的选择）。不改后台默认模型和全局的意图识别，默认模型只在后台改。成功时还带上切换后的模型列表（同 `GET /kiosk/llm?device=...`），不用再查一次 |
 | `POST /kiosk/reports` | `{"device": "...", "quiet": false, "play": false}` | `count`：这台设备有几条待汇报；`playing`：是否已安排念。`quiet` 为 true 表示设备在睡眠时段，期间有待汇报也不主动念（每次查询都要带上）；`play` 为 true 表示用户点了要听，马上在设备的连接上念 |
 | `POST /kiosk/asr` | 10 秒以内的 16kHz 单声道 16 位 PCM（原始字节，不是 JSON） | `{"text", "ms"}`：只识别、不进对话，用服务已加载的本机识别模型（设备客户端可以用它复核唤醒词）。当前识别不是本机模型（如豆包）时返回 501 |
 

@@ -318,7 +318,8 @@ class ConnectionHandler:
                         asyncio.set_event_loop(loop)
                         loop.run_until_complete(
                             self.memory.save_memory(
-                                self.dialogue.dialogue, self.session_id
+                                # [xiaozhi-hub] 工具调用示例是假对话，不能进记忆（上游 mem_local_short 会把它们总结进去）
+                                [m for m in self.dialogue.dialogue if not m.is_temporary], self.session_id
                             )
                         )
                     except Exception as e:
@@ -679,10 +680,9 @@ class ConnectionHandler:
             self.logger.bind(tag=TAG).debug("系统提示词已增强更新")
 
     def _inject_tool_call_fewshot(self):
-        """注入工具调用 few-shot 示例到对话历史。
-        结构：正样本（工具调用示例）放在动态 system 之前，可命中前缀缓存；
-        负样本（直接回答示例）放在动态 system 之后、紧挨真实用户消息，
-        确保模型在处理用户消息前最后看到的是"不调工具"的行为模式。
+        """注入工具调用 few-shot 示例到对话历史（is_temporary）。
+        [xiaozhi-hub] 发给模型时由 dialogue.render_fewshot 写成系统提示末尾的一段文字、注明不是真实对话，
+        不当成对话轮次发（否则模型会当成用户真说过）；不存聊天记录库、不进记忆。
         """
         if self.intent_type != "function_call":
             return

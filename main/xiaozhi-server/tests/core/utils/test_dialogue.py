@@ -73,11 +73,11 @@ async def test_get_llm_dialogue_with_memory_substitutes_into_system_message():
 
 
 @pytest.mark.asyncio
-async def test_get_llm_dialogue_separates_temporary_few_shot_from_actual_history():
+async def test_get_llm_dialogue_puts_temporary_few_shot_into_system_prompt():
     d = Dialogue()
+    d.put(Message(role="system", content="sys"))
     d.put(Message(role="user", content="real user msg", is_temporary=False))
     d.put(Message(role="user", content="fewshot example", is_temporary=True))
     msgs = d.get_llm_dialogue()
-    contents = [m["content"] for m in msgs if m["role"] == "user"]
-    assert "real user msg" in contents
-    assert "fewshot example" in contents
+    assert [m["content"] for m in msgs if m["role"] == "user"] == ["real user msg"]
+    assert "用户：fewshot example" in msgs[0]["content"]

@@ -114,6 +114,8 @@ def test_prompt_segments_for_api_with_plugins(tmp_path):
     p = pipeline.describe_prompt(m)
     assert p["llm"] == "DeepSeek"
     assert [s["id"] for s in p["segments"]] == ["base", "fewshot", "tools", "history"]
+    fewshot = next(s for s in p["segments"] if s["id"] == "fewshot")["text"]
+    assert fewshot.startswith("<tool_call_examples>") and "用户：给我讲个故事吧" in fewshot  # 和实际写进系统提示的一样
     tools = next(s for s in p["segments"] if s["id"] == "tools")["text"]
     assert "查天气" in tools and "放音乐" in tools and "热点新闻" not in tools
     assert not any("进程启动时" in w for w in p["warnings"])

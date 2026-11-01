@@ -28,15 +28,22 @@ VAR_LABELS = {
     "language": "回复语言",
 }
 
-DIRECT_ANSWER_FEWSHOT = [
-    {"role": "user", "content": "给我讲个故事吧"},
-    {"role": "assistant", "content": '调用 direct_answer：{"response": "好呀，你想听什么类型的呀？童话、冒险还是搞笑的？选一个我给你开讲~"}'},
-    {"role": "tool", "content": "已直接回复"},
-    {"role": "user", "content": "拜拜"},
-    {"role": "assistant", "content": '调用 handle_exit_intent：{"say_goodbye": "再见，下次再聊~"}'},
-    {"role": "tool", "content": "退出意图已处理"},
-    {"role": "assistant", "content": "再见，下次再聊~"},
-]
+def _fewshot_text() -> str:
+    """和 connection._inject_tool_call_fewshot 注入的示例一致，按 dialogue.render_fewshot 写进系统提示的样子。"""
+    from core.utils.dialogue import Message, render_fewshot
+
+    def call(name, args):
+        return Message(role="assistant", tool_calls=[{"function": {"name": name, "arguments": args}}])
+
+    return render_fewshot([
+        Message(role="user", content="给我讲个故事吧"),
+        call("direct_answer", '{"response": "好呀，你想听什么类型的呀？童话、冒险还是搞笑的？选一个我给你开讲~"}'),
+        Message(role="tool", content="已直接回复"),
+        Message(role="user", content="拜拜"),
+        call("handle_exit_intent", '{"say_goodbye": "再见，下次再聊~"}'),
+        Message(role="tool", content="退出意图已处理"),
+        Message(role="assistant", content="再见，下次再聊~"),
+    ])
 
 
 def _mark(name: str, value) -> str:
@@ -299,8 +306,10 @@ def describe_prompt(merged: dict) -> dict:
         if intent.get("type") == "function_call":
             segments.append({
                 "id": "fewshot", "title": "工具调用示例", "source": "服务端", "when": "每轮",
-                "text": "\n".join(f"[{m['role']}] {m['content']}" for m in DIRECT_ANSWER_FEWSHOT), "collapsed": True,
-                "note": "插在系统提示词后面的几条示范对话，教模型什么时候直接回答、什么时候调用工具。不会显示给用户。",
+                "text": _fewshot_text(), "collapsed": True,
+                "note": "追加在系统提示词末尾的一段示例，教模型什么时候直接回答、什么时候调用工具。不会显示给用户。"
+                        "原项目把它们当成几轮对话发，模型会当成用户真说过（问「我刚才让你做过什么」答「讲故事、说拜拜」），"
+                        "所以改成写在系统提示里并注明不是真实对话。",
             })
             plugins = [p["label"] for p in catalog.PLUGINS if p["name"] in (intent.get("functions") or [])]
             segments.append({

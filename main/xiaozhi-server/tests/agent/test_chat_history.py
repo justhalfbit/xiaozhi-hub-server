@@ -40,7 +40,7 @@ def chat(conn, user, reply):
 def sent(conn, memory=None):
     """发给模型的对话（不含系统提示和示例）。"""
     msgs = conn.dialogue.get_llm_dialogue_with_memory(memory)
-    return [(m["role"], m.get("content")) for m in msgs[3:]]
+    return [(m["role"], m.get("content")) for m in msgs[1:]]
 
 
 def tool_turn(d, n):
@@ -167,7 +167,7 @@ def test_tool_messages_round_trip():
     chat_history.sync(conn)
     conn2 = make_conn()
     chat_history.load(conn2, conn2.dialogue, "DeepSeekLLM")
-    msgs = conn2.dialogue.get_llm_dialogue_with_memory(None)[3:]
+    msgs = conn2.dialogue.get_llm_dialogue_with_memory(None)[1:]
     assert msgs[1]["tool_calls"][0]["id"] == "c1" and msgs[2] == {"role": "tool", "tool_call_id": "c1", "content": "晴"}
 
 
@@ -236,7 +236,7 @@ def test_memory_goes_into_the_system_prompt():
     assert "<memory>" not in conn.dialogue.get_llm_dialogue_with_memory("")[0]["content"]
     # 提示词里自带 <memory> 时照上游的做法替换
     conn.dialogue.update_system_message("前面<memory></memory>后面")
-    assert conn.dialogue.get_llm_dialogue_with_memory("记忆")[0]["content"] == "前面<memory>\n记忆\n</memory>后面"
+    assert conn.dialogue.get_llm_dialogue_with_memory("记忆")[0]["content"].startswith("前面<memory>\n记忆\n</memory>后面")
 
 
 def chat_history_intro():

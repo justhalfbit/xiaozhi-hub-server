@@ -22,7 +22,7 @@ from pathlib import Path
 from aiohttp import web
 
 from config.logger import setup_logging
-from core.admin import auth, catalog, config_store, connections, pages, pipeline
+from core.admin import auth, catalog, config_store, connections, pages, pipeline, updater
 from core.admin.grokbot import GrokBotAdmin
 from core.admin.status import _claude_version, collect_status
 from core.agent import chat_history, llm_router, reports
@@ -55,11 +55,18 @@ KIOSK_ASR_MAX_BYTES = 16000 * 2 * 10  # /kiosk/asr 最多 10 秒音频
 
 
 class AdminHandler:
-    def __init__(self, config: dict, ws_server=None, config_path: Path = None, grokbot_credentials: Path = None):
+    def __init__(self, config: dict, ws_server=None, config_path: Path = None, grokbot_credentials: Path = None,
+                 gateway_updater: "updater.Updater" = None):
         self.config = config
         self.ws_server = ws_server
         self.config_path = config_path
         self.sessions = auth.SessionStore()
+        # 后台点了更新网关、网关重启后，接着用重启前的登录（文件在 data/ 下，和配置放在一起）
+        data_dir = Path(config_path).parent if config_path else updater.SERVER_DIR / "data"
+        self.sessions_handover = data_dir / ".admin-sessions.json"
+        if self.sessions.restore(self.sessions_handover):
+            logger.bind(tag=TAG).info("更新网关后沿用了更新前的后台登录")
+        self.updater = gateway_updater or updater.Updater()
         self._emotion_runs = {}  # session_id -> {"task", "index", "total", "emotion"}
         self._voice_samples = {}  # 音色 -> mp3 字节（试听缓存）
         self.logger = logger
@@ -75,6 +82,9 @@ class AdminHandler:
                 web.post("/admin/api/login", self.handle_login),
                 web.post("/admin/api/logout", self.handle_logout),
                 web.get("/admin/api/status", self.handle_status),
+                web.get("/admin/api/update", self.handle_update),
+                web.post("/admin/api/update/check", self.handle_update_check),
+                web.post("/admin/api/update/start", self.handle_update_start),
                 web.get("/admin/api/devices", self.handle_devices),
                 web.get("/admin/api/memory", self.handle_memory),
                 web.post("/admin/api/memory/save", self.handle_memory_save),
@@ -433,6 +443,43 @@ class AdminHandler:
         merged = await self._blocking(self._merged)
         status = await self._blocking(collect_status, self.config, merged)
         return self._json({"ok": True, **status})
+
+    # ---------- 更新网关 ----------
+
+    async def handle_update(self, request: web.Request):
+        """当前版本、最近一次检查的结果、最近一次更新的进度（页面在更新期间轮询它）。"""
+        self._require_login(request)
+        version = await self._blocking(self.updater.version)
+        status = await self._blocking(self.updater.status)
+        # 检查之后代码变了（更新过）的话，那次的结果就不算数了，页面会重新检查
+        check = self.updater.last_check
+        if check and check.get("current", {}).get("commit") != version["current"].get("commit"):
+            check = None
+        return self._json({"ok": True, **version, "check": check, "update": status})
+
+    async def handle_update_check(self, request: web.Request):
+        """和远端比较有没有新版本，只取不改；连不上时 check.state 为 error，message 说明原因。"""
+        self._require_login(request)
+        await self._read_json(request)
+        result = await self._blocking(self.updater.check)
+        return self._json({"ok": True, "check": result})
+
+    async def handle_update_start(self, request: web.Request):
+        """在后台运行 scripts/update.sh：快进代码、按需补装依赖、重启网关；失败时退回原来的版本。"""
+        self._require_login(request)
+        await self._read_json(request)
+        # 开始前把登录交接出去：网关重启后页面不用重新登录
+        await self._blocking(self.sessions.save, self.sessions_handover)
+        try:
+            status = await self._blocking(self.updater.start)
+        except updater.UpdateError as e:
+            self.sessions_handover.unlink(missing_ok=True)
+            return self._error(str(e), 409)
+        except OSError as e:
+            self.sessions_handover.unlink(missing_ok=True)
+            return self._error(f"启动更新失败：{e}", 500)
+        self.logger.bind(tag=TAG).info(f"管理后台开始更新网关（来源 {request.remote}）")
+        return self._json({"ok": True, "update": status})
 
     # ---------- 大模型 ----------
 

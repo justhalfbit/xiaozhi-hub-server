@@ -29,16 +29,17 @@ hub_port() {
 }
 ota_up() { curl -s -m 2 -o /dev/null "http://127.0.0.1:$1/xiaozhi/ota/"; }
 
-# 等服务真正能访问（启动时要加载语音识别模型，一般十几秒），起不来就把报错显示出来
+# 等服务真正能访问（启动时要加载语音识别模型，一般十几秒），起不来就把报错显示出来。
+# 最多等 HUB_READY_TIMEOUT 秒（默认 90；update.sh 等得更久，起不来要退回原版本）
 wait_ready() {
-  local port="$1" i
+  local port="$1" i limit="${HUB_READY_TIMEOUT:-90}"
   command -v curl >/dev/null 2>&1 || return 0
   info "等待服务启动 ..."
-  for ((i = 0; i < 45; i++)); do
+  for ((i = 0; i < limit / 2; i++)); do
     ota_up "$port" && { info "服务已启动：http://127.0.0.1:$port/admin"; return 0; }
     sleep 2
   done
-  printf "\033[31m✗ 服务 90 秒内没有启动成功。\033[0m 最近的报错：\n" >&2
+  printf "\033[31m✗ 服务 ${limit} 秒内没有启动成功。\033[0m 最近的报错：\n" >&2
   if [[ "$P" == mac ]]; then tail -n 15 "$ERR_LOG" >&2 2>/dev/null || true
   else journalctl --user -u "$UNIT" -n 15 --no-pager >&2 2>/dev/null || true; fi
   info "完整日志：$SERVER/tmp/server.log" >&2

@@ -250,11 +250,6 @@
 
   /* 更新网关 */
   .kv.two { grid-template-columns: max-content minmax(0, 1fr); }
-  .commits { margin: 0; padding: 0; list-style: none; }
-  .commits li { display: flex; gap: 12px; padding: 9px 22px; border-top: 1px solid var(--line); align-items: baseline; }
-  .commits li:first-child { border-top: 0; }
-  .commits li span { flex: 1; min-width: 0; word-break: break-word; }
-  .commits li small { color: var(--muted); white-space: nowrap; }
   .update-log { margin: 10px 0 0; padding: 12px 14px; background: var(--soft); border-radius: 8px; max-height: 320px; overflow: auto;
                 white-space: pre-wrap; word-break: break-word; font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }
 
@@ -1514,7 +1509,8 @@ async function renderCallNames(root) {
 // ---------- 更新网关 ----------
 
 const fmtTime = (v) => (v ? new Date(typeof v === "number" ? v * 1000 : v).toLocaleString() : "");
-const commitLine = (c) => c && c.short ? `<code>${esc(c.short)}</code> ${esc(c.subject)} <span class="muted small">${esc(fmtTime(c.date))}</span>` : '<span class="muted">未知</span>';
+// 版本只显示时间和短提交号，不显示提交说明（用户定）
+const commitLine = (c) => c && c.short ? `${esc(fmtTime(c.date))} <span class="muted small">（${esc(c.short)}）</span>` : '<span class="muted">未知</span>';
 const UPDATE_NOTE = "更新期间网关会重启，一般 1～2 分钟，在线设备会断开一下再自动连上，正在进行的对话会中断。";
 
 async function renderUpdate(root) {
@@ -1569,13 +1565,10 @@ function drawCheck(root, c) {
   const box = $("up-box");
   if (!box) return;
   const when = c.checked_at ? `<span class="muted small">检查于 ${esc(fmtTime(c.checked_at))}</span>` : "";
-  const list = (c.commits || []).length ? `<ul class="commits">${c.commits.map((x) => `<li><code>${esc(x.short)}</code><span>${esc(x.subject)}</span><small>${esc(fmtTime(x.date))}</small></li>`).join("")}</ul>` : "";
-  const more = c.behind > (c.commits || []).length ? `<div class="panel muted small" style="padding-top:0">还有 ${c.behind - c.commits.length} 个更早的提交没列出来</div>` : "";
   if (c.state === "latest") {
     box.innerHTML = `<div class="card-head"><h2><span class="pill ok">已经是最新版本</span></h2>${when}</div><div class="panel muted">远端最新：${commitLine(c.latest)}</div>`;
   } else if (c.state === "available" || c.state === "dirty") {
-    const count = c.behind == null ? "有新版本（列不出中间的提交，只显示最新一个）" : `有 ${c.behind} 个新提交`;
-    box.innerHTML = `<div class="card-head"><h2>${count}</h2>${when}</div>${list}${more}
+    box.innerHTML = `<div class="card-head"><h2>有新版本</h2>${when}</div><div class="panel">最新版本：${commitLine(c.latest)}</div>
       <div class="panel" style="border-top:1px solid var(--line)">
         ${c.state === "dirty" ? `<div class="banner warn">${esc(c.message)}<br><code>${esc((c.files || []).join("  "))}</code></div>`
           : `<p class="muted small" style="margin:0 0 4px">${UPDATE_NOTE}依赖有变化时会自动补装；补装失败或新版本起不来时自动退回现在的版本。</p>`}

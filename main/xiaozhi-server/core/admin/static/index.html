@@ -1525,7 +1525,7 @@ async function renderUpdate(root) {
     ${d.unsupported ? `<div class="banner warn">${esc(d.unsupported)}</div>` : ""}
     <div class="card panel"><div class="kv two">
       <div class="k">当前版本</div><div>${commitLine(d.current)}</div>
-      ${d.running && d.running.short ? `<div class="k">运行中</div><div>${commitLine(d.running)} <span class="pill warn">代码已更新，重启服务后才用上</span></div>` : ""}
+      ${d.running && d.running.short ? `<div class="k">运行中</div><div>${commitLine(d.running)} <span class="pill warn">和当前版本不一样，重启服务后才换成当前版本</span></div>` : ""}
       ${d.branch ? `<div class="k">分支</div><div><code>${esc(d.branch)}</code></div>` : ""}
       ${src.url ? `<div class="k">更新来源</div><div><code>${esc(src.url)}</code> 的 <code>${esc(src.branch)}</code> 分支</div>` : ""}
     </div></div>
@@ -1601,7 +1601,8 @@ function renderUpdating(root, u) {
   let down = false;
   const show = (st) => {
     $("up-step").textContent = down ? "网关正在重启，等它回来…" : (st && st.step) || "准备中";
-    $("up-elapsed").textContent = `已用 ${Math.round((Date.now() - started) / 1000)} 秒`;
+    const sec = Math.round((Date.now() - started) / 1000);
+    $("up-elapsed").textContent = `已用 ${sec} 秒` + (sec > 150 ? "。新版本启动得比较慢，5 分钟内起不来会自动退回原来的版本" : "");
     if (st && st.log) $("up-log").textContent = st.log.join("\n");
   };
   show(u);

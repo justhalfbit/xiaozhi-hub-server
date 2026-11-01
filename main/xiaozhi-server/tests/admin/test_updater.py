@@ -22,8 +22,10 @@ REAL_UPDATE_SH = Path(updater.__file__).resolve().parents[4] / "scripts" / "upda
 
 INSTALL_STUB = """#!/usr/bin/env bash
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-echo "install HUB_UPDATING=${HUB_UPDATING:-}" >>"$HUB_TEST_CALLS"
-if [[ -n "${HUB_TEST_INSTALL_FAIL:-}" ]]; then printf "\\n\\033[31m✗ 模拟：依赖下载失败\\033[0m\\n" >&2; exit 1; fi
+SUBJECT="$(git -C "$ROOT" log -1 --format=%s)"
+echo "install $SUBJECT HUB_UPDATING=${HUB_UPDATING:-}" >>"$HUB_TEST_CALLS"
+# HUB_TEST_INSTALL_FAIL：提交说明里带这段文字的版本装不上；all 是哪个版本都装不上
+if [[ -n "${HUB_TEST_INSTALL_FAIL:-}" && ( "$HUB_TEST_INSTALL_FAIL" == all || "$SUBJECT" == *"$HUB_TEST_INSTALL_FAIL"* ) ]]; then printf "\\n\\033[31m✗ 模拟：依赖下载失败\\033[0m\\n" >&2; exit 1; fi
 : >"$ROOT/main/xiaozhi-server/data/.install-complete"
 """
 
@@ -232,12 +234,12 @@ def test_update_installs_when_requirements_change(repos):
     u.start()
     st = wait_done(u)
     assert st["state"] == "done" and git(install, "rev-parse", "HEAD") == new
-    assert calls.read_text().splitlines() == ["install HUB_UPDATING=1", f"restart 加依赖 timeout={updater.READY_TIMEOUT}"]
+    assert calls.read_text().splitlines() == ["install 加依赖 HUB_UPDATING=1", f"restart 加依赖 timeout={updater.READY_TIMEOUT}"]
 
 
 def test_update_install_failure_keeps_old_version(repos, monkeypatch):
     seed, install, calls = repos
-    monkeypatch.setenv("HUB_TEST_INSTALL_FAIL", "1")
+    monkeypatch.setenv("HUB_TEST_INSTALL_FAIL", "加依赖")
     old = git(install, "rev-parse", "HEAD")
     publish(seed, "加依赖", {"main/xiaozhi-server/requirements-hub.txt": "aiohttp\nrequests\n"})
     u = make_updater(install)
@@ -248,7 +250,24 @@ def test_update_install_failure_keeps_old_version(repos, monkeypatch):
     assert git(install, "rev-parse", "HEAD") == old
     assert git(install, "status", "--porcelain", "--untracked-files=no") == ""
     assert (install / "main" / "xiaozhi-server" / "data" / ".install-complete").exists()
-    assert calls.read_text().splitlines() == ["install HUB_UPDATING=1"]  # 没有重启
+    # 退回代码后在原来的版本上再装一次，把依赖装回去；没有重启
+    assert calls.read_text().splitlines() == ["install 加依赖 HUB_UPDATING=1", "install v1 HUB_UPDATING=1"]
+
+
+def test_update_install_failure_and_deps_restore_failure(repos, monkeypatch):
+    """依赖也没能装回去：代码照样退回，不留完成标记（下次 update.sh 会重新补装），报错说清楚。"""
+    seed, install, calls = repos
+    monkeypatch.setenv("HUB_TEST_INSTALL_FAIL", "all")
+    old = git(install, "rev-parse", "HEAD")
+    publish(seed, "加依赖", {"main/xiaozhi-server/requirements-hub.txt": "aiohttp\nrequests\n"})
+    u = make_updater(install)
+    u.start()
+    st = wait_done(u)
+    assert st["state"] == "failed" and not st["changed"]
+    assert "依赖没能装回原来的版本" in st["error"] and "install.sh" in st["error"]
+    assert git(install, "rev-parse", "HEAD") == old
+    assert not (install / "main" / "xiaozhi-server" / "data" / ".install-complete").exists()
+    assert calls.read_text().splitlines() == ["install 加依赖 HUB_UPDATING=1", "install v1 HUB_UPDATING=1"]
 
 
 def test_update_rolls_back_when_new_version_does_not_start(repos):
@@ -263,6 +282,37 @@ def test_update_rolls_back_when_new_version_does_not_start(repos):
     assert git(install, "rev-parse", "HEAD") == old
     assert calls.read_text().splitlines() == [f"restart broken 版本 timeout={updater.READY_TIMEOUT}",
                                               f"restart v1 timeout={updater.READY_TIMEOUT}"]
+
+
+def test_update_rollback_restores_deps_when_new_version_does_not_start(repos):
+    """新版本补装过依赖又起不来：退回代码后先把依赖装回原来的版本，再重启。"""
+    seed, install, calls = repos
+    old = git(install, "rev-parse", "HEAD")
+    publish(seed, "broken 加依赖", {"main/xiaozhi-server/requirements-hub.txt": "aiohttp\nrequests\n"})
+    u = make_updater(install)
+    u.start()
+    st = wait_done(u)
+    assert st["state"] == "failed" and not st["changed"]
+    assert "新版本没有启动成功，已退回原来的版本" in st["error"]
+    assert git(install, "rev-parse", "HEAD") == old
+    assert (install / "main" / "xiaozhi-server" / "data" / ".install-complete").exists()
+    assert calls.read_text().splitlines() == ["install broken 加依赖 HUB_UPDATING=1",
+                                              f"restart broken 加依赖 timeout={updater.READY_TIMEOUT}",
+                                              "install v1 HUB_UPDATING=1",
+                                              f"restart v1 timeout={updater.READY_TIMEOUT}"]
+
+
+def test_update_rollback_deps_restore_failure_skips_restart(repos, monkeypatch):
+    """依赖没能装回去就不再重启（旧代码配新依赖多半也起不来），报错让用户装回依赖。"""
+    seed, install, calls = repos
+    monkeypatch.setenv("HUB_TEST_INSTALL_FAIL", "v1")
+    publish(seed, "broken 加依赖", {"main/xiaozhi-server/requirements-hub.txt": "aiohttp\nrequests\n"})
+    u = make_updater(install)
+    u.start()
+    st = wait_done(u)
+    assert st["state"] == "failed" and "依赖没能装回原来的版本" in st["error"]
+    assert not (install / "main" / "xiaozhi-server" / "data" / ".install-complete").exists()
+    assert calls.read_text().splitlines()[-1] == "install v1 HUB_UPDATING=1"
 
 
 def test_update_when_already_latest(repos):
@@ -337,6 +387,23 @@ def test_start_refuses_while_running_and_detects_interrupted(repos):
         sleeper.wait()
     st = u.status()
     assert st["state"] == "interrupted" and st["error"]
+
+
+def test_status_not_interrupted_when_update_ends_while_checking(repos, monkeypatch):
+    """读退出码时还没写、查进程时已经结束：是正常结束，不是中断，报错读的是最后一行。"""
+    _, install, _ = repos
+    u = make_updater(install)
+    u.state_dir.mkdir(parents=True)
+    u._write_state({"started": time.time(), "from": git(install, "rev-parse", "HEAD"), "pid": 999999})
+    u.log_file.write_text("==> 补装依赖和模型\n✗ 安装步骤失败，已退回原来的版本\n", encoding="utf-8")
+
+    def ends_now(pid):
+        u.exit_file.write_text("1")
+        return False
+
+    monkeypatch.setattr(u, "_alive", ends_now)
+    st = u.status()
+    assert st["state"] == "failed" and st["error"] == "安装步骤失败，已退回原来的版本"
 
 
 # ---------- 登录交接 ----------

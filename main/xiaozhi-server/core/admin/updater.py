@@ -291,6 +291,14 @@ class Updater:
         if not state:
             return {"state": "idle"}
         code = self._exit_code()
+        if code is None:
+            alive = self._alive(state.get("pid")) and time.time() - state.get("started", 0) < RUNNING_LIMIT
+            # 读退出码和查进程之间它可能刚好结束：再读一次，免得把正常结束当成中断
+            code = None if alive else self._exit_code()
+            status = "running" if alive else "interrupted" if code is None else "done" if code == 0 else "failed"
+        else:
+            status = "done" if code == 0 else "failed"
+        # 日志在定下状态之后读：结束了就一定读得到最后的报错
         try:
             lines = [_ANSI.sub("", line).rstrip() for line in
                      self.log_file.read_text(encoding="utf-8", errors="replace").splitlines()]
@@ -299,11 +307,6 @@ class Updater:
         steps = [line[4:].strip() for line in lines if line.startswith("==> ")]
         errors = [line.lstrip("✗ ").strip() for line in lines if line.lstrip().startswith("✗")]
         head = self._head()
-        if code is None:
-            alive = self._alive(state.get("pid")) and time.time() - state.get("started", 0) < RUNNING_LIMIT
-            status = "running" if alive else "interrupted"
-        else:
-            status = "done" if code == 0 else "failed"
         result = {"state": status, "started": int(state.get("started", 0)), "step": steps[-1] if steps else "",
                   "from": self._commit(state["from"]) if state.get("from") else {}, "to": self._commit("HEAD"),
                   "changed": bool(head) and head != state.get("from"), "log": lines[-80:]}

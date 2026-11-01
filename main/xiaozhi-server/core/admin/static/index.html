@@ -328,6 +328,7 @@ const $ = (id) => document.getElementById(id);
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
 function toast(msg, isError, ms) {
+  toast.count = (toast.count || 0) + 1;
   const t = $("toast");
   t.textContent = msg;
   t.className = "show" + (isError ? " err" : "");
@@ -355,7 +356,8 @@ async function busy(btn, fn) {
   if (btn.disabled) return;
   btn.disabled = true; btn.classList.add("busy");
   const hint = btn.textContent.includes("保存") ? "正在保存，请稍等…" : "";
-  const timer = hint && setTimeout(() => toast(hint, false, 60000), 500);
+  const shown = toast.count;   // the hint never covers the result once it has been shown
+  const timer = hint && setTimeout(() => toast.count === shown && toast(hint, false, 60000), 500);
   try { return await fn(); } finally {
     clearTimeout(timer);
     if (hint && $("toast").textContent === hint) $("toast").className = "";   // 结果没另行提示时收起

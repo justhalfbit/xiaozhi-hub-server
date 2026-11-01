@@ -90,16 +90,30 @@ def not_ready_reply(conn: "ConnectionHandler") -> Optional[str]:
     name = st["current"] or default_name(conn)
     if not name:
         return None
-    if not model_ready(_server_config(conn), name):
+    config = _server_config(conn)
+    if not model_ready(config, name):
+        default = default_name(conn)
+        if default and default != name and model_ready(config, default):
+            # 在后台另选了一个模型、配好后设成默认（没给原来那个填 Key）：在线的连接改用它
+            try:
+                if switch(conn, default, remember=False):
+                    st.pop("not_ready", None)
+                    return None
+            except Exception as e:
+                logger.bind(tag=TAG).error(f"切到默认模型 {default} 失败: {e}")
         st["not_ready"] = True
         return NOT_READY_REPLY
     if st.pop("not_ready", False):
         # 用户听到提示后在后台填好了，连接还没断：手上的实例是拿占位 Key 建的，换成按新配置建的
-        instance = get_instance(conn, name)
-        if instance is not conn.llm:
-            _attach(conn, instance)
-            conn.llm = instance
-            logger.bind(tag=TAG).info(f"设备 {_device_key(conn)} 的模型 {name} 刚配置好，换用新实例")
+        try:
+            instance = get_instance(conn, name)
+            if instance is not conn.llm:
+                _attach(conn, instance)
+                conn.llm = instance
+                logger.bind(tag=TAG).info(f"设备 {_device_key(conn)} 的模型 {name} 刚配置好，换用新实例")
+        except Exception as e:
+            st["not_ready"] = True  # 下一轮再试
+            logger.bind(tag=TAG).error(f"模型 {name} 换用新实例失败，这一轮照旧请求: {e}")
     return None
 
 

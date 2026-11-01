@@ -79,3 +79,29 @@ def test_key_filled_in_while_connected_gets_a_fresh_instance(monkeypatch):
     h._chat("你好")
     assert h.llm is fresh and spoken(h) == "好的"
     stale.response.assert_not_called()
+
+
+def test_default_changed_to_a_configured_model_is_used(monkeypatch):
+    # chose and set up another model as the default instead of filling in the first one's key
+    h = make_handler("DeepSeekLLM")
+    h.hub_route = {"current": "DeepSeekLLM", "used": [], "dialogues": {}}
+    h._chat("你好")                                      # not configured yet
+    h.config["selected_module"]["LLM"] = "KimiLLM"      # admin page: Kimi set up and made the default
+    calls = []
+    monkeypatch.setattr(llm_router, "switch", lambda conn, name, remember=True, live=True: calls.append(name) or True)
+    assert llm_router.not_ready_reply(h) is None
+    assert calls == ["KimiLLM"]
+
+
+def test_failed_instance_swap_still_answers_and_retries(monkeypatch):
+    h = make_handler("DeepSeekLLM")
+    h._chat("你好")
+    h.config["LLM"] = {**LLM, "DeepSeekLLM": {**LLM["DeepSeekLLM"], "api_key": "sk-real"}}
+
+    def boom(conn, name):
+        raise RuntimeError("create failed")
+    monkeypatch.setattr(llm_router, "get_instance", boom)
+    h.tts.reset_mock()
+    h._chat("你好")
+    assert spoken(h) == "好的"                       # asked with the old instance, as before
+    assert h.hub_route["not_ready"] is True          # tried again next turn

@@ -152,6 +152,24 @@ def test_instances_shared_and_rebuilt_when_config_changes(env):
     assert env.created[0].retired and a.llm is env.created[0]  # 在线连接继续用旧实例
 
 
+def test_calling_current_model_again_uses_new_config(env):
+    """已经在用某个模型，后台改了它的设置后再呼名：换成照新配置建的实例，这个模型的对话保留。"""
+    conn = make_conn(env)
+    llm_router.on_conn_open(conn)
+    llm_router.switch(conn, "DeepSeekLLM")
+    conn.dialogue.put(Message(role="user", content="问 DeepSeek"))
+    old = conn.llm
+    assert llm_router.switch(conn, "DeepSeekLLM") and conn.llm is old and len(env.created) == 1  # 没改：不重建
+
+    env.server.config["LLM"]["DeepSeekLLM"]["api_key"] = "sk-new"
+    assert llm_router.switch(conn, "DeepSeekLLM")
+    new = env.created[1]
+    assert conn.llm is new and new.config["api_key"] == "sk-new" and new.opened == ["s1"]
+    assert old.retired and users(conn) == ["问 DeepSeek"]
+    llm_router.on_conn_close(conn)
+    assert old.closed == ["s1"] and new.closed == ["s1"]  # 新旧实例都通知到
+
+
 def test_default_model_uses_server_instance(env):
     env.server.config["selected_module"]["LLM"] = "DeepSeekLLM"
     env.server._llm = FakeLLM("deepseek-default")

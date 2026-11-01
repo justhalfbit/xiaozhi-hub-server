@@ -142,7 +142,7 @@ stt（识别出的文字） → tts start → llm（表情） → tts sentence_s
 
 ## 4. 设备 ↔ 服务端：WebSocket 长连接
 
-**开始**：唤醒设备（说唤醒词或点屏幕），设备连上服务端。每条连接有一个新的 `session_id`；设备用 `device-id` 标识自己，"上次用的模型"和 Claude Code 的会话都按 `device-id` 记。
+**开始**：唤醒设备（说唤醒词或点屏幕），设备连上服务端。每条连接有一个新的 `session_id`；设备用 `device-id` 标识自己，"上次用的模型"和 Claude Code 的会话都按 `device-id` 记。服务端不核实 `device-id`（上游的 token 认证默认关闭，OTA 接口也会给任何设备号签发 token），所以能连到 16689 端口的人可以冒充任意设备：用它的聊天记录和记忆、接续它的 Claude Code 会话。只适合在可信的局域网里用，见 [使用说明 · 安全提示](guide.md#安全提示)。
 
 **结束**，以下任一情况：
 

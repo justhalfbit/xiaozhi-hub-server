@@ -194,11 +194,13 @@ Write-Host @"
 
   启动服务：  powershell -ExecutionPolicy Bypass -File scripts\start.ps1
   卸载：      先 cd ~ 离开项目目录，再运行 powershell -ExecutionPolicy Bypass -File "$Root\scripts\uninstall.ps1"
-  首次打开管理后台需要在本机浏览器访问 http://127.0.0.1:$HttpPort/admin 设置密码。
+  请尽快打开管理后台设置密码：本机用 http://127.0.0.1:$HttpPort/admin，其他电脑用 http://<这台电脑的 IP>:$HttpPort/admin。
+  在你设置之前，局域网里谁先打开后台谁就能设置。
 $LlmHint
 
 提醒：
   - 请在路由器里给这台电脑设置固定 IP，否则 IP 变了设备会连不上。
   - 请在 Windows 防火墙中放行 TCP 端口 ${WsPort} 和 ${HttpPort}（仅限专用网络）。
-  - 服务只应在局域网内使用，不要暴露到公网。
+  - 服务只应在可信的局域网内使用，不要暴露到公网；远程使用请走 Tailscale、WireGuard 这类私人组网。
+    语音连接不认证，同一局域网的人能冒充设备使用你的模型、读写聊天记录和记忆、指挥 Claude Code 和 Grok Bot。
 "@

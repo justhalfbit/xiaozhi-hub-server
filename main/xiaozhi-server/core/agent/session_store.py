@@ -8,12 +8,23 @@ import time
 from pathlib import Path
 from typing import Optional
 
+# 同一个文件的所有实例共用一把锁：claude_cli、各 Grok Bot、last_model 各建各的实例，
+# 都是"读整个文件 → 改自己那一块 → 整个写回"，锁不共享时并发写会互相覆盖
+_locks = {}
+_locks_guard = threading.Lock()
+
+
+def _lock_for(path: Path) -> threading.Lock:
+    key = os.path.abspath(path)
+    with _locks_guard:
+        return _locks.setdefault(key, threading.Lock())
+
 
 class SessionStore:
     def __init__(self, path: Path, namespace: str):
         self.path = Path(path)
         self.namespace = namespace
-        self._lock = threading.Lock()
+        self._lock = _lock_for(self.path)
 
     def _read_all(self) -> dict:
         try:

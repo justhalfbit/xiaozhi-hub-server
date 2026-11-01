@@ -257,6 +257,28 @@ async def test_llm_use_links_intent(client, cfg_path):
     assert r.status == 400
 
 
+async def test_saving_non_default_model_updates_running_config(client):
+    """后台保存不是默认的模型后，运行中的配置要跟着更新：呼名切模型照它判断是否配好、创建实例，不用重启。"""
+    assert "DeepSeekLLM" not in client.handler.config["LLM"]
+    r = await client.post("/admin/api/llm/vendors/deepseek",
+                          json={"base_url": "https://api.deepseek.com", "model": "deepseek-chat", "api_key": "sk-ds-123456789"})
+    assert r.status == 200 and (await r.json())["note"] == "已保存"
+    running = client.handler.config
+    assert running["selected_module"]["LLM"] == "ClaudeCLI"  # 默认模型不变
+    assert running["LLM"]["DeepSeekLLM"]["model_name"] == "deepseek-chat"
+    assert llm_router.model_ready(running, "DeepSeekLLM")
+    await client.post("/admin/api/llm/vendors/deepseek", json={"base_url": "https://api.deepseek.com", "model": "deepseek-reasoner"})
+    assert running["LLM"]["DeepSeekLLM"]["model_name"] == "deepseek-reasoner"
+    # Claude Code 不是默认时改它的设置（例如把权限从 Auto 调回只读），呼名切过去也要用上新设置
+    assert (await client.post("/admin/api/llm/use", json={"kind": "api", "vendor": "deepseek"})).status == 200
+    assert running["selected_module"]["LLM"] == "DeepSeekLLM"
+    r = await client.post("/admin/api/llm/claude", json={"level": "auto"})
+    assert r.status == 200 and running["LLM"]["ClaudeCLI"]["permission_mode"] == "auto"
+    r = await client.post("/admin/api/llm/claude", json={"level": "read"})
+    assert r.status == 200 and running["LLM"]["ClaudeCLI"]["permission_mode"] == "default"
+    assert "Bash" not in running["LLM"]["ClaudeCLI"]["allowed_tools"]
+
+
 async def test_llm_and_page_endpoints(client):
     data = await (await client.get("/admin/api/llm")).json()
     assert data["kind"] == "cli" and "install" in data["claude"]

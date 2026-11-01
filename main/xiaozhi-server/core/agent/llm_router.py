@@ -274,6 +274,14 @@ def switch(conn: "ConnectionHandler", name: str, remember: bool = True, live: bo
         st["current"] = name
         if live:
             _apply_intent(conn, name)
+    elif name != default_name(conn):
+        # 已经在用这个模型，但后台改过它的设置（实例要重建）：换成新实例，对话照旧。
+        # 默认模型不在这里换：它由后台热加载重建，已连接的设备照旧用旧实例到重连（同 _apply 的说明）
+        instance = get_instance(conn, name)
+        if instance is not conn.llm:
+            _attach(conn, instance)
+            conn.llm = instance
+            logger.bind(tag=TAG).info(f"设备 {_device_key(conn)} 的模型 {name} 配置有变化，换用新实例")
     if remember:
         store().put(_device_key(conn), {"model": name})
     return True

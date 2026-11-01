@@ -1,3 +1,6 @@
+import socket
+import threading
+
 import httpx
 import openai
 from openai.types import CompletionUsage
@@ -74,6 +77,33 @@ class LLMProvider(LLMProviderBase):
         if model_key_msg:
             logger.bind(tag=TAG).error(model_key_msg)
         self.client = openai.OpenAI(api_key=self.api_key, base_url=self.base_url, timeout=custom_timeout)
+        # [xiaozhi-hub] 每个连接正在读的流式响应，打断时断开（abort）
+        self._streams = {}
+        self._streams_lock = threading.Lock()
+
+    def _track(self, session_id, stream, on=True):
+        with self._streams_lock:
+            streams = self._streams.setdefault(session_id, set())
+            (streams.add if on else streams.discard)(stream)
+            if not streams:
+                del self._streams[session_id]
+
+    def abort(self, conn) -> None:
+        """[xiaozhi-hub] 设备打断：立刻断开这个连接正在读的流式响应，模型不再接着生成。
+        读流的线程卡在收数据上，从这边关连接对象叫不醒它（Linux 上 close 不会打断另一个线程的 recv），
+        要对底层 socket 做 shutdown，读的那边马上报错退出（chat 里被打断时不播报错误）。
+        还在等响应头的请求断不了，等它回来后第一块数据就会因为这一轮已被打断而丢掉。"""
+        with self._streams_lock:
+            streams = list(self._streams.get(conn.session_id, ()))
+        for stream in streams:
+            try:
+                network = stream.response.extensions.get("network_stream")
+                sock = network.get_extra_info("socket") if network else None
+                if sock is not None:
+                    sock.shutdown(socket.SHUT_RDWR)
+                    logger.bind(tag=TAG).info("打断：已断开模型的流式响应")
+            except Exception as e:
+                logger.bind(tag=TAG).debug(f"断开流式响应失败: {e}")
 
     @staticmethod
     def normalize_dialogue(dialogue):
@@ -121,9 +151,10 @@ class LLMProvider(LLMProviderBase):
         self._apply_thinking_disabled(request_params)
 
         responses = self.client.chat.completions.create(**request_params)
+        self._track(session_id, responses)
 
         is_active = True
-        try:            
+        try:
             for chunk in responses:
                 try:
                     delta = chunk.choices[0].delta if getattr(chunk, "choices", None) else None
@@ -140,6 +171,7 @@ class LLMProvider(LLMProviderBase):
                     if is_active:
                         yield content
         finally:
+            self._track(session_id, responses, False)
             responses.close()
 
     def response_with_functions(self, session_id, dialogue, functions=None, **kwargs):
@@ -167,6 +199,7 @@ class LLMProvider(LLMProviderBase):
         self._apply_thinking_disabled(request_params)
 
         stream = self.client.chat.completions.create(**request_params)
+        self._track(session_id, stream)
 
         try:
             for chunk in stream:
@@ -183,4 +216,5 @@ class LLMProvider(LLMProviderBase):
                         f"共计 {getattr(usage_info, 'total_tokens', '未知')}"
                     )
         finally:
+            self._track(session_id, stream, False)
             stream.close()

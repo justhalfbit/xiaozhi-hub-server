@@ -38,7 +38,7 @@ from core.agent.claude_session import ClaudeSession, ClaudeSessionConfig
 from core.agent.session_store import SessionStore, choose_resume
 from core.agent.voice_commands import DEFAULT_RESUME_KEYWORDS, match_resume, match_stop
 from core.providers.llm.base import LLMProviderBase
-from core.utils import textUtils
+from core.utils import textUtils, turn_gen
 from core.utils.prompt_manager import EMOJI_List
 
 TAG = __name__
@@ -599,6 +599,8 @@ class LLMProvider(LLMProviderBase):
         system_prompt = dialogue[0].get("content", "") if dialogue and dialogue[0].get("role") == "system" else ""
         st = self._state(session_id)
         self._warn_intent(st)
+        # [xiaozhi-hub] 这一轮的代次（turn_gen）：打断后新的一轮一开始就清掉 client_abort，只看它会漏
+        gen = turn_gen.current(st.conn) if st.conn is not None else None
 
         out: queue.Queue = queue.Queue()
         asyncio.run_coroutine_threadsafe(self._run_turn(st, text, system_prompt, out), self._loop)
@@ -616,7 +618,7 @@ class LLMProvider(LLMProviderBase):
         finished = False
         try:
             while True:
-                if self._aborted(st):
+                if self._aborted(st, gen):
                     # 设备打断了（abort() 已经让 Claude 中断）：这一轮到此为止，不再保活、不再说进度。
                     # 不能等 Claude 自己结束：它卡住不理中断时，这里会一直等到单轮超时（最长 10 分钟），
                     # 期间连接一直不会因为没人说话断开；用户开口说下一句后，打断标志被清掉，
@@ -696,9 +698,12 @@ class LLMProvider(LLMProviderBase):
                 asyncio.run_coroutine_threadsafe(st.agent.interrupt(), self._loop)
 
     @staticmethod
-    def _aborted(st: ConnState) -> bool:
-        """设备是否打断了这一轮。打断时服务端会把连接的 client_abort 置为 True，新的一句话开始时清掉。"""
-        return bool(getattr(st.conn, "client_abort", False))
+    def _aborted(st: ConnState, gen=None) -> bool:
+        """设备是否打断了这一轮。打断时服务端会把连接的 client_abort 置为 True，新的一句话开始时清掉；
+        清掉之前这里没轮询到也不要紧，打断和新的一轮都会让代次变（gen 是这一轮开始时的代次）。"""
+        if bool(getattr(st.conn, "client_abort", False)):
+            return True
+        return gen is not None and st.conn is not None and turn_gen.stale(st.conn, gen)
 
     def _restore_record(self, key: str, previous: Optional[dict]) -> None:
         """把这台设备的会话记录恢复成这一轮开始前的样子；原来没有记录就删掉。"""

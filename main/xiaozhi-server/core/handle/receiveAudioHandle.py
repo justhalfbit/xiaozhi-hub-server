@@ -12,6 +12,7 @@ from core.agent.call_names import handle_call_name
 from core.handle.abortHandle import handleAbortMessage
 from core.handle.intentHandler import handle_user_intent, speak_txt
 from core.utils.output_counter import check_device_output_limit
+from core.utils import turn_gen
 from core.handle.sendAudioHandle import send_stt_message, SentenceType
 
 TAG = __name__
@@ -43,7 +44,11 @@ async def resume_vad_detection(conn: "ConnectionHandler"):
     conn.just_woken_up = False
 
 
-async def startToChat(conn: "ConnectionHandler", text):
+async def startToChat(conn: "ConnectionHandler", text, gen=None):
+    """gen：这句话说完时的轮次代次（turn_gen）；之后设备打断过就不再回答它。"""
+    if gen is not None and turn_gen.stale(conn, gen):
+        conn.logger.bind(tag=TAG).info(f"这句话说完后被打断过，不再回答: {text}")
+        return
     # 检查输入是否是JSON格式（包含说话人信息）
     speaker_name = None
     actual_text = text
@@ -94,6 +99,10 @@ async def startToChat(conn: "ConnectionHandler", text):
     if conn.client_is_speaking and conn.client_listen_mode != "manual":
         await handleAbortMessage(conn)
 
+    # [xiaozhi-hub] 新的一轮从这里开始：之前的轮次作废；下面呼名、意图识别、发 stt 都要等，
+    # 期间设备打断了就不再回答
+    gen = turn_gen.bump(conn)
+
     # [xiaozhi-hub] 呼名：句首"嗨 Claude"先去掉称呼；只有称呼时直接回复，不发给模型
     actual_text = await handle_call_name(conn, actual_text)
     if actual_text is None:
@@ -111,13 +120,17 @@ async def startToChat(conn: "ConnectionHandler", text):
         # 如果意图已被处理，不再进行聊天
         return
 
+    if turn_gen.stale(conn, gen):
+        conn.logger.bind(tag=TAG).info(f"开始回答前被打断，不再回答: {actual_text}")
+        return
+
     # 意图未被处理，继续常规聊天流程，使用实际文本内容
     await send_stt_message(conn, actual_text)
 
     # 准备开始新会话
     conn.client_abort = False
 
-    conn.executor.submit(conn.chat, actual_text)
+    conn.executor.submit(conn.chat, actual_text, turn=gen)
 
 
 async def no_voice_close_connect(conn: "ConnectionHandler", have_voice):

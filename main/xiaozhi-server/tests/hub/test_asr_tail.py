@@ -122,7 +122,7 @@ def test_voice_stop_recognises_only_the_rest(monkeypatch):
     import core.providers.asr.base as base
     said = []
 
-    async def to_chat(conn, text):
+    async def to_chat(conn, text, gen=None):
         said.append(text)
     monkeypatch.setattr(base, "startToChat", to_chat)
     monkeypatch.setattr(base, "correct_and_record", lambda conn, text: text)
@@ -161,7 +161,7 @@ def test_too_short_tells_the_client_nothing_was_heard():
 def _patch_chat(monkeypatch, said):
     import core.providers.asr.base as base
 
-    async def to_chat(conn, text):
+    async def to_chat(conn, text, gen=None):
         said.append(text)
     monkeypatch.setattr(base, "startToChat", to_chat)
     monkeypatch.setattr(base, "correct_and_record", lambda conn, text: text)

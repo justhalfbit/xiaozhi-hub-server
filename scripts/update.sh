@@ -36,9 +36,13 @@ main() {
   local shallow
   shallow="$(git rev-parse --is-shallow-repository)"
   if [[ "$shallow" == "true" ]]; then
-    # 一键安装下载的是只含最新一次提交的浅克隆：只取当前版本之后的提交（接得上历史，才列得出更新内容、
-    # 判断得了是不是快进）；远端不支持时退回只取最新一次提交
-    git fetch --shallow-since="$(git log -1 --format=%cI)" "$remote" "$rbranch" 2>/dev/null \
+    # 一键安装下载的是只含最新一次提交的浅克隆：只取本地最早那个提交（浅克隆的边界）之后的提交
+    # （接得上历史，才列得出更新内容、判断得了是不是快进）；远端不支持时退回只取最新一次提交。
+    # 不能用当前版本的时间：本地有自己的提交时它比和远端共同的那个提交新，取回来的历史接不上，
+    # 分叉就会被当成「接不上历史」直接切到新版本，把本地提交丢掉
+    local since
+    since="$(git log --no-walk --format='%ct %cI' $(git rev-list --max-parents=0 HEAD) | sort -n | awk 'NR == 1 {print $2}')" || true
+    git fetch --shallow-since="${since:-$(git log -1 --format=%cI)}" "$remote" "$rbranch" 2>/dev/null \
       || git fetch --depth 1 "$remote" "$rbranch"
   else
     git fetch "$remote" "$rbranch"

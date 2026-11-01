@@ -352,22 +352,43 @@ def test_shallow_clone_update(repos, tmp_path):
     assert st["state"] == "done" and git(shallow, "rev-parse", "HEAD") == new, st["log"]
 
 
-def test_shallow_clone_with_local_commit_is_diverged(repos, tmp_path):
-    """浅克隆但接得上历史时照样能看出分叉，不会切到新版本把本地提交丢掉。"""
-    seed, _, calls = repos
-    shallow = tmp_path / "shallow"
+def shallow_with_local_commit(tmp_path, monkeypatch, name="shallow") -> tuple:
+    """浅克隆后在本地提交一次，返回 (仓库, 本地提交)。
+
+    本地提交比和远端共同的那个提交晚（实际总是这样）：按当前版本的时间取远端提交时取不到共同的提交，
+    历史接不上，曾被误判成有新版本、更新时直接切过去把本地提交丢掉。提交时间写死晚 1 分钟，
+    不靠落在不同的秒里碰运气（原来同一秒内做完就碰巧能过）。
+    """
+    shallow = tmp_path / name
     git(tmp_path, "clone", "-q", "--depth", "1", (tmp_path / "remote.git").as_uri(), str(shallow))
     (shallow / "main" / "xiaozhi-server" / "data").mkdir()
     (shallow / "main" / "xiaozhi-server" / "data" / ".install-complete").touch()
     (shallow / "README.md").write_text("local\n")
+    base_time = int(git(shallow, "log", "-1", "--format=%ct"))
+    monkeypatch.setenv("GIT_COMMITTER_DATE", f"@{base_time + 60} +0800")
     git(shallow, "commit", "-qam", "本地提交")
-    local = git(shallow, "rev-parse", "HEAD")
+    monkeypatch.delenv("GIT_COMMITTER_DATE")
+    return shallow, git(shallow, "rev-parse", "HEAD")
+
+
+def test_shallow_clone_with_local_commit_is_diverged(repos, tmp_path, monkeypatch):
+    """浅克隆但接得上历史时照样能看出分叉，后台的「立即更新」按钮不会出现。"""
+    seed, _, calls = repos
+    shallow, local = shallow_with_local_commit(tmp_path, monkeypatch)
+    publish(seed, "v2")
+    c = make_updater(shallow).check()
+    assert c["state"] == "diverged" and "本地有自己的提交" in c["message"], c
+
+
+def test_shallow_clone_with_local_commit_update_refuses(repos, tmp_path, monkeypatch):
+    """没先检查、直接跑 update.sh（终端里更新）也要拒绝，不能切到新版本把本地提交丢掉。"""
+    seed, _, calls = repos
+    shallow, local = shallow_with_local_commit(tmp_path, monkeypatch)
     publish(seed, "v2")
     u = make_updater(shallow)
-    assert u.check()["state"] == "diverged"
-    u.start()  # 后台的按钮不会出现；直接跑脚本也要拒绝
+    u.start()
     st = wait_done(u)
-    assert st["state"] == "failed" and "本地有自己的提交" in st["error"]
+    assert st["state"] == "failed" and "本地有自己的提交" in st["error"], st["log"]
     assert git(shallow, "rev-parse", "HEAD") == local and calls.read_text() == ""
 
 

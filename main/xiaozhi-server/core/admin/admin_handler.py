@@ -16,6 +16,7 @@ import copy
 import functools
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from aiohttp import web
@@ -31,6 +32,13 @@ from core.utils.modules_initialize import initialize_modules
 from core.utils.textUtils import EMOJI_MAP
 
 TAG = __name__
+
+# 后台的同步操作（读写配置、测试连接、查 Claude 版本）用自己的线程：默认线程池和语音识别等共用，
+# 被卡住的操作（如连不上的测试连接）占满它时，保存要排队十几秒，识别也跟着变慢
+_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="admin")
+
+# 测试连接最多等这么久：连不上（地址被墙时连接不报错、一直没回应）就尽快告诉用户，也不占着线程
+TEST_TIMEOUT = {"connect": 5.0, "read": 15.0, "write": 5.0, "pool": 2.0}
 logger = setup_logging()
 COOKIE_NAME = "xz_admin"
 STATIC_DIR = Path(__file__).parent / "static"
@@ -119,8 +127,8 @@ class AdminHandler:
 
     @staticmethod
     async def _blocking(func, *args, **kwargs):
-        """在线程池里执行同步操作（配置文件读写、密码哈希），不阻塞负责音频下发的主事件循环。"""
-        return await asyncio.get_running_loop().run_in_executor(None, functools.partial(func, *args, **kwargs))
+        """在后台自己的线程里执行同步操作（配置文件读写、密码哈希），不阻塞负责音频下发的主事件循环。"""
+        return await asyncio.get_running_loop().run_in_executor(_POOL, functools.partial(func, *args, **kwargs))
 
     def _logged_in(self, request: web.Request) -> bool:
         return self.sessions.valid(request.cookies.get(COOKIE_NAME))
@@ -460,6 +468,7 @@ class AdminHandler:
         self._require_login(request)
         vendor = request.match_info["vendor"]
         body = await self._read_json(request)
+        started = time.monotonic()
         try:
             merged = await self._blocking(self._merged)
             changed = await self._blocking(pages.save_vendor, vendor, body, merged, self.config_path)
@@ -467,9 +476,12 @@ class AdminHandler:
             return self._error("不支持这个厂商", 404)
         except ValueError as e:
             return self._error(str(e), 400)
-        self.logger.bind(tag=TAG).info(f"管理后台更新了 {vendor} 的 API 设置: {', '.join(changed) or '无变化'}")
         entry = catalog.VENDOR_BY_ID[vendor]["entry"]
-        return self._json({"ok": True, "changed": changed, **await self._apply_if_selected("LLM", entry, changed)})
+        applied = await self._apply_if_selected("LLM", entry, changed)
+        # 用时记进日志：保存曾经要等十几秒，原因没能复现
+        self.logger.bind(tag=TAG).info(f"管理后台更新了 {vendor} 的 API 设置: {', '.join(changed) or '无变化'}"
+                                       f"（用时 {time.monotonic() - started:.1f} 秒）")
+        return self._json({"ok": True, "changed": changed, **applied})
 
     @staticmethod
     def _test_llm(config: dict) -> dict:
@@ -478,7 +490,9 @@ class AdminHandler:
 
         started = time.time()
         try:
-            reply = LLMProvider(config).response_no_stream("你是语音助手，回答尽量简短。", "只回复一个字：好")
+            provider = LLMProvider({**config, "timeout": TEST_TIMEOUT})
+            provider.client.max_retries = 0   # 默认失败后再试 2 次
+            reply = provider.response_no_stream("你是语音助手，回答尽量简短。", "只回复一个字：好")
         except openai.AuthenticationError:
             return {"ok": False, "error": "API Key 不对或已失效"}
         except openai.NotFoundError:
@@ -486,7 +500,7 @@ class AdminHandler:
         except openai.RateLimitError:
             return {"ok": False, "error": "请求太频繁或额度用完了"}
         except (openai.APIConnectionError, openai.APITimeoutError):
-            return {"ok": False, "error": "连不上接口地址，请检查地址和网络"}
+            return {"ok": False, "error": "连不上接口地址，请检查地址和网络；国外的服务在国内可能要走代理，或者换国内的服务"}
         except openai.APIStatusError as e:
             return {"ok": False, "error": f"接口返回错误 {e.status_code}：{str(e.message)[:200]}"}
         except Exception as e:

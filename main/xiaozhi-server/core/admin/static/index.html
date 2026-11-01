@@ -248,6 +248,16 @@
   .auth .brand { color: var(--text); padding: 0 0 18px; }
   .auth h2 { margin: 0 0 4px; font-size: 18px; }
 
+  /* 更新网关 */
+  .kv.two { grid-template-columns: max-content minmax(0, 1fr); }
+  .commits { margin: 0; padding: 0; list-style: none; }
+  .commits li { display: flex; gap: 12px; padding: 9px 22px; border-top: 1px solid var(--line); align-items: baseline; }
+  .commits li:first-child { border-top: 0; }
+  .commits li span { flex: 1; min-width: 0; word-break: break-word; }
+  .commits li small { color: var(--muted); white-space: nowrap; }
+  .update-log { margin: 10px 0 0; padding: 12px 14px; background: var(--soft); border-radius: 8px; max-height: 320px; overflow: auto;
+                white-space: pre-wrap; word-break: break-word; font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }
+
   #toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%) translateY(8px); padding: 10px 18px; max-width: 90vw;
            border-radius: 10px; background: #0f172a; color: #fff; opacity: 0; transition: opacity .2s, transform .2s;
            pointer-events: none; z-index: 20; box-shadow: 0 8px 24px rgba(0, 0, 0, .2); }
@@ -313,6 +323,7 @@
       <button data-page="asr"><span class="ico">◐</span>语音识别</button>
       <button data-page="tts"><span class="ico">♪</span>语音合成</button>
       <button data-page="intent"><span class="ico">⚙</span>意图识别</button>
+      <button data-page="update"><span class="ico">⟳</span>更新网关</button>
     </nav>
     <div class="side-foot"><span class="dot" id="online-dot"></span><span id="online-text">没有设备在线</span><span id="online-short">无设备</span>
       <div class="row"><button id="logout">退出登录</button>
@@ -418,7 +429,7 @@ $("auth-form").addEventListener("submit", async (ev) => {
 });
 $("logout").onclick = async () => { if (!confirmLeave()) return; page.dirty = null; await api("logout", {}); await route(); };
 
-const PAGES = { status: renderStatus, how: renderHow, llm: renderLLM, calls: renderCallNames, grokbot: renderGrokBot, memory: renderMemory, asr: renderASR, tts: renderTTS, intent: renderIntent };
+const PAGES = { status: renderStatus, how: renderHow, llm: renderLLM, calls: renderCallNames, grokbot: renderGrokBot, memory: renderMemory, asr: renderASR, tts: renderTTS, intent: renderIntent, update: renderUpdate };
 const page = { name: "", dirty: null, timer: null };
 function currentPage() { const p = location.hash.slice(1); return PAGES[p] ? p : "status"; }
 function confirmLeave() { return !(page.dirty && page.dirty()) || confirm("当前页面有修改还没保存，确定离开吗？"); }
@@ -1496,6 +1507,119 @@ async function renderCallNames(root) {
     try { const r = await api("call-names", values()); toast(r.note); page.dirty = null; await openPage("calls", true); }
     catch (err) { toast(err.message, true); }
   });
+}
+
+// ---------- 更新网关 ----------
+
+const fmtTime = (v) => (v ? new Date(typeof v === "number" ? v * 1000 : v).toLocaleString() : "");
+const commitLine = (c) => c && c.short ? `<code>${esc(c.short)}</code> ${esc(c.subject)} <span class="muted small">${esc(fmtTime(c.date))}</span>` : '<span class="muted">未知</span>';
+const UPDATE_NOTE = "更新期间网关会重启，一般 1～2 分钟，在线设备会断开一下再自动连上，正在进行的对话会中断。";
+
+async function renderUpdate(root) {
+  const d = await api("update");
+  if (d.update.state === "running") return renderUpdating(root, d.update);
+  const src = d.source || {};
+  root.innerHTML = `
+    <div class="page-head"><div><h1>更新网关</h1><p class="sub">和 GitHub 上的版本比较，有新版本时由你决定什么时候更新，不会自动更新。</p></div>
+      ${d.unsupported ? "" : '<button class="btn" id="up-check">检查更新</button>'}</div>
+    ${d.unsupported ? `<div class="banner warn">${esc(d.unsupported)}</div>` : ""}
+    <div class="card panel"><div class="kv two">
+      <div class="k">当前版本</div><div>${commitLine(d.current)}</div>
+      ${d.running && d.running.short ? `<div class="k">运行中</div><div>${commitLine(d.running)} <span class="pill warn">代码已更新，重启服务后才用上</span></div>` : ""}
+      ${d.branch ? `<div class="k">分支</div><div><code>${esc(d.branch)}</code></div>` : ""}
+      ${src.url ? `<div class="k">更新来源</div><div><code>${esc(src.url)}</code> 的 <code>${esc(src.branch)}</code> 分支</div>` : ""}
+    </div></div>
+    <div id="up-last"></div>
+    ${d.unsupported ? "" : '<div class="section-title">新版本</div><div class="card" id="up-box"></div>'}`;
+  renderLastUpdate(d.update);
+  if (d.unsupported) return;
+  const check = () => busy($("up-check"), async () => {
+    $("up-box").innerHTML = '<div class="panel muted">正在和 GitHub 比较…（网络不好时最多等 30 秒）</div>';
+    try { drawCheck(root, (await api("update/check", {})).check); }
+    catch (e) { $("up-box").innerHTML = `<div class="panel"><div class="banner err" style="margin:0">${esc(e.message)}</div></div>`; }
+  });
+  $("up-check").onclick = check;
+  // 打开这一页时，十分钟内没检查过就自动查一次（只查不更新）
+  if (d.check && Date.now() / 1000 - d.check.checked_at < 600) drawCheck(root, d.check);
+  else check();
+}
+
+function renderLastUpdate(u) {
+  const box = $("up-last");
+  if (!box || !u || u.state === "idle" || u.state === "running") return;
+  const when = fmtTime(u.finished || u.started);
+  let html = "";
+  if (u.state === "done") {
+    html = u.changed
+      ? `<div class="banner info">${esc(when)} 更新成功：${esc(u.from.short || "")} → ${esc(u.to.short || "")}。</div>`
+      : `<div class="banner info">${esc(when)} 检查过，已经是最新版本，没有改动。</div>`;
+    if (u.restart_needed) html += '<div class="banner warn">代码已更新，但服务是手动启动的，没有自动重启：请在运行网关的终端按 Ctrl+C 停止，再运行 scripts/start.sh。</div>';
+  } else {
+    html = `<div class="banner ${u.state === "failed" ? "err" : "warn"}">${esc(when)} 更新没有完成：${esc(u.error || "")}${u.changed ? "" : "。网关仍是原来的版本"}</div>`;
+  }
+  if (u.log && u.log.length) html += `<details class="adv" style="margin:0 0 14px;padding:0;border:0"><summary>更新输出</summary><pre class="update-log">${esc(u.log.join("\n"))}</pre></details>`;
+  box.style.marginTop = "14px";
+  box.innerHTML = html;
+}
+
+function drawCheck(root, c) {
+  const box = $("up-box");
+  if (!box) return;
+  const when = c.checked_at ? `<span class="muted small">检查于 ${esc(fmtTime(c.checked_at))}</span>` : "";
+  const list = (c.commits || []).length ? `<ul class="commits">${c.commits.map((x) => `<li><code>${esc(x.short)}</code><span>${esc(x.subject)}</span><small>${esc(fmtTime(x.date))}</small></li>`).join("")}</ul>` : "";
+  const more = c.behind > (c.commits || []).length ? `<div class="panel muted small" style="padding-top:0">还有 ${c.behind - c.commits.length} 个更早的提交没列出来</div>` : "";
+  if (c.state === "latest") {
+    box.innerHTML = `<div class="card-head"><h2><span class="pill ok">已经是最新版本</span></h2>${when}</div><div class="panel muted">远端最新：${commitLine(c.latest)}</div>`;
+  } else if (c.state === "available" || c.state === "dirty") {
+    const count = c.behind == null ? "有新版本（列不出中间的提交，只显示最新一个）" : `有 ${c.behind} 个新提交`;
+    box.innerHTML = `<div class="card-head"><h2>${count}</h2>${when}</div>${list}${more}
+      <div class="panel" style="border-top:1px solid var(--line)">
+        ${c.state === "dirty" ? `<div class="banner warn">${esc(c.message)}<br><code>${esc((c.files || []).join("  "))}</code></div>`
+          : `<p class="muted small" style="margin:0 0 4px">${UPDATE_NOTE}依赖有变化时会自动补装；补装失败或新版本起不来时自动退回现在的版本。</p>`}
+        <div class="actions" style="margin-top:10px"><button class="btn primary" id="up-start" ${c.state === "dirty" ? "disabled" : ""}>立即更新</button></div></div>`;
+    if (c.state === "available") $("up-start").onclick = (e) => busy(e.target, async () => {
+      if (!confirm("现在更新网关吗？\n\n" + UPDATE_NOTE)) return;
+      try { renderUpdating(root, (await api("update/start", {})).update); }
+      catch (err) { toast(err.message, true); }
+    });
+  } else {
+    const cls = c.state === "error" ? "err" : "warn";
+    box.innerHTML = `<div class="panel"><div class="banner ${cls}" style="margin:0">${esc(c.message)}</div>${when ? `<p style="margin:8px 0 0">${when}</p>` : ""}</div>`;
+  }
+}
+
+// 更新中：每 2 秒查一次进度。网关重启期间连不上是正常的，等它回来；结束后成功就刷新整页（页面本身也可能更新了）
+function renderUpdating(root, u) {
+  root.innerHTML = `
+    <div class="page-head"><div><h1>更新网关</h1><p class="sub">正在更新，请不要关闭网关或断电。</p></div></div>
+    <div class="card panel">
+      <div class="banner info">正在更新，网关会重启，一般 1～2 分钟。在线设备会断开一下再自动连上，这个页面会自动恢复。</div>
+      <p style="margin:0">当前步骤：<b id="up-step">准备中</b> <span class="muted small" id="up-elapsed"></span></p>
+      <details class="adv"><summary>更新输出</summary><pre class="update-log" id="up-log"></pre></details>
+    </div>`;
+  const started = (u.started || Date.now() / 1000) * 1000;
+  let down = false;
+  const show = (st) => {
+    $("up-step").textContent = down ? "网关正在重启，等它回来…" : (st && st.step) || "准备中";
+    $("up-elapsed").textContent = `已用 ${Math.round((Date.now() - started) / 1000)} 秒`;
+    if (st && st.log) $("up-log").textContent = st.log.join("\n");
+  };
+  show(u);
+  clearInterval(page.timer);
+  page.timer = setInterval(async () => {
+    if (!$("up-step")) return;
+    let d;
+    try { d = await api("update", undefined, true); down = false; }
+    catch (e) { if (isOffline(e)) { down = true; show(null); } return; }
+    if (d.update.state === "running") return show(d.update);
+    clearInterval(page.timer); page.timer = null;
+    if (d.update.state === "done" && d.update.changed && !d.update.restart_needed) {
+      toast(`已更新到 ${d.update.to.short}，页面马上刷新`);
+      setTimeout(() => location.reload(), 1500);
+    } else {
+      await openPage("update", true);
+    }
+  }, 2000);
 }
 
 route();

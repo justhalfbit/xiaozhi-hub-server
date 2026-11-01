@@ -229,6 +229,24 @@ def test_dropped_messages_are_summarized_into_memory():
     assert "用户：我叫小明" not in llm2.calls[0][1]
 
 
+@pytest.mark.parametrize("reply", ["【阿里百练API服务响应异常】", "【服务响应异常】", "  【服务响应异常】\n",
+                                   "我没听清，抱歉【服务响应异常】"])
+def test_error_reply_from_summary_model_keeps_old_memory(reply):
+    """AliBL、Dify 这类模型出错不抛异常、输出一句出错提示：不能拿它替换记忆，也不推进进度，下次重新总结。"""
+    conn = make_conn()
+    chat_history.load(conn, conn.dialogue, "DeepSeekLLM")
+    chat(conn, "我叫小明", "你好小明")
+    for i in range(3):
+        chat(conn, f"问{i}", f"答{i}")
+    cfg = chat_history.settings(CONFIG)
+    chat_history.db().set_memory("dev-1", "- 用户喜欢爬山", "summary")
+    assert not chat_history.summarize_now(FakeLLM(reply), "dev-1", cfg, CONFIG)
+    assert chat_history.memory_for(conn) == "- 用户喜欢爬山"
+    assert chat_history.db().progress("dev-1") == {}
+    assert chat_history.summarize_now(FakeLLM("- 用户叫小明\n- 【重要】喜欢爬山"), "dev-1", cfg, CONFIG)
+    assert chat_history.memory_for(conn) == "- 用户叫小明\n- 【重要】喜欢爬山"
+
+
 def test_memory_goes_into_the_system_prompt():
     conn = make_conn()
     msgs = conn.dialogue.get_llm_dialogue_with_memory("- 用户叫小明")
@@ -657,6 +675,30 @@ def test_old_per_model_memories_are_merged(tmp_path):
     finally:
         store.close()
     chat_history.ChatDB(path).close()   # 再打开一次不出错
+
+
+def test_db_files_are_private(tmp_path):
+    """聊天记录库和 -wal、-shm 只给自己读写（同目录的 .config.yaml 也是 600），以前建成 644 的也改过来。"""
+    import os
+    import stat
+
+    path = tmp_path / "chat.db"
+    store = chat_history.ChatDB(path)
+    try:
+        store.set_memory("dev-1", "- 记忆", "summary")
+        for suffix in ("", "-wal", "-shm"):
+            assert stat.S_IMODE(os.stat(f"{path}{suffix}").st_mode) == 0o600, suffix
+    finally:
+        store.close()
+    for suffix in ("", "-wal", "-shm"):
+        if os.path.exists(f"{path}{suffix}"):
+            os.chmod(f"{path}{suffix}", 0o644)
+    store = chat_history.ChatDB(path)
+    try:
+        for suffix in ("", "-wal", "-shm"):
+            assert stat.S_IMODE(os.stat(f"{path}{suffix}").st_mode) == 0o600, suffix
+    finally:
+        store.close()
 
 
 def test_clear_bumps_memory_version_so_running_summary_is_dropped(project):

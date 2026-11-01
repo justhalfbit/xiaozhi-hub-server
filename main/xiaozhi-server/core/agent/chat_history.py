@@ -20,6 +20,7 @@ summary_llm（总结用哪个 LLM 条目，空则用当前模型）、display_li
 """
 
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -92,6 +93,10 @@ class ChatDB:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        # 聊天记录和记忆只给自己看（同目录的 .config.yaml 也是 600）。先建好库文件、设好权限，
+        # SQLite 新建 -wal、-shm 时照库文件的权限来；以前按默认 umask 建出来的也一并改掉
+        self.path.touch(mode=0o600, exist_ok=True)
+        self._private()
         self._conn = sqlite3.connect(str(self.path), check_same_thread=False, isolation_level=None)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
@@ -124,6 +129,14 @@ class ChatDB:
             """
         )
         self._migrate()
+        self._private()
+
+    def _private(self) -> None:
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.chmod(f"{self.path}{suffix}", 0o600)
+            except FileNotFoundError:
+                pass
 
     def _migrate(self) -> None:
         """早期按"设备 + 模型"各存一份记忆（memories 表）：合并成每台设备一份，进度按模型留着。"""
@@ -443,6 +456,14 @@ def pending_summary(device: str, cfg: dict, config: dict):
     return batch[:SUMMARY_BATCH], mem
 
 
+def _looks_like_error(text: str) -> bool:
+    """有的模型（上游的 AliBL、Dify 等）出错时不抛异常，而是输出一句【……异常】这样的提示。
+    总结结果是一行用【】整个括起来的话，或以"异常】"结尾，就当成出错，不能拿它替换记忆。"""
+    if text.startswith("【") and text.endswith("】") and "\n" not in text:
+        return True
+    return text.endswith("异常】")
+
+
 def summarize_now(llm, device: str, cfg: dict, config: dict) -> bool:
     """同步执行一次总结。返回有没有更新记忆。"""
     rows, mem = pending_summary(device, cfg, config)
@@ -452,6 +473,9 @@ def summarize_now(llm, device: str, cfg: dict, config: dict) -> bool:
     text = llm.response_no_stream(SUMMARY_PROMPT.format(chars=cfg["summary_chars"]), prompt)
     text = (text or "").strip()
     if not text:
+        return False
+    if _looks_like_error(text):
+        logger.bind(tag=TAG).warning(f"设备 {device}：总结用的模型返回了出错提示「{text[:40]}」，保留原来的记忆")
         return False
     if text in ("无", "无。"):
         text = mem["summary"]

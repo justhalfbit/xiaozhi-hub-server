@@ -327,12 +327,12 @@
 const $ = (id) => document.getElementById(id);
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
-function toast(msg, isError) {
+function toast(msg, isError, ms) {
   const t = $("toast");
   t.textContent = msg;
   t.className = "show" + (isError ? " err" : "");
   clearTimeout(toast.timer);
-  toast.timer = setTimeout(() => (t.className = isError ? "err" : ""), isError ? 6000 : 3000);
+  toast.timer = setTimeout(() => (t.className = isError ? "err" : ""), ms || (isError ? 6000 : 3000));
 }
 
 // quiet：后台定时查询用。登录过期时如果页面上有没保存的修改，不跳到登录页（会清掉这些修改），只抛出错误
@@ -350,11 +350,17 @@ async function api(path, body, quiet) {
   return data;
 }
 
-// 按钮执行期间显示转圈并禁用，避免重复点击
+// 按钮执行期间显示转圈并禁用，避免重复点击；保存超过半秒（写配置、重建模型要几秒）再提示一句
 async function busy(btn, fn) {
   if (btn.disabled) return;
   btn.disabled = true; btn.classList.add("busy");
-  try { return await fn(); } finally { btn.disabled = false; btn.classList.remove("busy"); }
+  const hint = btn.textContent.includes("保存") ? "正在保存，请稍等…" : "";
+  const timer = hint && setTimeout(() => toast(hint, false, 60000), 500);
+  try { return await fn(); } finally {
+    clearTimeout(timer);
+    if (hint && $("toast").textContent === hint) $("toast").className = "";   // 结果没另行提示时收起
+    btn.disabled = false; btn.classList.remove("busy");
+  }
 }
 
 async function copyText(text) {

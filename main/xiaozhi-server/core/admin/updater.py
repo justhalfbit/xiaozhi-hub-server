@@ -172,8 +172,8 @@ class Updater:
         if self._is_ancestor(head, new):
             base["behind"] = int(self._out("rev-list", "--count", f"{head}..{new}") or 0)
             base["commits"] = self._commits(f"{head}..{new}")
-        elif shallow:
-            # 浅克隆的历史不全，判断不了先后，同 update.sh 直接换到新版本；只列得出最新一次提交
+        elif shallow and not self._out("merge-base", head, new):
+            # 浅克隆接不上历史，判断不了先后，同 update.sh 直接换到新版本；只列得出最新一次提交
             base["behind"], base["commits"] = None, [{k: base["latest"][k] for k in ("short", "date", "subject")}]
         elif self._is_ancestor(new, head):
             return {**base, "state": "diverged",

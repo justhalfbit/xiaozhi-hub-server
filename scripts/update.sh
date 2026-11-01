@@ -36,8 +36,10 @@ main() {
   local shallow
   shallow="$(git rev-parse --is-shallow-repository)"
   if [[ "$shallow" == "true" ]]; then
-    # 一键安装下载的是只含最新一次提交的浅克隆，更新时也只取最新一次提交
-    git fetch --depth 1 "$remote" "$rbranch"
+    # 一键安装下载的是只含最新一次提交的浅克隆：只取当前版本之后的提交（接得上历史，才列得出更新内容、
+    # 判断得了是不是快进）；远端不支持时退回只取最新一次提交
+    git fetch --shallow-since="$(git log -1 --format=%cI)" "$remote" "$rbranch" 2>/dev/null \
+      || git fetch --depth 1 "$remote" "$rbranch"
   else
     git fetch "$remote" "$rbranch"
   fi
@@ -52,11 +54,15 @@ main() {
   fi
 
   step "下载新版本"
-  if [[ "$shallow" == "true" ]]; then
-    # 浅克隆没有新旧版本之间的历史，不能快进合并，直接切到新版本（上面已确认没有本地改动）
+  if [[ "$shallow" == "true" ]] && ! git merge-base HEAD FETCH_HEAD >/dev/null 2>&1; then
+    # 浅克隆接不上新旧版本之间的历史，不能快进合并，直接切到新版本（上面已确认没有本地改动）
     git reset --keep FETCH_HEAD
   else
     git merge --ff-only FETCH_HEAD || fail "本地有自己的提交，无法直接更新。请手动合并：git merge ${remote}/${rbranch}"
+  fi
+  if [[ "$(git rev-parse HEAD)" == "$old" ]]; then
+    info "本地的版本比远端还新（有远端没有的提交），不用更新"
+    return
   fi
   exec bash "$ROOT/scripts/update.sh" --after-pull "$old"
 }

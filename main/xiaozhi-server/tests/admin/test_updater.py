@@ -302,6 +302,25 @@ def test_shallow_clone_update(repos, tmp_path):
     assert st["state"] == "done" and git(shallow, "rev-parse", "HEAD") == new, st["log"]
 
 
+def test_shallow_clone_with_local_commit_is_diverged(repos, tmp_path):
+    """浅克隆但接得上历史时照样能看出分叉，不会切到新版本把本地提交丢掉。"""
+    seed, _, calls = repos
+    shallow = tmp_path / "shallow"
+    git(tmp_path, "clone", "-q", "--depth", "1", (tmp_path / "remote.git").as_uri(), str(shallow))
+    (shallow / "main" / "xiaozhi-server" / "data").mkdir()
+    (shallow / "main" / "xiaozhi-server" / "data" / ".install-complete").touch()
+    (shallow / "README.md").write_text("local\n")
+    git(shallow, "commit", "-qam", "本地提交")
+    local = git(shallow, "rev-parse", "HEAD")
+    publish(seed, "v2")
+    u = make_updater(shallow)
+    assert u.check()["state"] == "diverged"
+    u.start()  # 后台的按钮不会出现；直接跑脚本也要拒绝
+    st = wait_done(u)
+    assert st["state"] == "failed" and "本地有自己的提交" in st["error"]
+    assert git(shallow, "rev-parse", "HEAD") == local and calls.read_text() == ""
+
+
 def test_start_refuses_while_running_and_detects_interrupted(repos):
     _, install, _ = repos
     u = make_updater(install)

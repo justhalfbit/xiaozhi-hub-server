@@ -5,7 +5,9 @@ Bot 的名字自动成为称呼。同一个账号的所有 Bot 共用一条事�
 
 连接管理、空闲关闭、填充语、进度提示、超时都继承 claude_cli 的 provider，只换掉会话的创建方式：
 - 没有本机进程，"启动会话"只是确认云端电脑醒着并订阅事件流；设备叫到这个 Bot 时就提前做（热身），
-  第一句话不用再等云端电脑唤醒；
+  第一句话不用再等云端电脑唤醒；刚从休眠里叫醒的，热身时再确认里面的网关真能响应（grokbot_client.confirm_awake），
+  云端本来醒着时不做这一步；
+- 话发不出去（会话起不来、sendPrompt 失败且查不到送达记录）就说"发送失败，请再说一次"，不转后台、不自动重发；
 - 对话记录在云端，不需要接续逻辑；
 - 被打断（含等超时）后 Bot 在云端继续做，做完的回复进待汇报箱（core/agent/reports.py），设备空闲时念；
   云端电脑还在唤醒时就被打断或断开，这句话也照样发出去，发完直接转后台盯着（hand_off）；
@@ -109,6 +111,11 @@ class LLMProvider(AgentProvider):
 
     def _voice_error(self, kind: ErrorKind) -> str:
         return voice_for(kind)
+
+    def _stall_note(self, st: ConnState) -> str:
+        # 发送一开始会话就报 tools_running=1，看门狗只可能在发出去之前触发：这句话没发出去，播报"发送失败"
+        stage = getattr(st.agent, "stage", "") if st.agent else "启动会话"
+        return f"（卡在「{stage or '发送前'}」，这句话还没发出去，按发送失败处理）"
 
     # ---------- 会话 ----------
 

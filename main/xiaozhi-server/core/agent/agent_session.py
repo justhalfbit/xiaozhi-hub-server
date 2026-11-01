@@ -20,6 +20,7 @@ class ErrorKind(str, Enum):
     PROCESS_EXITED = "process_exited"
     TIMEOUT = "timeout"
     STALLED = "stalled"
+    SEND_FAILED = "send_failed"  # 话没发出去（云端 Agent 用；本机进程的 Claude Code 不会有）
     UNKNOWN = "unknown"
 
 
@@ -34,6 +35,7 @@ VOICE_ERROR_MESSAGES = {
     ErrorKind.PROCESS_EXITED: "Claude Code 意外退出了，再说一次试试。",
     ErrorKind.TIMEOUT: "这件事做得太久，我先停下了。想接着做的话，跟我说继续就行。",
     ErrorKind.STALLED: "Claude 那边一直没有回应，可能是网络或服务有点慢，我先停下了。稍后跟我说继续，就能接着做。",
+    ErrorKind.SEND_FAILED: "发送失败，请再说一次。",
     ErrorKind.UNKNOWN: "出了点小问题，再说一次试试。",
 }
 

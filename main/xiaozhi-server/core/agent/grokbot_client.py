@@ -42,6 +42,12 @@ REFRESH_AHEAD = 300  # access token 到期前这么多秒就续期
 WAKE_TIMEOUT = 180  # 云端电脑休眠时最多等多久醒来
 WAKE_POLL = 3  # 唤醒期间每隔多久问一次就绪了没
 ENSURE_TIMEOUT = 60  # 单次 EnsureSandBox 最多等多久；冷启动时会超时，WAKE_TIMEOUT 之内重试
+# 刚从休眠里叫醒时 EnsureSandBox 已经报 RUNNING，里面的网关却可能一两分钟不响应（2026-11-01 真机：休眠 7 小时后
+# 叫醒，读对话尾部卡住一分多钟）。设备日志统计：醒着时 EnsureSandBox 1–3 秒返回，刚醒的 4.6–10 秒，按这个分界判断
+WAKE_SLOW = 4  # EnsureSandBox（含重试）用了这么久，就当云端电脑是刚叫醒的
+WAKE_PROBE_MAX = 45  # 刚叫醒时最多花这么久（从醒来算起）确认网关能响应
+WAKE_PROBE_TIMEOUT = 5  # 确认网关时单次请求的超时
+WAKE_PROBE_PAUSE = 2  # 确认网关时两次请求的间隔
 STREAM_READ_TIMEOUT = 45  # 事件流每 15 秒一个 ping，45 秒没字节就当断了
 STREAM_BACKOFF = (1, 2, 4, 8, 10)
 AUTH_RETRY = 60  # 登录失效时事件流多久再试一次
@@ -199,6 +205,7 @@ class GrokBotClient:
         self.logger = logger
         self.client_version = client_version
         self.conn: Optional[dict] = None  # EnsureSandBox 的结果：gatewayUrl、gatewayToken、networkToken、runState
+        self.woke_at: Optional[float] = None  # 云端电脑刚叫醒、网关还没确认能响应时，醒来的时刻（monotonic）
         self._session: Optional[aiohttp.ClientSession] = None
         self._refresh_lock: Optional[asyncio.Lock] = None
         self._ensure_lock: Optional[asyncio.Lock] = None
@@ -360,8 +367,10 @@ class GrokBotClient:
         if self._ensure_lock is None:
             self._ensure_lock = asyncio.Lock()
         async with self._ensure_lock:
-            deadline = time.monotonic() + WAKE_TIMEOUT
+            t0 = time.monotonic()
+            deadline = t0 + WAKE_TIMEOUT
             refreshed = False
+            waited = False  # 中途看到过还没就绪（或请求挂到超时）：肯定是在唤醒
             while True:
                 try:
                     status, hdrs, body = await self._request(
@@ -373,6 +382,7 @@ class GrokBotClient:
                     if not isinstance(e.__cause__, asyncio.TimeoutError) or time.monotonic() > deadline:
                         raise
                     self._log("info", f"EnsureSandBox {int(ENSURE_TIMEOUT)} 秒没返回，云端电脑可能还在醒，再问一次")
+                    waited = True
                     continue
                 if status == 401 and not refreshed:
                     # token 看着还没过期却被拒：强制续期一次再试；还不行就要重新登录
@@ -390,12 +400,42 @@ class GrokBotClient:
                     if not host.endswith(GATEWAY_SUFFIXES) and not host.startswith(("127.", "localhost")):
                         raise GrokBotError(ErrorKind.SERVER, f"网关地址不在预期域名内：{host}")
                     self.conn = body
-                    self._log("info", f"云端电脑就绪 runState={body.get('runState')} 网关 {host}")
+                    took = time.monotonic() - t0
+                    woke = waited or took >= WAKE_SLOW
+                    if woke:
+                        self.woke_at = time.monotonic()
+                    self._log("info", f"云端电脑就绪 runState={body.get('runState')} 网关 {host}（{took:.1f}s"
+                                      f"{'，像是刚叫醒，用之前先确认网关能响应' if woke else ''}）")
                     return body
                 if time.monotonic() > deadline:
                     raise GrokBotError(ErrorKind.TIMEOUT, f"云端电脑 {WAKE_TIMEOUT} 秒内没醒（runState={body.get('runState')}）")
                 self._log("info", f"云端电脑还没就绪（runState={body.get('runState')}），{WAKE_POLL} 秒后重试")
+                waited = True
                 await _sleep(WAKE_POLL)
+
+    async def confirm_awake(self) -> None:
+        """云端电脑刚叫醒（见 WAKE_SLOW）时，用一个很轻的请求（listAgents）确认里面的网关真能响应，
+        单次 WAKE_PROBE_TIMEOUT 秒、隔 WAKE_PROBE_PAUSE 秒再试，从醒来算起最多 WAKE_PROBE_MAX 秒，至少试一次。
+        确认不了抛 GrokBotError。不是刚叫醒的（或之后已经有请求成功过）什么都不做。"""
+        if self.woke_at is None:
+            return
+        deadline = self.woke_at + WAKE_PROBE_MAX
+        t0 = time.monotonic()
+        tries = 0
+        while True:
+            tries += 1
+            try:
+                await self.call("listAgents", retry=False, timeout=WAKE_PROBE_TIMEOUT)
+            except GrokBotError as e:
+                if e.kind == ErrorKind.AUTH or time.monotonic() + WAKE_PROBE_PAUSE >= deadline:
+                    raise GrokBotError(e.kind, f"云端电脑刚叫醒，网关试了 {tries} 次（{time.monotonic() - t0:.1f}s）"
+                                               f"都没响应：{e.detail[:160]}")
+                self._log("info", f"云端电脑刚叫醒，网关还没响应（第 {tries} 次：{e.detail[:80]}），"
+                                  f"{WAKE_PROBE_PAUSE} 秒后再试")
+                await _sleep(WAKE_PROBE_PAUSE)
+                continue
+            self._log("info", f"云端电脑刚叫醒，网关已能响应（第 {tries} 次，{time.monotonic() - t0:.1f}s）")
+            return  # call() 成功时已经清掉 woke_at
 
     # ----- 网关 -----
 
@@ -431,22 +471,24 @@ class GrokBotClient:
             return await self.call(method, args, retry=False, timeout=timeout)
         if not 200 <= status < 300:
             raise GrokBotError(ErrorKind.SERVER, f"{method} HTTP {status} {str(body)[:200]}")
+        self.woke_at = None  # 网关响应了：刚叫醒的也不用再确认
         return body
 
     async def list_agents(self) -> List[dict]:
         agents = await self.call("listAgents")
         return [a for a in agents if isinstance(a, dict)] if isinstance(agents, list) else []
 
-    async def send_prompt(self, agent_id: str, text: str, nonce: str) -> dict:
+    async def send_prompt(self, agent_id: str, text: str, nonce: str, timeout: float = 60) -> dict:
         res = await self.call("sendPrompt", {
             "agentId": agent_id, "prompt": text, "clientNonce": nonce,
             "directAddressedAcceptance": True, "source": "desktop", "sendSource": "chat",
             "initiator": "user", "composedAtMs": int(time.time() * 1000),
-        }, retry=False)
+        }, retry=False, timeout=timeout)
         return res if isinstance(res, dict) else {"raw": res}
 
-    async def acceptance_status(self, agent_id: str, nonce: str) -> dict:
-        res = await self.call("promptAcceptanceStatus", {"accountSlot": "host", "agentId": agent_id, "clientNonce": nonce})
+    async def acceptance_status(self, agent_id: str, nonce: str, timeout: float = 60) -> dict:
+        res = await self.call("promptAcceptanceStatus", {"accountSlot": "host", "agentId": agent_id, "clientNonce": nonce},
+                              timeout=timeout)
         return res if isinstance(res, dict) else {"raw": res}
 
     async def transcript_tail(self, agent_id: str, limit: int = 10) -> List[dict]:

@@ -75,6 +75,9 @@ class FakeCloud:
         self.tail_hold = 0  # 接下来这么多次读尾部挂一会儿才返回
         self.tail_waiting = False
         self.acceptance = {"status": "accepted"}
+        self.acceptance_fail = False  # promptAcceptanceStatus 返回 500
+        self.list_calls = 0
+        self.list_hold = 0  # 接下来这么多次 listAgents 挂 0.5 秒才返回（刚叫醒，网关还不响应）
         self.hibernate_once = False
         self.tail_fail = 0  # 接下来这么多次 getAgentTranscriptTail 返回 500
         self.window_fail = 0  # 同上，getAgentTranscriptWindow
@@ -136,6 +139,10 @@ class FakeCloud:
         return None
 
     async def list_agents(self, request):
+        self.list_calls += 1
+        if self.list_hold:
+            self.list_hold -= 1
+            await real_sleep(0.5)
         return self._check(request) or web.json_response(self.agents)
 
     async def send_prompt(self, request):
@@ -149,6 +156,8 @@ class FakeCloud:
         return web.json_response({"accepted": True})
 
     async def acceptance_status(self, request):
+        if self.acceptance_fail:
+            return web.Response(status=500, text="status boom")
         return web.json_response(self.acceptance)
 
     async def tail(self, request):
@@ -494,7 +503,8 @@ async def test_send_failure_not_delivered(cloud, hub):
     s = GrokBotSession(hub, cfg())
     await s.start()
     evs = await collect(s)
-    assert isinstance(evs[-1], Error) and evs[-1].kind == ErrorKind.SERVER and "没收到" in evs[-1].voice_message
+    assert isinstance(evs[-1], Error) and evs[-1].kind == ErrorKind.SEND_FAILED
+    assert evs[-1].voice_message == gs.SEND_FAILED_NOTICE and len(cloud.sent) == 1  # 不自动重发
     await s.close()
 
 
@@ -701,8 +711,10 @@ def test_provider_self_check_without_login(tmp_path, monkeypatch, caplog):
 
 
 def test_voice_messages_cover_kinds():
-    for kind in (ErrorKind.AUTH, ErrorKind.SERVER, ErrorKind.TIMEOUT, ErrorKind.STALLED, ErrorKind.PROCESS_EXITED):
+    for kind in (ErrorKind.AUTH, ErrorKind.SERVER, ErrorKind.TIMEOUT, ErrorKind.PROCESS_EXITED):
         assert "Grok Bot" in gs.voice_for(kind)
+    # 看门狗判卡住只会在发出去之前：说发送失败，不说"一直没有回应"
+    assert gs.voice_for(ErrorKind.STALLED) == gs.voice_for(ErrorKind.SEND_FAILED) == gs.SEND_FAILED_NOTICE
     assert gs.voice_for(ErrorKind.NOT_INSTALLED) == gs.VOICE_MESSAGES[ErrorKind.UNKNOWN]
 
 
@@ -1447,3 +1459,192 @@ async def test_provider_timeout_interrupt_turns_into_watch(cloud, hub):
     await wait_until(lambda: got, timeout=3)
     assert got == ["孙悟空做完了：做完了。"]
     await s.close()
+
+
+# ---------- 发送失败（2026-11-01 真机：云端电脑休眠 7 小时后叫醒，读对话尾部卡住，看门狗放弃，话根本没发）----------
+
+def bot_reply_script(cloud, text="好。"):
+    async def script():
+        await wait_until(lambda: cloud.sent)
+        await cloud.push("agent-upserted", {"agent": {"id": "bot-1", "isRunning": True}})
+        await cloud.push("transcript", {"agentId": "bot-1", "type": "appended", "entry": {**echo_entry(cloud), "seq": 10}})
+        await cloud.push("transcript", {"agentId": "bot-1", "type": "appended", "entry": reply_entry(text, seq=11)})
+        await cloud.push("agent-upserted", {"agent": {"id": "bot-1", "isRunning": False}})
+    return script
+
+
+async def test_baseline_tail_timeout_skips_and_sends(cloud, hub):
+    """读对话尾部挂住：baseline_timeout 秒后跳过，照常发，靠回显的 seq 分新旧。"""
+    cloud.tail_hold = 1
+    s = GrokBotSession(hub, cfg(baseline_timeout=0.1))
+    await s.start()
+    task = asyncio.ensure_future(bot_reply_script(cloud)())
+    t0 = time.monotonic()
+    evs = await collect(s)
+    await task
+    assert len(cloud.sent) == 1 and texts(evs) == ["好。"] and isinstance(evs[-1], Done)
+    sent_at = next(e for e in evs if isinstance(e, Activity) and e.label == "sent")
+    assert sent_at and time.monotonic() - t0 < 3
+    await s.close()
+
+
+async def test_send_activity_comes_before_send_prompt(cloud, hub):
+    """sendPrompt 前先报 Activity(sending, tools_running=1)：看门狗从这里起不计时，不会在 sendPrompt 半路放弃。"""
+    s = GrokBotSession(hub, cfg())
+    await s.start()
+    task = asyncio.ensure_future(bot_reply_script(cloud)())
+    labels = []
+    async for ev in s.send("你好"):
+        if isinstance(ev, Activity):
+            labels.append((ev.label, ev.tools_running, len(cloud.sent)))
+    await task
+    assert labels[0] == ("sending", 1, 0) and ("sent", 1, 1) in labels
+    await s.close()
+
+
+async def test_ensure_box_marks_woke_by_state_or_slowness(cloud, client, monkeypatch):
+    await client.ensure_box()
+    assert client.woke_at is None  # 醒着：一问就好
+    cloud.ensure_states = ["SAND_BOX_RUN_STATE_STARTING"]
+    await client.ensure_box()
+    assert client.woke_at is not None  # 中途看到还没就绪
+    await client.list_agents()
+    assert client.woke_at is None  # 网关响应过就不用再确认
+    monkeypatch.setattr(gc, "WAKE_SLOW", 0.3)
+    cloud.ensure_hold = 1  # EnsureSandBox 挂 0.5 秒才返回 RUNNING（2026-11-01 那次就是这样）
+    await client.ensure_box()
+    assert client.woke_at is not None
+
+
+@pytest.fixture
+def fast_probe(monkeypatch):
+    monkeypatch.setattr(gc, "WAKE_PROBE_TIMEOUT", 0.1)
+    monkeypatch.setattr(gc, "WAKE_PROBE_PAUSE", 0.01)
+    monkeypatch.setattr(gc, "WAKE_PROBE_MAX", 5)
+
+
+async def test_awake_box_is_not_probed(cloud, hub, fast_probe):
+    s = GrokBotSession(hub, cfg())
+    await s.start()
+    assert cloud.list_calls == 0  # 醒着时热身不多发任何请求
+    await s.close()
+
+
+async def test_woke_box_probe_succeeds_after_retries(cloud, hub, fast_probe):
+    """刚叫醒：网关前两次不响应，第三次才响应，热身等到它能响应才算就绪。"""
+    cloud.ensure_states = ["SAND_BOX_RUN_STATE_STARTING"]
+    cloud.list_hold = 2
+    s = GrokBotSession(hub, cfg())
+    await s.start()
+    assert cloud.list_calls == 3 and hub.client.woke_at is None and s.alive
+    task = asyncio.ensure_future(bot_reply_script(cloud)())
+    evs = await collect(s)
+    await task
+    assert texts(evs) == ["好。"]
+    await s.close()
+
+
+async def test_woke_box_probe_fails_is_send_failed(cloud, hub, fast_probe, monkeypatch):
+    """刚叫醒、网关一直不响应：探到总时限就放弃，算发送失败；之后再启动只试一次，不再干等一整轮。"""
+    monkeypatch.setattr(gc, "WAKE_PROBE_MAX", 0.4)
+    cloud.ensure_states = ["SAND_BOX_RUN_STATE_STARTING"]
+    cloud.list_hold = 100
+    t0 = time.monotonic()
+    with pytest.raises(AgentSessionError) as e:
+        await GrokBotSession(hub, cfg()).start()
+    assert e.value.kind == ErrorKind.SEND_FAILED and gs.voice_for(e.value.kind) == gs.SEND_FAILED_NOTICE
+    assert "网关试了" in e.value.detail and time.monotonic() - t0 < 2 and cloud.list_calls >= 2
+    calls = cloud.list_calls
+    with pytest.raises(AgentSessionError):
+        await GrokBotSession(hub, cfg()).start()
+    assert cloud.list_calls == calls + 1 and cloud.sent == []
+
+
+async def test_connected_stream_skips_probe(cloud, hub, fast_probe):
+    """事件流连着说明网关一直在响应：就算 EnsureSandBox 慢了也不探。"""
+    s1 = GrokBotSession(hub, cfg())
+    await s1.start()
+    assert await hub.wait_connected(2)
+    cloud.ensure_states = ["SAND_BOX_RUN_STATE_STARTING"]
+    s2 = GrokBotSession(hub, cfg())
+    await s2.start()
+    assert cloud.list_calls == 0
+    await s1.close()
+    await s2.close()
+
+
+async def test_start_failure_is_send_failed(cloud, hub):
+    cloud.ensure_status = [500]
+    with pytest.raises(AgentSessionError) as e:
+        await GrokBotSession(hub, cfg()).start()
+    assert e.value.kind == ErrorKind.SEND_FAILED
+
+
+async def test_send_failure_and_status_failure_is_send_failed(cloud, hub):
+    cloud.send_fail_once = True
+    cloud.acceptance_fail = True
+    s = GrokBotSession(hub, cfg())
+    await s.start()
+    evs = await collect(s)
+    assert isinstance(evs[-1], Error) and evs[-1].kind == ErrorKind.SEND_FAILED
+    assert evs[-1].voice_message == gs.SEND_FAILED_NOTICE and len(cloud.sent) == 1
+    assert s.watch_key not in gs._watches  # 没发出去：不转后台
+    await s.close()
+
+
+async def test_send_timeout_not_delivered_is_send_failed(cloud, hub):
+    """sendPrompt 挂住：send_timeout 后查送达记录，没有就说发送失败，不重发。"""
+    cloud.send_hold = 0.6
+    cloud.acceptance = {"status": "not-found"}
+    s = GrokBotSession(hub, cfg(send_timeout=0.2, connect_wait=0.1))
+    await s.start()
+    evs = await collect(s)
+    assert isinstance(evs[-1], Error) and evs[-1].voice_message == gs.SEND_FAILED_NOTICE and len(cloud.sent) == 1
+    await s.close()
+
+
+async def test_send_timeout_but_delivered_continues(cloud, hub):
+    cloud.send_hold = 0.6
+    s = GrokBotSession(hub, cfg(send_timeout=0.2, connect_wait=0.1))
+    await s.start()
+    task = asyncio.ensure_future(bot_reply_script(cloud)())
+    evs = await collect(s)
+    await task
+    assert texts(evs) == ["好。"] and isinstance(evs[-1], Done) and len(cloud.sent) == 1
+    await s.close()
+
+
+async def test_send_without_session_is_send_failed(cloud, hub):
+    evs = await collect(GrokBotSession(hub, cfg()))
+    assert isinstance(evs[-1], Error) and evs[-1].voice_message == gs.SEND_FAILED_NOTICE
+
+
+def test_provider_start_failure_says_send_failed(provider):
+    FakeGrokAgent.start_error = AgentSessionError(ErrorKind.SEND_FAILED, "云端电脑刚叫醒，网关试了 6 次都没响应")
+    c = conn()
+    provider.on_conn_open(c)
+    assert run(provider, c, "你好").endswith(gs.SEND_FAILED_NOTICE)
+
+
+def test_provider_stall_before_sending_says_send_failed(tmp_path, monkeypatch):
+    """还没发出去就卡住（以前是读对话尾部卡住）：看门狗放弃本轮，说发送失败，不说"一直没有回应"。"""
+    monkeypatch.setattr(grok_mod, "GrokBotSession", FakeGrokAgent)
+    monkeypatch.setattr(grok_mod, "get_hub", lambda *a, **k: None)
+    FakeGrokAgent.instances, FakeGrokAgent.script, FakeGrokAgent.start_error, FakeGrokAgent.delay = [], [], None, 0.0
+
+    async def stuck_send(self, text):
+        self.stage = "读对话尾部"
+        await real_sleep(2)
+        yield Done()
+
+    monkeypatch.setattr(FakeGrokAgent, "send", stuck_send)
+    p = grok_mod.LLMProvider({"bot_id": "bot-1", "bot_name": "孙悟空", "credentials_path": str(tmp_path / "c.json"),
+                              "stall_timeout_seconds": 0.3, "first_reply_filler": ""})
+    p.store = SessionStore(tmp_path / "s7.json", "grok_bot")
+    c = conn()
+    p.on_conn_open(c)
+    out = run(p, c, "帮我查一下明天北京的天气")
+    assert out.endswith(gs.SEND_FAILED_NOTICE) and "一直没有回应" not in out
+    note = p._stall_note(SimpleNamespace(agent=SimpleNamespace(stage="读对话尾部")))
+    assert "读对话尾部" in note and "还没发出去" in note
+    assert "启动会话" in p._stall_note(SimpleNamespace(agent=None))

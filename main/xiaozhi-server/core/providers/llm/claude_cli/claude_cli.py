@@ -650,7 +650,7 @@ class LLMProvider(LLMProviderBase):
                     if elapsed >= self.turn_timeout or stalled:
                         kind = ErrorKind.STALLED if stalled else ErrorKind.TIMEOUT
                         logger.bind(tag=TAG).warning(
-                            f"已中断本轮：{'连续 %d 秒没有任何响应' % int(self.stall_timeout) if stalled else '超过 %d 秒' % int(self.turn_timeout)}"
+                            f"已中断本轮：{'连续 %d 秒没有任何响应' % int(self.stall_timeout) + self._stall_note(st) if stalled else '超过 %d 秒' % int(self.turn_timeout)}"
                         )
                         if st.agent:
                             asyncio.run_coroutine_threadsafe(st.agent.interrupt(), self._loop)
@@ -722,6 +722,10 @@ class LLMProvider(LLMProviderBase):
         """
         if st.conn is not None:
             st.conn.last_activity_time = time.time() * 1000
+
+    def _stall_note(self, st: ConnState) -> str:
+        """看门狗判卡住时附在日志后面的说明。grok_bot 用它写清卡在发送前的哪一步。"""
+        return ""
 
     @staticmethod
     def _before_notice(tail: str, spoke: bool) -> str:

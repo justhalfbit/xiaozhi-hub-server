@@ -3,8 +3,9 @@
 和 ClaudeSession 不同，这里没有本机进程：对话记录在 Bot 的云端电脑上，天然跨连接接续，
 "会话 ID"就是 Bot 的 id。一轮的经过：
 
-1. 先记下对话尾部已有的条目（之后只播新的）；
-2. sendPrompt 发送，结果不明确时用 promptAcceptanceStatus 确认，不盲目重发；
+1. 先记下对话尾部已有的条目（之后只播新的）；最多等 baseline_timeout 秒，读不到就跳过，靠回显的 seq 分新旧；
+2. sendPrompt 发送，结果不明确时用 promptAcceptanceStatus 确认，不盲目重发；确认没送到（或查不到）就说"发送失败"，
+   让用户再说一次——发不出去不转后台、不自动重发（用户定的，怕重复）；
 3. 从事件流收：Bot 开始处理（agent-upserted）→ 我们的消息回显（transcript）→ 回复条目 → Bot 空闲；
    收到过回复、空闲 1.5 秒无新动静才算本轮结束。一条回复都没有时空闲不算数：Bot 想得久时会中途显示空闲，
    实测（2026-11-01）空闲 63 秒后才发出回复；这时一直等到回复，或空闲满 no_reply_timeout 转后台；
@@ -31,13 +32,16 @@ from core.agent.grokbot_client import GrokBotError, GrokBotHub, Subscription
 SENTENCE_END = set("。！？!?；;…~～.\n")
 WAITING_NOTICE = "Grok Bot 在等你去 App 里处理。"
 NO_REPLY_NOTICE = "Grok Bot 还没回话，回了我再告诉你。"
+SEND_FAILED_NOTICE = "发送失败，请再说一次。"
 
 # 出错时播报给用户的话（代替 agent_session 里 Claude 的默认文案）
 VOICE_MESSAGES = {
     ErrorKind.AUTH: "Grok Bot 还没登录，或者登录过期了，请到管理后台重新登录。",
     ErrorKind.SERVER: "Grok Bot 那边暂时连不上，稍后再试吧。",
     ErrorKind.TIMEOUT: "Grok Bot 这件事做得太久，我先不等了。它做完后我再告诉你。",
-    ErrorKind.STALLED: "Grok Bot 一直没有回应，我先停下了。",
+    # 看门狗判卡住只会发生在发出去之前：发送一开始就报 Activity(tools_running=1)，之后看门狗不再计时
+    ErrorKind.STALLED: SEND_FAILED_NOTICE,
+    ErrorKind.SEND_FAILED: SEND_FAILED_NOTICE,
     ErrorKind.PROCESS_EXITED: "和 Grok Bot 的连接断开了，再说一次试试。",
     ErrorKind.UNKNOWN: "出了点小问题，再说一次试试。",
 }
@@ -57,6 +61,9 @@ class GrokBotSessionConfig:
     done_delay: float = 1.5  # 收到过回复、Bot 空闲后再等这么久没新动静才算本轮结束
     no_reply_timeout: float = 90  # 消息送到了、一条回复都没有、Bot 连续空闲这么久：设备这边先结束，转后台盯着
     connect_wait: float = 3  # 发送前最多等事件流连上这么久
+    baseline_timeout: float = 5  # 发送前读对话尾部最多等这么久，读不到就跳过（不能让它卡住整轮）
+    send_timeout: float = 15  # sendPrompt 最多等这么久（平时 0.4–1.3 秒），超时就查送达记录
+    status_timeout: float = 8  # 查送达记录（promptAcceptanceStatus）最多等这么久
     watch_max: float = 2 * 3600  # 还没拿到回复就结束了（打断、超时、断开、没回话）：最多在后台盯多久
     linger_max: float = 600  # 正常做完后再盯多久，接住之后补发的消息；每补到一批再顺延这么久
     tail_limit: int = 20
@@ -247,6 +254,7 @@ class GrokBotSession(AgentSession):
         self._interrupted = False
         self._started = False
         self._in_turn = False
+        self.stage = ""  # 这一轮走到哪一步了（读对话尾部、等事件流、发送中、已发出），看门狗判卡住时写进日志
 
     @property
     def watch_key(self):
@@ -267,10 +275,16 @@ class GrokBotSession(AgentSession):
     # ---------- 生命周期 ----------
 
     async def start(self) -> None:
+        """确认云端电脑醒着、订阅事件流。刚从休眠里叫醒的，再确认里面的网关真能响应才算就绪（见 confirm_awake）；
+        事件流本来就连着说明网关一直在响应，不用确认。失败时登录问题照实报，其他都是"这句话发不出去"。"""
+        client = self.hub.client
+        was_connected = self.hub.connected
         try:
-            await self.hub.client.ensure_box()
+            await client.ensure_box()
+            if not was_connected:
+                await client.confirm_awake()
         except GrokBotError as e:
-            raise AgentSessionError(e.kind, e.detail)
+            raise AgentSessionError(e.kind if e.kind == ErrorKind.AUTH else ErrorKind.SEND_FAILED, e.detail)
         self._sub = self.hub.subscribe(self.config.bot_id)
         self._started = True
 
@@ -412,9 +426,10 @@ class GrokBotSession(AgentSession):
 
     async def send(self, text: str) -> AsyncIterator[AgentEvent]:
         if not self._started or self._sub is None:
-            yield Error(ErrorKind.PROCESS_EXITED, "session not started", voice=voice_for(ErrorKind.PROCESS_EXITED))
+            yield Error(ErrorKind.PROCESS_EXITED, "会话没有启动，没法发送", voice=SEND_FAILED_NOTICE)
             return
         self._interrupted = False
+        self.stage = ""
         # 从这里起就算在一轮里：发送前后（读尾部、sendPrompt 还没返回）设备断开也当打断，话照样发，转后台盯着
         self._in_turn = True
         try:
@@ -441,12 +456,17 @@ class GrokBotSession(AgentSession):
         while not queue.empty():
             queue.get_nowait()
 
-        # 发送前记下对话里已有的条目，之后只念新的。读不到也照常发：之后用回显的 seq 分新旧
+        # 发送前记下对话里已有的条目，之后只念新的。读不到（含 baseline_timeout 秒没返回）也照常发：
+        # 之后用回显的 seq 分新旧。2026-11-01 真机：云端电脑刚叫醒时这一步卡了一分多钟，整轮被看门狗放弃，话根本没发
+        self.stage = "读对话尾部"
         have_baseline = True
         try:
-            for e in await client.transcript_tail(bot_id, cfg.tail_limit):
+            for e in await asyncio.wait_for(client.transcript_tail(bot_id, cfg.tail_limit), cfg.baseline_timeout):
                 if e.get("id"):
                     seen[str(e["id"])] = ""
+        except asyncio.TimeoutError:
+            have_baseline = False
+            self._log("warning", f"读对话尾部 {cfg.baseline_timeout:g} 秒没返回，跳过，改用回显序号分新旧")
         except GrokBotError as e:
             if e.kind == ErrorKind.AUTH:
                 yield Error(e.kind, e.detail, voice=voice_for(e.kind))
@@ -454,30 +474,50 @@ class GrokBotSession(AgentSession):
             have_baseline = False
             self._log("warning", f"读对话尾部失败，改用回显序号分新旧：{e.detail}")
 
+        self.stage = "等事件流连上"
         if not self.hub.connected and not await self.hub.wait_connected(cfg.connect_wait):
             self._log("warning", f"事件流 {cfg.connect_wait} 秒内没连上，先发送，靠补拉和轮询兜底")
 
         tracker = Tracker(cfg, nonce, sent_text, seen, self.hub.generation, self._log)
         tracker.have_baseline = have_baseline
+        # 从这里起看门狗不再计时（tools_running=1）：sendPrompt 自己有超时，超时后查送达记录，不能被看门狗半路放弃、
+        # 话可能已经送到却说没发出去
+        self.stage = "发送中"
+        yield Activity("sending", tools_running=1)
+        failure: Optional[GrokBotError] = None
         try:
-            res = await client.send_prompt(bot_id, sent_text, nonce)
+            # 外面再套一层总时限：网关连接丢了时 send_prompt 要先重新获取连接，那一步不受单次请求超时管
+            res = await asyncio.wait_for(client.send_prompt(bot_id, sent_text, nonce, timeout=cfg.send_timeout),
+                                         cfg.send_timeout + cfg.connect_wait)
             self._log("info", f"{tracker._since()} sendPrompt 返回 {json.dumps(res, ensure_ascii=False)[:120]}")
+        except asyncio.TimeoutError:
+            failure = GrokBotError(ErrorKind.SERVER, f"sendPrompt {cfg.send_timeout + cfg.connect_wait:g} 秒没返回")
         except GrokBotError as e:
+            failure = e
+        if failure is not None:
+            e = failure
             if e.kind == ErrorKind.AUTH:
                 yield Error(e.kind, e.detail, voice=voice_for(e.kind))
                 return
             # 结果不明确：查送达记录。只有查不到记录才是真的没送到（也只有这时才能用同一个 nonce 重发，这里不重发）
             try:
-                status = await client.acceptance_status(bot_id, nonce)
-            except GrokBotError as e2:
-                yield Error(ErrorKind.SERVER, f"sendPrompt 失败：{e.detail}；查送达状态也失败：{e2.detail}",
-                            voice=voice_for(ErrorKind.SERVER))
+                status = await asyncio.wait_for(client.acceptance_status(bot_id, nonce, timeout=cfg.status_timeout),
+                                                cfg.status_timeout)
+            except (GrokBotError, asyncio.TimeoutError) as e2:
+                detail2 = e2.detail if isinstance(e2, GrokBotError) else f"{cfg.status_timeout:g} 秒没返回"
+                self._log("warning", f"发送失败：sendPrompt 出错（{e.detail[:160]}），查送达记录也失败（{detail2[:160]}），"
+                                     f"不知道送没送到，按没送到处理，不重发")
+                yield Error(ErrorKind.SEND_FAILED, f"sendPrompt 失败：{e.detail}；查送达状态也失败：{detail2}",
+                            voice=SEND_FAILED_NOTICE)
                 return
-            self._log("warning", f"sendPrompt 失败：{e.detail}；送达状态 {json.dumps(status, ensure_ascii=False)[:200]}")
-            if "not-found" in json.dumps(status).lower() or "not_found" in json.dumps(status).lower():
-                yield Error(ErrorKind.SERVER, f"消息没有送到：{e.detail}", voice="Grok Bot 没收到这句话，再说一次试试。")
+            status_text = json.dumps(status, ensure_ascii=False)
+            if "not-found" in status_text.lower() or "not_found" in status_text.lower():
+                self._log("warning", f"发送失败：sendPrompt 出错（{e.detail[:160]}），送达记录里没有这句话：{status_text[:200]}")
+                yield Error(ErrorKind.SEND_FAILED, f"消息没有送到：{e.detail}", voice=SEND_FAILED_NOTICE)
                 return
+            self._log("warning", f"sendPrompt 出错（{e.detail[:160]}），但送达记录显示已送到，照常等回复：{status_text[:200]}")
 
+        self.stage = "已发出"
         yield Activity("sent", tools_running=1)
         held: List[str] = []  # 设备不听了（打断、断开）之后才到的回复，例如断开时正在补读：不念，留着汇报
         try:

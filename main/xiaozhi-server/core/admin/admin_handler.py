@@ -209,11 +209,16 @@ class AdminHandler:
         return (self.config.get("selected_module") or {}).get(section)
 
     async def _apply_if_selected(self, section: str, name: str, changed: list) -> dict:
-        """保存条目后：改的是正在使用的条目才热加载，否则只保存。"""
+        """保存条目后：改的是正在使用的条目才热加载，否则只保存。
+
+        不是默认的条目也要同步进运行中的配置（同 /kiosk/llm/use）：呼名切模型照运行中的配置判断是否配好、
+        创建实例，不同步的话新填好 Key 的厂商叫不动，改过的设置要重启才生效。"""
         if not changed:
             return {"applied": True, "note": "没有修改"}
         merged = await self._blocking(self._merged)
         if (merged.get("selected_module") or {}).get(section) != name:
+            if name in (merged.get(section) or {}):
+                self.config.setdefault(section, {})[name] = copy.deepcopy(merged[section][name])
             return {"applied": True, "note": "已保存"}
         return await self._apply(section)
 

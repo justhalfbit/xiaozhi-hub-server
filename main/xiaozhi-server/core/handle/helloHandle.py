@@ -62,9 +62,6 @@ async def handleHelloMessage(conn: "ConnectionHandler", msg_json):
     if features and features.get("vad_end"):
         # [xiaozhi-hub] 告诉客户端这个网关会发 VAD 事件（含"什么也没识别出来"），它不必干等兜底超时
         welcome = {**welcome, "features": {**(welcome.get("features") or {}), "vad_end": True}}
-    if features and features.get("stt_partial"):
-        # [xiaozhi-hub] 说话中途会发已识别的前半句（{"type": "stt", "state": "partial"}，见 asr/base.py）
-        welcome = {**welcome, "features": {**(welcome.get("features") or {}), "stt_partial": True}}
     await conn.websocket.send(json.dumps(welcome))
 
     # The device waits for the server hello before processing MCP messages.

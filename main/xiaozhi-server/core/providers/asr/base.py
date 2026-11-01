@@ -18,8 +18,7 @@ from core.handle.receiveAudioHandle import startToChat
 from core.handle.reportHandle import enqueue_asr_report
 from core.utils.util import remove_punctuation_and_length
 from core.handle.receiveAudioHandle import handleAudioMessage
-from core.agent.asr_text import correct_and_record, apply_corrections, corrections_of  # [xiaozhi-hub]
-from core.utils.textUtils import get_string_no_punctuation_or_emoji  # [xiaozhi-hub]
+from core.agent.asr_text import correct_and_record  # [xiaozhi-hub]
 from core.utils import reply_echo, turn_gen  # [xiaozhi-hub]
 from typing import Optional, Tuple, List, NamedTuple, TYPE_CHECKING
 
@@ -45,41 +44,6 @@ async def send_vad_event(conn: "ConnectionHandler", state: str):
         return
     try:
         await conn.websocket.send(json.dumps({"type": "vad", "state": state, "session_id": conn.session_id}))
-    except Exception:
-        pass
-
-
-async def send_partial(conn: "ConnectionHandler", future, gen: int):
-    """[xiaozhi-hub] 边说边上屏：说话中途识别完一段，就把这句话到目前为止识别出的文字发给 hello 里声明了
-    features.stt_partial 的客户端：{"type": "stt", "state": "partial", "text": ...}。文字是从第一段起
-    连续识别完的几段拼起来的（后面的段先识别完就等前面的），每条都是全部前文，客户端替换上一条即可。
-    只是把已有的分段结果发出去，不多识别。这句已经说完（之后发最终 stt 或 vad empty）、换了下一句、
-    被打断（代次变了）、或者只是回复的回声，就不发。"""
-    try:
-        await future
-    except Exception:
-        return
-    segments = getattr(conn, "asr_segments", None) or []
-    if future not in segments or conn.client_voice_stop or turn_gen.stale(conn, gen):
-        return
-    texts = []
-    for f in segments:
-        if not f.done():
-            break
-        texts.append("" if f.cancelled() or f.exception() else f.result())
-    if segments.index(future) >= len(texts):
-        return  # 前面还有段没识别完：等它识别完时会连这段一起发
-    text = join_segments(texts)
-    try:
-        text = apply_corrections(text, corrections_of(getattr(conn, "config", None)))
-    except Exception:
-        pass
-    text = get_string_no_punctuation_or_emoji(text)
-    if not text or (reply_echo.during_reply(conn) and reply_echo.is_echo(conn, text)):
-        return
-    try:
-        await conn.websocket.send(json.dumps(
-            {"type": "stt", "state": "partial", "text": text, "session_id": conn.session_id}, ensure_ascii=False))
     except Exception:
         pass
 
@@ -192,8 +156,6 @@ class ASRProviderBase(ABC):
         conn.asr_segments = (getattr(conn, "asr_segments", None) or []) + [future]
         conn.asr_segment_start = end
         logger.bind(tag=TAG).debug(f"边说边识别：第 {len(conn.asr_segments)} 段 {len(pcm) / 32000:.1f} 秒")
-        if (conn.features or {}).get("stt_partial"):
-            asyncio.create_task(send_partial(conn, future, turn_gen.current(conn)))
 
     # 处理语音停止
     async def handle_voice_stop(self, conn: "ConnectionHandler", asr_audio_task: List[bytes],

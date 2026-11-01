@@ -29,7 +29,7 @@ def test_unreachable_test_gives_up_fast_without_retries(monkeypatch):
                                         "base_url": "https://zenmux.ai/api/v1"})
     assert not result["ok"] and "连不上接口地址" in result["error"] and "代理" in result["error"]
     p = made[0]
-    assert p.config["timeout"] == ah.TEST_TIMEOUT and ah.TEST_TIMEOUT["connect"] <= 5   # 页面传来的 20 秒被替换
+    assert p.config["timeout"] == ah.TEST_TIMEOUT and ah.TEST_TIMEOUT["connect"] <= 10   # 页面传来的 20 秒被替换
     assert p.client.max_retries == 0
 
 

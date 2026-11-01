@@ -37,8 +37,10 @@ TAG = __name__
 # 被卡住的操作（如连不上的测试连接）占满它时，保存要排队十几秒，识别也跟着变慢
 _POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="admin")
 
-# 测试连接最多等这么久：连不上（地址被墙时连接不报错、一直没回应）就尽快告诉用户，也不占着线程
-TEST_TIMEOUT = {"connect": 5.0, "read": 15.0, "write": 5.0, "pool": 2.0}
+# 测试连接最多等这么久：连不上（地址被墙时连接不报错、一直没回应）就尽快告诉用户，也不占着线程。
+# connect 只管建立连接（TCP + TLS，走代理、连国外也就一两秒）；模型想多久算在 read 里，
+# 它是两段数据之间最多等多久，回复要 8 秒也没问题
+TEST_TIMEOUT = {"connect": 10.0, "read": 15.0, "write": 5.0, "pool": 2.0}
 logger = setup_logging()
 COOKIE_NAME = "xz_admin"
 STATIC_DIR = Path(__file__).parent / "static"

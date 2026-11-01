@@ -1557,7 +1557,8 @@ function renderLastUpdate(u) {
   } else {
     html = `<div class="banner ${u.state === "failed" ? "err" : "warn"}">${esc(when)} 更新没有完成：${esc(u.error || "")}${u.changed ? "" : "。网关仍是原来的版本"}</div>`;
   }
-  if (u.log && u.log.length) html += `<details class="adv" style="margin:0 0 14px;padding:0;border:0"><summary>更新输出</summary><pre class="update-log">${esc(u.log.join("\n"))}</pre></details>`;
+  // 没成功时展开输出：原因（如"按上面的提示处理"）就在里面
+  if (u.log && u.log.length) html += `<details class="adv" style="margin:0 0 14px;padding:0;border:0" ${u.state === "done" ? "" : "open"}><summary>更新输出</summary><pre class="update-log">${esc(u.log.join("\n"))}</pre></details>`;
   box.style.marginTop = "14px";
   box.innerHTML = html;
 }

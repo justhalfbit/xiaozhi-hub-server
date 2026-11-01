@@ -149,8 +149,9 @@ class Updater:
         src = info["source"]
         shallow = self._out("rev-parse", "--is-shallow-repository") == "true"
         fetch = [*_GIT_NET, "fetch", "--no-tags", "--quiet"]
-        # 一键安装是只含最新一次提交的浅克隆：取当前版本之后的提交，才列得出更新说明
-        attempts = [["--shallow-since=" + info["current"]["date"]], ["--depth=1"]] if shallow else [[]]
+        # 一键安装是只含最新一次提交的浅克隆：取浅克隆边界之后的提交，接得上历史才列得出更新说明、看得出分叉
+        attempts = [["--shallow-since=" + self._shallow_since(info["current"]["date"])], ["--depth=1"]] \
+            if shallow else [[]]
         started = time.monotonic()
         for extra in attempts:
             left = timeout - (time.monotonic() - started)
@@ -186,6 +187,17 @@ class Updater:
             return {**base, "state": "dirty", "files": files,
                     "message": "有新版本，但下面这些文件被改过，更新会和它们冲突。请先撤销（git checkout -- <文件>）或备份后再更新"}
         return {**base, "state": "available", "message": "有新版本"}
+
+    def _shallow_since(self, fallback: str) -> str:
+        """浅克隆本地最早那个提交（边界）的时间（同 update.sh）。
+
+        不能用当前版本的时间：本地有自己的提交时它比和远端共同的那个提交新，按它取回来的历史接不上，
+        分叉会被当成「接不上历史」，判成有新版本，更新时直接切过去把本地提交丢掉。
+        """
+        roots = self._out("rev-list", "--max-parents=0", "HEAD").split()
+        out = self._out("log", "--no-walk", "--format=%ct %cI", *roots) if roots else ""
+        dates = sorted((int(t), d) for t, _, d in (line.partition(" ") for line in out.splitlines()) if t.isdigit())
+        return dates[0][1] if dates else fallback
 
     def _is_ancestor(self, a: str, b: str) -> bool:
         try:

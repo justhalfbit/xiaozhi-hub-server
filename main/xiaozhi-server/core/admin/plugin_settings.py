@@ -124,7 +124,20 @@ def test_values(settings_id: str, payload: dict, merged: dict) -> dict:
 # ---------- 测试函数 ----------
 # settings_id -> async (values) -> dict；values 是 test_values 整理好的完整设置，失败时抛 ValueError
 
-TESTS = {}
+async def _test_web_search(values: dict) -> dict:
+    from plugins_func.functions import web_search
+
+    settings = web_search.settings_of({"plugins": {"web_search": values}})
+    try:
+        result = await web_search.search(settings, "今天的重要新闻")
+    except web_search.SearchError as e:
+        raise ValueError(str(e))
+    if not result.results:
+        raise ValueError("接口执行了搜索，但没有返回结果")
+    return {"seconds": result.seconds, "count": len(result.results), "first": result.results[0]["title"]}
+
+
+TESTS = {"web_search": _test_web_search}
 
 
 def _redact(message: str, values: dict, settings_id: str) -> str:

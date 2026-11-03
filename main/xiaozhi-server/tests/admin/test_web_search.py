@@ -22,7 +22,11 @@ OK_BODY = {
             {"type": "web_search_result", "title": "第二条", "url": "https://b.example/2"},
         ]},
         {"type": "text", "text": "今天的要点是"},
-        {"type": "text", "text": "某某事件。"},
+        {"type": "text", "text": "某某事件。", "citations": [
+            {"type": "web_search_result_location", "url": "https://b.example/2", "title": "第二条",
+             "cited_text": "某某事件\n今天上午发生。"},
+            {"type": "web_search_result_location", "url": "https://b.example/2", "cited_text": "影响很大。"},
+            {"type": "web_search_result_location", "url": "https://b.example/2", "cited_text": "影响很大。"}]},
     ]
 }
 
@@ -71,9 +75,30 @@ async def test_search_request_and_parse(fake_api):
     assert body["tools"] == [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}]
     assert body["messages"] == [{"role": "user", "content": "今天新闻"}]
     assert r.summary == "今天的要点是某某事件。" and r.queries == ["今天新闻"]
-    assert [x["title"] for x in r.results] == ["第一条新闻", "第二条"]  # 同一个链接只留一条
+    # 同一个链接只留一条；有原文片段（被引用过）的排前面，片段去掉换行、重复的不拼
+    assert [x["title"] for x in r.results] == ["第二条", "第一条新闻"]
+    assert r.results[0]["snippet"] == "某某事件 今天上午发生。 影响很大。" and r.results[1]["snippet"] == ""
     text = ws.format_for_llm("今天新闻", r)
-    assert "总结：今天的要点是某某事件。" in text and "1. 第一条新闻（2026-11-03）" in text and "https://" not in text
+    assert "总结：今天的要点是某某事件。" in text and "https://" not in text
+    assert "1. 第二条：某某事件 今天上午发生。 影响很大。" in text and "2. 第一条新闻（2026-11-03）" in text
+    assert "以原文片段为准" in text and "一两句" in text
+
+
+def test_snippet_and_source_limits():
+    long = "字" * 400
+    data = {"content": [
+        {"type": "server_tool_use", "id": "s", "input": {"query": "q"}},
+        {"type": "web_search_tool_result", "content": [
+            {"type": "web_search_result", "title": f"t{i}", "url": f"https://x/{i}"} for i in range(9)]},
+        {"type": "text", "text": "x", "citations": [{"url": "https://x/8", "cited_text": long}]},
+    ]}
+    r = ws._parse(data)
+    assert r.results[0]["title"] == "t8" and len(r.results[0]["snippet"]) == ws.SNIPPET_LIMIT + 1  # 加省略号
+    text = ws.format_for_llm("q", r)
+    assert "5. t3" in text and "6." not in text
+    r.results[0]["snippet"] = ""  # 没有引用的接口（如 DeepSeek）：不提原文片段
+    text = ws.format_for_llm("q", r)
+    assert "来源：" in text and "原文片段" not in text
 
 
 @pytest.mark.parametrize("respond, reason", [
@@ -172,7 +197,7 @@ async def test_admin_test_button(client, fake_api):
     r = await client.post("/admin/api/plugin-settings/web_search/test", json={})
     assert r.status == 400 and "API Key" in (await r.json())["error"]
     r = await (await client.post("/admin/api/plugin-settings/web_search/test", json={"api_key": "sk-good"})).json()
-    assert r == {"ok": True, "seconds": r["seconds"], "count": 2, "first": "第一条新闻"}
+    assert r == {"ok": True, "seconds": r["seconds"], "count": 2, "first": "第二条"}
     await client.post("/admin/api/plugin-settings/web_search/test",
                       json={"api_key": "sk-good", "base_url": "http://10.0.0.2:8317/v1"})
     assert str(fake_api.calls[-1].url) == "http://10.0.0.2:8317/v1/messages"

@@ -30,7 +30,8 @@ DEFAULT_MAX_USES = 5
 MAX_USES_LIMIT = 10
 # 语音场景用户在干等：连不上 5 秒就放弃，整次搜索（可能搜好几轮）最多 30 秒
 TIMEOUT = httpx.Timeout(30.0, connect=5.0)
-RESULT_LIMIT = 8  # 交给聊天模型的搜索结果条数上限
+RESULT_LIMIT = 5  # 交给聊天模型的来源条数上限
+SNIPPET_LIMIT = 150  # 每条来源的原文片段最多多少字
 ANTHROPIC_VERSION = "2023-06-01"
 
 _DEFAULT_DESCRIPTION = (
@@ -71,7 +72,7 @@ class SearchError(Exception):
 @dataclass
 class SearchResult:
     summary: str = ""
-    results: list = field(default_factory=list)  # [{"title", "url", "page_age"}]
+    results: list = field(default_factory=list)  # [{"title", "url", "page_age", "snippet"}]
     queries: list = field(default_factory=list)  # 模型实际搜的词
     seconds: float = 0.0
 
@@ -126,11 +127,33 @@ def _api_error(response: httpx.Response, api_key: str = "") -> str:
     return f"接口返回错误（{status}{'：' + message if message else ''}）"
 
 
+def _citation_snippets(blocks: list) -> dict:
+    """url -> 原文片段：搜索结果本身不带正文，只有模型回答时引用的原文（citations[].cited_text）。
+    同一来源被引用多次时拼起来，最多 SNIPPET_LIMIT 字。"""
+    snippets = {}
+    for block in blocks:
+        if not isinstance(block, dict) or block.get("type") != "text":
+            continue
+        for cite in block.get("citations") or []:
+            if not isinstance(cite, dict):
+                continue
+            url, text = str(cite.get("url") or ""), " ".join(str(cite.get("cited_text") or "").split())
+            if not url or not text:
+                continue
+            old = snippets.get(url, "")
+            if text in old or len(old) >= SNIPPET_LIMIT:
+                continue
+            joined = f"{old} {text}".strip()
+            snippets[url] = joined if len(joined) <= SNIPPET_LIMIT else joined[:SNIPPET_LIMIT] + "…"
+    return snippets
+
+
 def _parse(data) -> SearchResult:
     if not isinstance(data, dict) or not isinstance(data.get("content"), list):
         raise SearchError("接口返回的不是 Anthropic 协议的格式")
     result = SearchResult()
     texts, searched, errors, seen = [], False, [], set()
+    snippets = _citation_snippets(data["content"])
     for block in data["content"]:
         if not isinstance(block, dict):
             continue
@@ -156,7 +179,10 @@ def _parse(data) -> SearchResult:
                     continue
                 seen.add(url)
                 result.results.append({"title": str(item.get("title") or "无标题"), "url": url,
-                                       "page_age": str(item.get("page_age") or "")})
+                                       "page_age": str(item.get("page_age") or ""),
+                                       "snippet": snippets.get(url, "")})
+    # 有原文片段的（总结里引用过的）排前面，交给聊天模型时只留前几条
+    result.results.sort(key=lambda r: not r["snippet"])
     result.summary = "".join(texts).strip()
     if not searched:
         raise SearchError("接口没有执行搜索，这个接口或模型可能不支持自带搜索")
@@ -202,15 +228,21 @@ async def search(settings: dict, query: str) -> SearchResult:
 
 
 def format_for_llm(query: str, result: SearchResult) -> str:
+    """交给聊天模型：搜索模型的短总结，加前几条来源的标题、日期和原文片段（不给网址，语音用不上）。"""
     lines = [f"【联网搜索结果】搜索：{query}"]
     if result.summary:
         lines.append(f"总结：{result.summary}")
+    # 有的接口（如 DeepSeek）回答时不带引用，就只有标题和日期
+    has_snippet = any(item["snippet"] for item in result.results[:RESULT_LIMIT])
     if result.results:
-        lines.append("来源：")
+        lines.append("来源和原文片段：" if has_snippet else "来源：")
         for i, item in enumerate(result.results[:RESULT_LIMIT], 1):
             age = f"（{item['page_age']}）" if item["page_age"] else ""
-            lines.append(f"{i}. {item['title']}{age}")
-    lines.append("请根据以上结果用口语简短回答，不要念网址；结果里没有的内容不要编。")
+            snippet = f"：{item['snippet']}" if item["snippet"] else ""
+            lines.append(f"{i}. {item['title']}{age}{snippet}")
+    lines.append("回答要求：" + ("总结和原文片段对不上时，以原文片段为准；" if has_snippet else "")
+                 + "结果里没有的内容不要编。用口语先说一两句最重要的结论，不要一条条全念，也不要念网址；"
+                 "内容多的话，最后问一句用户还想听哪方面。")
     return "\n".join(lines)
 
 

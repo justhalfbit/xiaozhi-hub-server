@@ -26,6 +26,11 @@ def get(session_id: str):
     return item[0] if item else None
 
 
+def all_connections() -> list:
+    with _lock:
+        return [conn for conn, _ in _connections.values()]
+
+
 def snapshot() -> list:
     with _lock:
         items = list(_connections.items())

@@ -1220,14 +1220,22 @@ async function renderIntent(root) {
     <div class="card panel" id="plugins-box">
       <div class="plugins">
         ${d.plugins.map((p) => `<label class="plugin ${p.enabled ? "on" : ""}"><input type="checkbox" data-fn="${esc(p.name)}" ${p.enabled ? "checked" : ""}>
-          <div><b>${esc(p.label)}</b>${p.needs_config ? ' <span class="pill warn">还没配置</span>' : ""}<small>${esc(p.desc)}</small></div></label>`).join("")}
+          <div style="flex:1"><b>${esc(p.label)}</b>${p.needs_config ? ' <span class="pill warn">还没配置</span>' : ""}<small>${esc(p.desc)}</small></div>
+          ${p.settings ? `<button type="button" class="btn sm" data-settings="${esc(p.settings)}" data-label="${esc(p.label)}">设置</button>` : ""}</label>`).join("")}
         ${d.always_on.map((p) => `<div class="plugin fixed"><input type="checkbox" checked disabled>
           <div><b>${esc(p.label)}</b> <span class="pill">始终开启</span><small>${esc(p.desc)}</small></div></div>`).join("")}
       </div>
       ${d.extra.length ? `<p class="muted small" style="margin:12px 0 0">另外保留了配置文件里手动添加的：${esc(d.extra.join("、"))}</p>` : ""}
     </div>
+    <div class="card panel hidden" id="plugin-settings" style="margin-top:12px"></div>
     <div class="actions"><button class="btn primary" id="intent-save">保存</button></div>`;
   const values = () => ({ mode, functions: [...root.querySelectorAll("[data-fn]:checked")].map((i) => i.dataset.fn) });
+  root.querySelectorAll("[data-settings]").forEach((b) => (b.onclick = (e) => {
+    e.preventDefault();   // 按钮在 label 里，不要顺带勾选插件
+    const id = b.dataset.settings;
+    const onSaved = (ok) => d.plugins.forEach((p) => { if (p.settings === id) p.needs_config = !ok; });
+    openPluginSettings(id, b.dataset.label, onSaved).catch((err) => toast(err.message, true));
+  }));
   const sync = () => {
     root.querySelectorAll("[data-mode]").forEach((b) => {
       b.classList.toggle("on", b.dataset.mode === mode);
@@ -1240,12 +1248,68 @@ async function renderIntent(root) {
     if (d.locked && b.dataset.mode !== "nointent") return toast("使用 Claude Code 时只能选“不用插件”", true);
     mode = b.dataset.mode; sync();
   }));
-  root.querySelectorAll("[data-fn]").forEach((i) => (i.onchange = sync));
+  root.querySelectorAll("[data-fn]").forEach((i) => (i.onchange = () => {
+    const p = d.plugins.find((x) => x.name === i.dataset.fn);
+    if (i.checked && p && p.needs_config) toast(`${p.label}还没配置，${p.settings ? "点旁边的「设置」填写" : "需要在配置文件里填写"}，否则用不了`, true);
+    sync();
+  }));
   sync();
-  page.dirty = snapshot(values);
+  const intentDirty = snapshot(values);
+  pluginSettingsDirty = () => false;
+  page.dirty = () => intentDirty() || pluginSettingsDirty();
   $("intent-save").onclick = (e) => busy(e.target, async () => {
     try { const r = await api("intent", values()); toast(r.note, r.failed); page.dirty = null; await openPage("intent", true); }
     catch (err) { toast(err.message, true); }
+  });
+}
+
+// 插件设置：按接口给的字段列表生成表单，显示在意图识别页插件列表下面
+let pluginSettingsDirty = () => false;
+async function openPluginSettings(id, label, onSaved) {
+  const d = await api("plugin-settings/" + encodeURIComponent(id));
+  const box = $("plugin-settings");
+  box.classList.remove("hidden");
+  const input = (f) => f.type === "secret"
+    ? `<input class="in mono" data-k="${esc(f.key)}" type="password" autocomplete="off" placeholder="${f.set ? `已配置 ${esc(f.hint_set)}，留空表示不改` : "未配置，粘贴后保存"}">`
+    : `<input class="in ${f.type === "number" ? "" : "mono"}" data-k="${esc(f.key)}" ${f.type === "number" ? `type="number" min="${f.min ?? ""}" max="${f.max ?? ""}"` : ""}
+        value="${esc(f.value ?? "")}" placeholder="${f.default !== undefined ? "留空用默认：" + esc(f.default) : ""}">`;
+  box.innerHTML = `
+    <div class="section-title" style="margin-top:0">${esc(label)} · 设置 ${d.configured ? '<span class="pill ok">已配置</span>' : '<span class="pill warn">还没配置</span>'}</div>
+    ${d.note ? `<div class="banner info">${esc(d.note)}</div>` : ""}
+    <div class="grid2">
+      ${d.fields.map((f) => `<label class="f ${f.type === "text" ? "full" : ""}">${esc(f.label)}${f.hint ? `<span class="hint">${esc(f.hint)}</span>` : ""}${input(f)}</label>`).join("")}
+    </div>
+    <p class="muted small" style="margin:8px 0 0">密钥只保存在网关的配置文件里，页面上只显示首尾 4 位。保存后马上生效，不用重启。</p>
+    <div class="actions"><span class="result" id="ps-result"></span>
+      <button class="btn" id="ps-close">收起</button>
+      ${d.testable ? '<button class="btn" id="ps-test">测试</button>' : ""}
+      <button class="btn primary" id="ps-save">保存设置</button></div>`;
+  box.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  const values = () => Object.fromEntries([...box.querySelectorAll("[data-k]")].map((i) => [i.dataset.k, i.value.trim()]));
+  const dirty = snapshot(values);
+  const result = (html) => ($("ps-result").innerHTML = html);
+  const bad = (msg) => result(`<span style="color:var(--err)">${esc(msg)}</span>`);
+  pluginSettingsDirty = () => !box.classList.contains("hidden") && dirty();
+  $("ps-close").onclick = () => { box.classList.add("hidden"); box.innerHTML = ""; };
+  if ($("ps-test")) $("ps-test").onclick = (e) => busy(e.target, async () => {
+    result('<span class="muted">正在真搜一次，最多等 30 秒…</span>');
+    try {
+      const r = await api(`plugin-settings/${encodeURIComponent(id)}/test`, values());
+      result(`<span style="color:var(--ok)">✓ 搜到 ${r.count} 条，用时 ${r.seconds} 秒。第一条：${esc(r.first)}</span>`);
+    } catch (err) { bad(err.message); }
+  });
+  $("ps-save").onclick = (e) => busy(e.target, async () => {
+    try {
+      const r = await api("plugin-settings/" + encodeURIComponent(id), values());
+      toast(r.note);
+      // 不整页刷新，免得丢掉还没保存的插件勾选；只更新这个插件的"还没配置"标记
+      document.querySelectorAll(`[data-settings="${CSS.escape(id)}"]`).forEach((b) => {
+        const pill = b.closest(".plugin").querySelector(".pill.warn");
+        if (r.configured && pill) pill.remove();
+      });
+      if (onSaved) onSaved(r.configured);
+      await openPluginSettings(id, label, onSaved);
+    } catch (err) { bad(err.message); }
   });
 }
 

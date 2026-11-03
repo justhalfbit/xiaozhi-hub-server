@@ -138,6 +138,14 @@ PLUGINS = [
      "config": "search_from_ragflow"},
 ]
 PLUGIN_NAMES = {p["name"] for p in PLUGINS}
+
+# 插件设置（后台插件旁边的「设置」）：按字段清单自动生成表单，值存在 plugins.<config> 下。
+# PLUGINS 条目加 "settings": <id> 指向这里。每份设置 {"note": 整体说明, "fields": [...]}，字段：
+#   key、label；type：text / secret（只写不读，留空表示不改）/ number（可带 min、max）；
+#   required：没填时插件显示"还没配置"（不写就是选填）；default：留空时实际用的值，页面上当占位提示；
+#   hint：字段旁边的说明文字。
+# 要有「测试」按钮，在 core/admin/plugin_settings.py 的 TESTS 里登记测试函数。
+PLUGIN_SETTINGS = {}
 INTENT_MODES = ("nointent", "function_call")
 
 # ---------- 情绪（表情测试） ----------

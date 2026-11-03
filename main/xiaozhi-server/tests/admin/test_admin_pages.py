@@ -153,7 +153,7 @@ def test_vendor_test_config_prefers_unsaved_values(cfg_path):
 def test_desired_intent(cfg_path):
     m = merged(cfg_path)
     assert pages.desired_intent(m, "ClaudeCLI", cfg_path) == "nointent"
-    assert pages.desired_intent(m, "ClaudeAPI", cfg_path) == "nointent"  # Claude 在 function_call 下表现不好
+    assert pages.desired_intent(m, "ClaudeAPI", cfg_path) == "function_call"  # 所有 API 模型都能用插件
     assert pages.desired_intent(m, "DeepSeekLLM", cfg_path) == "function_call"
     pages.remember_api_intent("nointent", cfg_path)
     assert pages.desired_intent(m, "DeepSeekLLM", cfg_path) == "nointent"

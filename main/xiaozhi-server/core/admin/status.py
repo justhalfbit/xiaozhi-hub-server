@@ -29,6 +29,28 @@ def _check(name, ok, detail="", level=None):
     return {"name": name, "level": level or ("ok" if ok else "error"), "detail": detail}
 
 
+def plugins_in_use(merged: dict, llm_type) -> bool:
+    """有没有哪种情况会用插件：默认 API 模型选了「用插件」；或者默认是智能体（Claude Code、Grok Bot，
+    固定不用插件），但设备切到 API 模型时会用（API 模型的选择不是「不用插件」，没选过时默认用插件）。"""
+    from core.agent.llm_router import AGENT_TYPES
+
+    if llm_type in AGENT_TYPES:
+        return (merged.get("admin") or {}).get("api_intent") != "nointent"
+    return config_store.entry_type(merged, "Intent") == "function_call"
+
+
+def _plugin_setting_checks(merged: dict, llm_type) -> list:
+    from core.admin import catalog, plugin_settings
+
+    functions = [str(f) for f in ((merged.get("Intent") or {}).get("function_call") or {}).get("functions") or []]
+    missing = [p["label"] for p in catalog.PLUGINS if p.get("settings") and p["name"] in functions
+               and not plugin_settings.configured(merged, p["settings"])]
+    if not missing or not plugins_in_use(merged, llm_type):
+        return []
+    return [_check("插件设置", False, f"已勾选{'、'.join(dict.fromkeys(missing))}，但还没填 API Key 等必填设置，"
+                                     "请到「意图识别」页插件旁边的「设置」里填写", level="warn")]
+
+
 def collect_status(config: dict, merged: dict) -> dict:
     """config 是服务正在使用的配置，merged 是磁盘上的最新配置。"""
     ip = get_local_ip()
@@ -85,10 +107,9 @@ def collect_status(config: dict, merged: dict) -> dict:
         if secrets:
             checks.append(_check("大模型密钥", not missing,
                                  "已填写" if not missing else f"{selected.get('LLM')} 未填写 {', '.join(missing)}"))
-        if llm_type == "openai" and config_store.entry_type(merged, "Intent") == "function_call" and \
-                "claude" in str(llm_entry.get("model_name", "")).lower():
-            checks.append(_check("意图识别", False, "Claude 在 function_call 模式下表情和回复长度都有问题，建议用 nointent",
-                                 level="warn"))
+
+    # 后台能设置的插件：勾选了、但必填的设置（如 API Key）没填，而且会用到插件时提醒
+    checks.extend(_plugin_setting_checks(merged, llm_type))
 
     # Grok Bot：勾选了 Bot 就要有能用的登录
     grok = [e for e in (merged.get("LLM") or {}).values() if isinstance(e, dict) and e.get("type") == "grok_bot"]

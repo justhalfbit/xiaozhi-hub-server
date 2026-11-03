@@ -188,20 +188,21 @@ plugins:
     api_key: "ragflow-xxx"
     # ragflow知识库id
     dataset_ids: ["123456789"]
-  # 联网搜索插件配置
-  # 支持秘塔(metaso)、Tavily和Serply三个搜索源
-  # 秘塔API Key申请：https://metaso.cn/search-api/api-keys
-  # Tavily API Key申请：https://app.tavily.com/home
-  # Serply API Key申请：https://serply.io
+  # 联网搜索插件配置（后台「意图识别」页的联网搜索旁边可以设置和测试）
+  # 向 Anthropic 协议的接口发请求，用接口自带的搜索工具（web_search_20250305）搜，
+  # 需要支持自带搜索的接口，例如 DeepSeek（https://api.deepseek.com/anthropic/v1）、Anthropic 官方（https://api.anthropic.com）。
+  # 聊天模型和这里无关，用哪家都可以。
   web_search:
-    # 搜索源：metaso / tavily / serply
-    provider: "metaso"
     # 工具描述，用于告知LLM何时调用此工具，可根据需要自定义
-    description: "联网搜索工具。当用户明确需要联网搜索问题时使用此工具。"
-    # 返回结果数量（默认5）
-    max_results: 5
-    # 秘塔API Key（mk-前缀） / Tavily API Key（tvly-前缀） / Serply API Key
-    api_key: "mk-xxx"
+    description: "联网搜索工具。用户问到实时信息、最近发生的事、新闻、价格、比分，或者你不确定、需要查证的事实时使用。"
+    # 接口地址：写到 /anthropic 或 /anthropic/v1 都可以
+    base_url: "https://api.deepseek.com/anthropic/v1"
+    # API Key
+    api_key: "你的api_key"
+    # 搜索用的模型
+    model: "deepseek-v4-flash"
+    # 单次最多搜索几次（1-10）
+    max_uses: 5
 # 声纹识别配置
 # [xiaozhi-hub] 默认不启用声纹识别（原配置带示例说话人，每次连接都会报"配置不完整"）。
 # 需要时在 data/.config.yaml 里按下面注释掉的格式填写 url 和 speakers。

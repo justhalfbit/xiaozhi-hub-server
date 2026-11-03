@@ -2,7 +2,7 @@
 让那个模型去搜，拿回总结和搜索结果（标题、日期），再交给聊天模型回答。
 
 和 DeepSeek Harness 的做法一致：不接专门的搜索服务，用支持自带搜索的 Anthropic 协议接口
-（DeepSeek 的 https://api.deepseek.com/anthropic、Anthropic 官方等）。聊天模型用哪家都可以，和这里无关。
+（DeepSeek 的 https://api.deepseek.com/anthropic/v1、Anthropic 官方等）。聊天模型用哪家都可以，和这里无关。
 """
 
 import time
@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 TAG = __name__
 logger = setup_logging()
 
-DEFAULT_BASE_URL = "https://api.deepseek.com/anthropic"
+DEFAULT_BASE_URL = "https://api.deepseek.com/anthropic/v1"
 DEFAULT_MODEL = "deepseek-v4-flash"
 DEFAULT_MAX_USES = 5
 MAX_USES_LIMIT = 10

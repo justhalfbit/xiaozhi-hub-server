@@ -43,7 +43,7 @@ def fake_api(monkeypatch):
     return SimpleNamespace(calls=calls, state=state)
 
 
-SETTINGS = {"base_url": "https://api.deepseek.com/anthropic", "api_key": "sk-good", "model": "deepseek-v4-flash",
+SETTINGS = {"base_url": "https://api.deepseek.com/anthropic/v1", "api_key": "sk-good", "model": "deepseek-v4-flash",
             "max_uses": 3}
 
 

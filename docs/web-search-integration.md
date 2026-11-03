@@ -6,7 +6,7 @@
 
 做法和 DeepSeek Harness 一致：不接专门的搜索服务，而是向一个 **Anthropic 协议** 的接口发请求，带上接口自带的搜索工具 `web_search_20250305`，让那个模型去搜，拿回总结和搜索结果（标题、日期），再交给聊天模型回答。
 
-- 需要支持自带搜索的 Anthropic 协议接口，例如 DeepSeek（`https://api.deepseek.com/anthropic`，用 DeepSeek 平台的 Key，见 [DeepSeek 文档](https://api-docs.deepseek.com/guides/anthropic_api)）、Anthropic 官方（`https://api.anthropic.com`）。
+- 需要支持自带搜索的 Anthropic 协议接口，例如 DeepSeek（`https://api.deepseek.com/anthropic/v1`，用 DeepSeek 平台的 Key，见 [DeepSeek 文档](https://api-docs.deepseek.com/guides/anthropic_api)）、Anthropic 官方（`https://api.anthropic.com`）。
 - 聊天模型和这里无关，用哪家都可以；搜索接口单独设置。
 - 搜不到或出错时，插件会让模型告诉用户"这次没搜到"，不会卡住。整次搜索最多等 30 秒。
 
@@ -14,7 +14,7 @@
 
 1. 打开管理后台的「意图识别」页，选「用插件」。
 2. 在「联网搜索」旁边点「设置」，填写：
-   - 接口地址：默认 `https://api.deepseek.com/anthropic`，写到 `/anthropic` 或 `/anthropic/v1` 都可以；
+   - 接口地址：默认 `https://api.deepseek.com/anthropic/v1`（和 DeepSeek Harness 一致），写到 `/anthropic` 或 `/anthropic/v1` 都可以；
    - API Key：只写不读，填过后显示"已配置"，留空表示不改；
    - 模型：默认 `deepseek-v4-flash`；
    - 单次最多搜索次数：默认 5（1–10）。
@@ -30,7 +30,7 @@
 ```yaml
 plugins:
   web_search:
-    base_url: "https://api.deepseek.com/anthropic"
+    base_url: "https://api.deepseek.com/anthropic/v1"
     api_key: "你的API Key"
     model: "deepseek-v4-flash"
     max_uses: 5

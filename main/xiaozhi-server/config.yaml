@@ -190,13 +190,13 @@ plugins:
     dataset_ids: ["123456789"]
   # 联网搜索插件配置（后台「意图识别」页的联网搜索旁边可以设置和测试）
   # 向 Anthropic 协议的接口发请求，用接口自带的搜索工具（web_search_20250305）搜，
-  # 需要支持自带搜索的接口，例如 DeepSeek（https://api.deepseek.com/anthropic）、Anthropic 官方（https://api.anthropic.com）。
+  # 需要支持自带搜索的接口，例如 DeepSeek（https://api.deepseek.com/anthropic/v1）、Anthropic 官方（https://api.anthropic.com）。
   # 聊天模型和这里无关，用哪家都可以。
   web_search:
     # 工具描述，用于告知LLM何时调用此工具，可根据需要自定义
     description: "联网搜索工具。用户问到实时信息、最近发生的事、新闻、价格、比分，或者你不确定、需要查证的事实时使用。"
     # 接口地址：写到 /anthropic 或 /anthropic/v1 都可以
-    base_url: "https://api.deepseek.com/anthropic"
+    base_url: "https://api.deepseek.com/anthropic/v1"
     # API Key
     api_key: "你的api_key"
     # 搜索用的模型

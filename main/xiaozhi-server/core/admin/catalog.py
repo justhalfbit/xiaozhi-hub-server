@@ -150,7 +150,7 @@ PLUGIN_SETTINGS = {
         "note": "需要 Anthropic 协议、支持自带搜索（web_search）的接口，比如 DeepSeek、Anthropic 官方。"
                 "聊天模型用哪家都可以，和这里无关。注意：网关装在设备上时，127.0.0.1 指设备自己。",
         "fields": [
-            {"key": "base_url", "label": "接口地址", "type": "text", "default": "https://api.deepseek.com/anthropic",
+            {"key": "base_url", "label": "接口地址", "type": "text", "default": "https://api.deepseek.com/anthropic/v1",
              "hint": "写到 /anthropic 或 /anthropic/v1 都可以；Anthropic 官方填 https://api.anthropic.com"},
             {"key": "api_key", "label": "API Key", "type": "secret", "required": True},
             {"key": "model", "label": "模型", "type": "text", "default": "deepseek-v4-flash",

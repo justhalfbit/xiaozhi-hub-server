@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 
 import httpx
 from config.logger import setup_logging
+from core.providers.tts.dto.dto import ContentType
 from plugins_func.register import (
     register_function,
     ToolType,
@@ -28,8 +29,11 @@ DEFAULT_BASE_URL = "https://api.deepseek.com/anthropic/v1"
 DEFAULT_MODEL = "deepseek-v4-flash"
 DEFAULT_MAX_USES = 5
 MAX_USES_LIMIT = 10
-# 语音场景用户在干等：连不上 5 秒就放弃，整次搜索（可能搜好几轮）最多 30 秒
-TIMEOUT = httpx.Timeout(30.0, connect=5.0)
+# 语音场景用户在干等：连不上 5 秒就放弃，整次搜索（可能搜好几轮）最多 20 秒（实测一般 3 到 5 秒）
+TIMEOUT = httpx.Timeout(20.0, connect=5.0)
+WEEKDAYS = "一二三四五六日"
+# 模型决定搜索时先播的一句，免得搜索那几秒没有声音
+SEARCHING_REPLY = "我上网查一下。"  # 句号不能省：合成按标点切句，没有就会和后面的回答连成一句
 RESULT_LIMIT = 5  # 交给聊天模型的来源条数上限
 SNIPPET_LIMIT = 150  # 每条来源的原文片段最多多少字
 ANTHROPIC_VERSION = "2023-06-01"
@@ -64,9 +68,21 @@ _SEARCH_SYSTEM = (
     "今天是 {today}。"
 )
 
+# 失败分两类：config 要用户去后台处理（设备要说出原因），temporary 是临时问题（只说这次没搜到）
+CONFIG, TEMPORARY = "config", "temporary"
+
 
 class SearchError(Exception):
-    """搜索失败，message 是给人看的原因（后台测试按钮直接显示）。"""
+    """搜索失败。message 是详细原因（后台测试按钮直接显示）；spoken 是设备上能说给用户听的简短原因。"""
+
+    def __init__(self, message: str, kind: str = TEMPORARY, spoken: str = ""):
+        super().__init__(message)
+        self.kind = kind
+        self.spoken = spoken or message
+
+
+def today_text() -> str:
+    return time.strftime("%Y-%m-%d") + " 星期" + WEEKDAYS[time.localtime().tm_wday]
 
 
 @dataclass
@@ -102,8 +118,8 @@ def settings_of(config: dict) -> dict:
     }
 
 
-def _api_error(response: httpx.Response, api_key: str = "") -> str:
-    """把接口返回的错误翻译成能看懂的原因（有的接口会把收到的 Key 写进错误信息，换成 ***）。"""
+def _api_error(response: httpx.Response, api_key: str = "") -> SearchError:
+    """把接口返回的错误翻译成能看懂的原因并分类（有的接口会把收到的 Key 写进错误信息，换成 ***）。"""
     try:
         data = response.json()
     except ValueError:
@@ -115,16 +131,23 @@ def _api_error(response: httpx.Response, api_key: str = "") -> str:
     if api_key:
         message = message.replace(api_key, "***")
     status = response.status_code
-    if status in (401, 403):
-        return f"API Key 不对或没有权限（{status}{'：' + message if message else ''}）"
-    if status == 404:
-        return f"接口地址不对，或者不是 Anthropic 协议的接口（404{'：' + message if message else ''}）"
-    if data is None:
-        return f"接口返回的不是 Anthropic 协议的格式（HTTP {status}）"
+    detail = f"{status}{'：' + message if message else ''}"
     low = message.lower()
+    if status == 402 or "insufficient balance" in low or "余额" in message or "credit balance" in low:
+        return SearchError(f"账户余额不足（{detail}）", CONFIG, "联网搜索的账户余额不足，需要去充值")
+    if status in (401, 403):
+        return SearchError(f"API Key 不对或没有权限（{detail}）", CONFIG, "联网搜索的 API Key 不对")
+    if status == 404:
+        return SearchError(f"接口地址不对，或者不是 Anthropic 协议的接口（{detail}）", CONFIG,
+                           "联网搜索的接口地址不对")
+    if status == 429:
+        return SearchError(f"请求太频繁，稍后再试（{detail}）", TEMPORARY)
+    if data is None:
+        return SearchError(f"接口返回的不是 Anthropic 协议的格式（HTTP {status}）",
+                           TEMPORARY if status >= 500 else CONFIG, "联网搜索的接口地址不对")
     if status in (400, 422) and ("web_search" in low or "tool" in low or "server" in low):
-        return f"这个接口或模型不支持自带搜索（{status}：{message}）"
-    return f"接口返回错误（{status}{'：' + message if message else ''}）"
+        return SearchError(f"这个接口或模型不支持自带搜索（{detail}）", CONFIG, "联网搜索设置的接口或模型不支持搜索")
+    return SearchError(f"接口返回错误（{detail}）", TEMPORARY)
 
 
 def _citation_snippets(blocks: list) -> dict:
@@ -150,7 +173,7 @@ def _citation_snippets(blocks: list) -> dict:
 
 def _parse(data) -> SearchResult:
     if not isinstance(data, dict) or not isinstance(data.get("content"), list):
-        raise SearchError("接口返回的不是 Anthropic 协议的格式")
+        raise SearchError("接口返回的不是 Anthropic 协议的格式", CONFIG, "联网搜索的接口地址不对")
     result = SearchResult()
     texts, searched, errors, seen = [], False, [], set()
     snippets = _citation_snippets(data["content"])
@@ -185,7 +208,8 @@ def _parse(data) -> SearchResult:
     result.results.sort(key=lambda r: not r["snippet"])
     result.summary = "".join(texts).strip()
     if not searched:
-        raise SearchError("接口没有执行搜索，这个接口或模型可能不支持自带搜索")
+        raise SearchError("接口没有执行搜索，这个接口或模型可能不支持自带搜索", CONFIG,
+                          "联网搜索设置的接口或模型不支持搜索")
     if not result.results and errors:
         raise SearchError(f"搜索没有成功（{', '.join(errors)}）")
     return result
@@ -194,15 +218,15 @@ def _parse(data) -> SearchResult:
 async def search(settings: dict, query: str) -> SearchResult:
     """搜一次。失败时抛 SearchError，原因写在 message 里。"""
     if not settings.get("api_key"):
-        raise SearchError("还没有填写 API Key")
+        raise SearchError("还没有填写 API Key", CONFIG, "联网搜索还没开通，需要先填 API Key")
     url = messages_url(settings["base_url"])
     if not url.startswith(("http://", "https://")):
-        raise SearchError("接口地址要以 http:// 或 https:// 开头")
+        raise SearchError("接口地址要以 http:// 或 https:// 开头", CONFIG, "联网搜索的接口地址不对")
     payload = {
         "model": settings["model"],
         "max_tokens": 1024,
         "thinking": {"type": "disabled"},
-        "system": _SEARCH_SYSTEM.format(today=time.strftime("%Y-%m-%d")),
+        "system": _SEARCH_SYSTEM.format(today=today_text()),
         "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": settings["max_uses"]}],
         "messages": [{"role": "user", "content": query}],
     }
@@ -217,11 +241,11 @@ async def search(settings: dict, query: str) -> SearchResult:
     except httpx.HTTPError as e:
         raise SearchError(f"连不上接口地址（{type(e).__name__}：{e}）")
     if response.status_code != 200:
-        raise SearchError(_api_error(response, settings["api_key"]))
+        raise _api_error(response, settings["api_key"])
     try:
         data = response.json()
     except ValueError:
-        raise SearchError("接口返回的不是 Anthropic 协议的格式")
+        raise SearchError("接口返回的不是 Anthropic 协议的格式", CONFIG, "联网搜索的接口地址不对")
     result = _parse(data)
     result.seconds = round(time.monotonic() - started, 1)
     return result
@@ -246,6 +270,17 @@ def format_for_llm(query: str, result: SearchResult) -> str:
     return "\n".join(lines)
 
 
+def _say_searching(conn) -> None:
+    """先播一句"我上网查一下"，接在这一轮回答的前面（同一个 sentence_id）。用户已经打断时不说。"""
+    tts, sentence_id = getattr(conn, "tts", None), getattr(conn, "sentence_id", None)
+    if tts is None or not sentence_id or getattr(conn, "client_abort", False):
+        return
+    try:
+        tts.tts_one_sentence(conn, ContentType.TEXT, content_detail=SEARCHING_REPLY, sentence_id=sentence_id)
+    except Exception as e:
+        logger.bind(tag=TAG).warning(f"播搜索提示失败: {e}")
+
+
 @register_function("web_search", WEB_SEARCH_FUNCTION_DESC, ToolType.SYSTEM_CTL)
 async def web_search(conn: "ConnectionHandler", query: str = None):
     logger.bind(tag=TAG).info(f"web_search 被调用 | query={query}")
@@ -256,15 +291,18 @@ async def web_search(conn: "ConnectionHandler", query: str = None):
     logger.bind(tag=TAG).info(
         f"web_search 配置 | url={messages_url(settings['base_url'])} | model={settings['model']} "
         f"| max_uses={settings['max_uses']} | key={'已配置' if settings['api_key'] else '未配置'}")
+    if settings["api_key"]:
+        _say_searching(conn)
     try:
         result = await search(settings, query)
     except SearchError as e:
-        logger.bind(tag=TAG).error(f"联网搜索失败: {e}")
-        return ActionResponse(
-            Action.REQLLM,
-            f"联网搜索失败：{e}。请用一句话告诉用户这次没搜到，不要编造答案。",
-            None,
-        )
+        logger.bind(tag=TAG).error(f"联网搜索失败（{e.kind}）: {e}")
+        if e.kind == CONFIG:
+            reply = (f"联网搜索用不了：{e.spoken}。请用一句话告诉用户这个原因，"
+                     "并说明要到网关管理后台「意图识别」页、联网搜索旁边的「设置」里处理；不要编造答案。")
+        else:
+            reply = "联网搜索这次没成功（临时问题）。请用一句话告诉用户这次没搜到，稍后再试；不要编造答案。"
+        return ActionResponse(Action.REQLLM, reply, None)
     except Exception as e:
         logger.bind(tag=TAG).error(f"联网搜索异常: {type(e).__name__}: {e}")
         return ActionResponse(Action.REQLLM, "联网搜索出现异常。请用一句话告诉用户这次没搜到，不要编造答案。", None)

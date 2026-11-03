@@ -101,23 +101,32 @@ def test_snippet_and_source_limits():
     assert "来源：" in text and "原文片段" not in text
 
 
-@pytest.mark.parametrize("respond, reason", [
+C, T = ws.CONFIG, ws.TEMPORARY
+
+
+@pytest.mark.parametrize("respond, reason, kind", [
     (lambda r: httpx.Response(401, json={"type": "error", "error": {"type": "authentication_error", "message": "bad key"}}),
-     "API Key 不对"),
-    (lambda r: httpx.Response(404, text="Not Found"), "不是 Anthropic 协议"),
-    (lambda r: httpx.Response(400, json={"error": {"message": "unknown tool type web_search_20250305"}}), "不支持自带搜索"),
-    (lambda r: httpx.Response(200, text="<html>hi</html>"), "不是 Anthropic 协议"),
-    (lambda r: httpx.Response(200, json={"choices": []}), "不是 Anthropic 协议"),  # OpenAI 协议的回应
-    (lambda r: httpx.Response(200, json={"content": [{"type": "text", "text": "我不能上网"}]}), "没有执行搜索"),
+     "API Key 不对", C),
+    (lambda r: httpx.Response(402, json={"error": {"message": "Insufficient Balance"}}), "余额不足", C),
+    (lambda r: httpx.Response(400, json={"error": {"message": "Your credit balance is too low"}}), "余额不足", C),
+    (lambda r: httpx.Response(429, json={"error": {"message": "rate limit"}}), "太频繁", T),
+    (lambda r: httpx.Response(503, json={"error": {"message": "overloaded"}}), "接口返回错误", T),
+    (lambda r: httpx.Response(502, text="Bad Gateway"), "不是 Anthropic 协议", T),
+    (lambda r: httpx.Response(404, text="Not Found"), "不是 Anthropic 协议", C),
+    (lambda r: httpx.Response(400, json={"error": {"message": "unknown tool type web_search_20250305"}}), "不支持自带搜索", C),
+    (lambda r: httpx.Response(200, text="<html>hi</html>"), "不是 Anthropic 协议", C),
+    (lambda r: httpx.Response(200, json={"choices": []}), "不是 Anthropic 协议", C),  # OpenAI 协议的回应
+    (lambda r: httpx.Response(200, json={"content": [{"type": "text", "text": "我不能上网"}]}), "没有执行搜索", C),
     (lambda r: httpx.Response(200, json={"content": [
         {"type": "server_tool_use", "id": "s", "input": {"query": "q"}},
         {"type": "web_search_tool_result", "content": {"type": "web_search_tool_result_error", "error_code": "unavailable"}}]}),
-     "unavailable"),
+     "unavailable", T),
 ])
-async def test_search_error_reasons(fake_api, respond, reason):
+async def test_search_error_reasons(fake_api, respond, reason, kind):
     fake_api.state["respond"] = respond
-    with pytest.raises(ws.SearchError, match=reason):
+    with pytest.raises(ws.SearchError, match=reason) as e:
         await ws.search(SETTINGS, "q")
+    assert e.value.kind == kind and e.value.spoken
 
 
 async def test_search_unreachable_and_timeout(fake_api):
@@ -136,14 +145,54 @@ async def test_search_unreachable_and_timeout(fake_api):
         await ws.search({**SETTINGS, "api_key": ""}, "q")
 
 
-async def test_plugin_tells_model_to_say_not_found(fake_api):
-    fake_api.state["respond"] = lambda r: httpx.Response(401, json={"error": {"message": "x"}})
-    conn = SimpleNamespace(config={"plugins": {"web_search": SETTINGS}})
+class FakeTTS:
+    def __init__(self):
+        self.said = []
+
+    def tts_one_sentence(self, conn, content_type, content_detail=None, sentence_id=None, **kw):
+        self.said.append((content_detail, sentence_id))
+
+
+def fake_conn(settings=SETTINGS, **kw):
+    return SimpleNamespace(config={"plugins": {"web_search": settings}}, tts=FakeTTS(), sentence_id="sid-1",
+                           client_abort=False, **kw)
+
+
+async def test_plugin_replies_by_error_kind(fake_api):
+    # 要用户处理的：说出原因和去哪里改
+    fake_api.state["respond"] = lambda r: httpx.Response(402, json={"error": {"message": "Insufficient Balance"}})
+    conn = fake_conn()
     resp = await ws.web_search(conn, query="q")
-    assert "没搜到" in resp.result and "不要编造" in resp.result
+    assert "余额不足" in resp.result and "管理后台" in resp.result and "不要编造" in resp.result
+    # 临时问题：只说这次没搜到
+    fake_api.state["respond"] = lambda r: httpx.Response(429, json={"error": {"message": "rate"}})
+    resp = await ws.web_search(conn, query="q")
+    assert "没搜到" in resp.result and "管理后台" not in resp.result
+    # 没填 Key：说还没开通，而且不先说"我上网查一下"
+    conn = fake_conn({**SETTINGS, "api_key": ""})
+    resp = await ws.web_search(conn, query="q")
+    assert "还没开通" in resp.result and conn.tts.said == []
     fake_api.state["respond"] = lambda r: httpx.Response(200, json=OK_BODY)
-    resp = await ws.web_search(conn, query="q")
+    resp = await ws.web_search(fake_conn(), query="q")
     assert resp.result.startswith("【联网搜索结果】")
+
+
+async def test_plugin_says_searching_first(fake_api):
+    conn = fake_conn()
+    await ws.web_search(conn, query="q")
+    assert conn.tts.said == [(ws.SEARCHING_REPLY, "sid-1")] and ws.SEARCHING_REPLY.endswith("。")
+    conn = fake_conn()
+    conn.client_abort = True  # 用户已经打断：不说
+    await ws.web_search(conn, query="q")
+    assert conn.tts.said == []
+
+
+async def test_system_prompt_has_weekday(fake_api, monkeypatch):
+    monkeypatch.setattr(ws.time, "localtime", lambda *a: SimpleNamespace(tm_wday=2))
+    monkeypatch.setattr(ws.time, "strftime", lambda fmt, *a: "2026-11-04")
+    await ws.search(SETTINGS, "q")
+    assert "今天是 2026-11-04 星期三" in json.loads(fake_api.calls[-1].content)["system"]
+    assert ws.TIMEOUT.read == 20.0 and ws.TIMEOUT.connect == 5.0
 
 
 async def test_key_redacted_in_error(fake_api):
@@ -205,3 +254,34 @@ async def test_admin_test_button(client, fake_api):
     r = await client.post("/admin/api/plugin-settings/web_search/test", json={"api_key": "sk-good"})
     err = (await r.json())["error"]
     assert r.status == 400 and "API Key 不对" in err and "sk-good" not in err
+
+
+# ---------- 状态页：勾了联网搜索但没填 Key ----------
+
+def _status(merged):
+    from core.admin import status
+
+    llm = (merged.get("selected_module") or {}).get("LLM")
+    return status._plugin_setting_checks(merged, config_store.entry_type(merged, "LLM", llm) if llm else None)
+
+
+def _merged(llm_type, intent, functions, key="", api_intent=None):
+    m = {"selected_module": {"LLM": "M", "Intent": intent}, "LLM": {"M": {"type": llm_type}},
+         "Intent": {intent: {"type": intent}, "function_call": {"type": "function_call", "functions": functions}},
+         "plugins": {"web_search": {"api_key": key}}}
+    if api_intent:
+        m["admin"] = {"api_intent": api_intent}
+    return m
+
+
+def test_status_warns_only_when_plugins_used():
+    on = ["web_search", "get_weather"]
+    warn = _status(_merged("openai", "function_call", on))
+    assert len(warn) == 1 and warn[0]["level"] == "warn" and "联网搜索" in warn[0]["detail"]
+    assert _status(_merged("openai", "function_call", on, key="sk-x")) == []          # 填了 Key
+    assert _status(_merged("openai", "function_call", ["get_weather"])) == []          # 没勾
+    assert _status(_merged("openai", "nointent", on)) == []                            # API 模型不用插件
+    # 默认是智能体：自己不用插件；设备切到 API 模型时会用（没选过默认用插件），选过「不用插件」就不提醒
+    assert len(_status(_merged("claude_cli", "nointent", on))) == 1
+    assert len(_status(_merged("grok_bot", "nointent", on, api_intent="function_call"))) == 1
+    assert _status(_merged("claude_cli", "nointent", on, api_intent="nointent")) == []

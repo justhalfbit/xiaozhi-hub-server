@@ -14,8 +14,10 @@
 import asyncio
 import copy
 import functools
+import io
 import json
 import time
+import wave
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -53,6 +55,19 @@ SECURITY_HEADERS = {
 }
 EMOTION_EMOJI = {name: emoji for emoji, name in EMOJI_MAP.items()}
 KIOSK_ASR_MAX_BYTES = 16000 * 2 * 10  # /kiosk/asr 最多 10 秒音频
+KIOSK_TTS_MAX_CHARS = 200  # /kiosk/tts 一次最多合成这么多字（提醒的内容，一两句话）
+KIOSK_TTS_RATE = 24000     # /kiosk/tts 返回的采样率：Edge TTS 原本就是 24 kHz
+
+
+def _wav(pcm: bytes, rate: int) -> bytes:
+    """16 位单声道 PCM 加上 WAV 文件头。"""
+    out = io.BytesIO()
+    with wave.open(out, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(pcm)
+    return out.getvalue()
 
 
 class AdminHandler:
@@ -124,6 +139,7 @@ class AdminHandler:
                 web.post("/kiosk/llm/use", self.handle_kiosk_llm_use),
                 web.post("/kiosk/reports", self.handle_kiosk_reports),
                 web.post("/kiosk/asr", self.handle_kiosk_asr),
+                web.post("/kiosk/tts", self.handle_kiosk_tts),
                 web.get("/kiosk/chat/history", self.handle_kiosk_chat_history),
                 web.post("/kiosk/chat/clear", self.handle_kiosk_chat_clear),
             ]
@@ -760,6 +776,39 @@ class AdminHandler:
         started = time.monotonic()
         text = await self._blocking(asr.recognize_pcm, pcm)
         return self._json({"ok": True, "text": text, "ms": round((time.monotonic() - started) * 1000)})
+
+    async def handle_kiosk_tts(self, request: web.Request):
+        """{"text"}：只合成、不对话，返回 16 位单声道 WAV（24 kHz）。
+
+        用运行中配置选的语音合成和音色（和设备听到的回复一样）。设备客户端设提醒时用它把要念的话预先合成好
+        存在本机，到点直接播，不再依赖网关。流式合成（没有整句合成）返回 501，客户端到点只响铃、屏幕显示文字。"""
+        if not self._from_this_machine(request):
+            return self._error("仅限本机", 403)
+        body = await self._read_json(request)
+        text = str(body.get("text") or "").strip()
+        if not text or len(text) > KIOSK_TTS_MAX_CHARS:
+            return self._error(f"text 要 1 到 {KIOSK_TTS_MAX_CHARS} 个字", 400)
+        started = time.monotonic()
+        try:
+            pcm = await self._blocking(self._synthesize, text)
+        except NotImplementedError:
+            return self._error("当前语音合成不支持整句合成", 501)
+        except Exception as e:
+            self.logger.bind(tag=TAG).warning(f"/kiosk/tts 合成失败: {e}")
+            pcm = None
+        if not pcm:
+            return self._error("合成失败，请检查语音合成服务能否访问", 502)
+        self.logger.bind(tag=TAG).info(f"/kiosk/tts 合成 {len(text)} 字，用时 {time.monotonic() - started:.1f}s")
+        return web.Response(body=_wav(pcm, KIOSK_TTS_RATE), content_type="audio/wav", headers=SECURITY_HEADERS)
+
+    def _synthesize(self, text: str) -> bytes:
+        from core.providers.tts.dto.dto import InterfaceType
+        from core.utils.modules_initialize import initialize_tts
+
+        tts = initialize_tts(self.config)
+        if tts.interface_type != InterfaceType.NON_STREAM:
+            raise NotImplementedError
+        return tts.synthesize_pcm(text, KIOSK_TTS_RATE)
 
     async def handle_kiosk_chat_history(self, request: web.Request):
         """?device=<device-id>[&limit=N]：这台设备存下来的聊天记录，给屏幕显示。

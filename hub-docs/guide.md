@@ -180,6 +180,7 @@ http://<电脑的局域网 IP>:16688/xiaozhi/ota/
 | `POST /kiosk/llm/use` | `{"kind": "cli", "device": "..."}`、`{"kind": "api", "vendor": "deepseek", "device": "..."}` 或 `{"kind": "grok", "entry": "GrokBot_<名字>", "device": "..."}`，必须带 device | 和喊称呼一样只切这台设备并记住：它在线的连接马上换到新模型（从新对话开始），意图识别跟着这台设备的模型走（Claude Code、Grok Bot 不用插件，API 模型照后台的选择）。不改后台默认模型和全局的意图识别，默认模型只在后台改。成功时还带上切换后的模型列表（同 `GET /kiosk/llm?device=...`），不用再查一次 |
 | `POST /kiosk/reports` | `{"device": "...", "quiet": false, "play": false}` | `count`：这台设备有几条待汇报；`playing`：是否已安排念。`quiet` 为 true 表示设备在睡眠时段，期间有待汇报也不主动念（每次查询都要带上）；`play` 为 true 表示用户点了要听，马上在设备的连接上念 |
 | `POST /kiosk/asr` | 10 秒以内的 16kHz 单声道 16 位 PCM（原始字节，不是 JSON） | `{"text", "ms"}`：只识别、不进对话，用服务已加载的本机识别模型（设备客户端可以用它复核唤醒词）。当前识别不是本机模型（如豆包）时返回 501 |
+| `POST /kiosk/tts` | `{"text": "该晾衣服了"}`，1 到 200 个字 | 只合成、不进对话：返回 24 kHz 单声道 16 位 WAV（`audio/wav`），音色和设备听到的回复一样。设备客户端设提醒时用它把要念的话预先合成好存在本机，到点不依赖网关。当前语音合成是流式的（没有整句合成）时返回 501，合成服务连不上时返回 502 |
 
 ## 6. 常见问题
 

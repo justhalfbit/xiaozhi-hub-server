@@ -531,6 +531,7 @@ def test_sherpa_recognize_pcm():
 async def test_kiosk_only_from_this_machine(kiosk, monkeypatch):
     calls = [("get", "/kiosk/llm", None), ("post", "/kiosk/llm/use", {"kind": "cli"}),
              ("post", "/kiosk/reports", {"device": "dev-1"}), ("post", "/kiosk/asr", None),
+             ("post", "/kiosk/tts", {"text": "该晾衣服了"}),
              ("get", "/kiosk/chat/history?device=dev-1", None), ("post", "/kiosk/chat/clear", {"device": "dev-1"})]
     for method, path, body in calls:  # 本机反向代理转发来的不算本机
         r = await getattr(kiosk, method)(path, json=body, headers={"X-Forwarded-For": "203.0.113.5"})
@@ -926,3 +927,35 @@ async def test_asr_use_and_doubao_endpoints(cfg_path, monkeypatch):
         r = await (await c.post("/admin/api/asr/use", json={"choice": "local"})).json()
         assert r["ok"] and loaded[-1] == "SherpaXASR"
         assert (await c.post("/admin/api/asr/use", json={"choice": "funasr"})).status == 400
+
+
+async def test_kiosk_tts(kiosk, monkeypatch):
+    """只合成、不对话：返回 WAV；流式合成 501，合成失败 502，文字长度要合理。"""
+    import io
+    import wave
+
+    from core.providers.tts.dto.dto import InterfaceType
+    from core.utils import modules_initialize
+
+    said = []
+
+    class FakeTTS:
+        interface_type = InterfaceType.NON_STREAM
+
+        def synthesize_pcm(self, text, sample_rate=16000):
+            said.append((text, sample_rate))
+            return b"\x01\x00" * 2400
+    monkeypatch.setattr(modules_initialize, "initialize_tts", lambda config: FakeTTS())
+    r = await kiosk.post("/kiosk/tts", json={"text": " 该晾衣服了 "})
+    assert r.status == 200 and r.content_type == "audio/wav"
+    with wave.open(io.BytesIO(await r.read())) as w:
+        assert (w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()) == (1, 2, ah.KIOSK_TTS_RATE, 2400)
+    assert said == [("该晾衣服了", ah.KIOSK_TTS_RATE)]
+    for bad in ({}, {"text": "  "}, {"text": "字" * (ah.KIOSK_TTS_MAX_CHARS + 1)}):
+        assert (await kiosk.post("/kiosk/tts", json=bad)).status == 400
+    FakeTTS.synthesize_pcm = lambda self, text, sample_rate=16000: None   # 连不上合成服务
+    assert (await kiosk.post("/kiosk/tts", json={"text": "该晾衣服了"})).status == 502
+    FakeTTS.synthesize_pcm = lambda self, text, sample_rate=16000: 1 / 0
+    assert (await kiosk.post("/kiosk/tts", json={"text": "该晾衣服了"})).status == 502
+    FakeTTS.interface_type = InterfaceType.DUAL_STREAM   # 流式合成
+    assert (await kiosk.post("/kiosk/tts", json={"text": "该晾衣服了"})).status == 501

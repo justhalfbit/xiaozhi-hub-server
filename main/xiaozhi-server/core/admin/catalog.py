@@ -144,6 +144,8 @@ PLUGIN_NAMES = {p["name"] for p in PLUGINS}
 #   key、label；type：text / secret（只写不读，留空表示不改）/ number（可带 min、max）；
 #   required：没填时插件显示"还没配置"（不写就是选填）；default：留空时实际用的值，页面上当占位提示；
 #   hint：字段旁边的说明文字。
+# legacy_keys：旧版插件才有的字段，配置里还有它们时，已保存的密钥当成没填（是给别的服务的），
+#   保存时删掉这些字段并清掉旧密钥；legacy_note 是页面上的提示。
 # 要有「测试」按钮，在 core/admin/plugin_settings.py 的 TESTS 里登记测试函数。
 PLUGIN_SETTINGS = {
     "web_search": {
@@ -158,6 +160,10 @@ PLUGIN_SETTINGS = {
             {"key": "max_uses", "label": "单次最多搜索次数", "type": "number", "default": 5, "min": 1, "max": 10,
              "hint": "一个问题里模型最多搜几轮；越多越全，也越慢"},
         ],
+        # 旧版联网搜索（秘塔、Tavily、Serply）的字段：那时的 Key 不能发给新接口
+        "legacy_keys": ["provider", "max_results"],
+        "legacy_note": "配置里还留着旧版联网搜索（秘塔、Tavily、Serply）的设置，那时填的 Key 不能用在新接口上，"
+                       "新版不会使用它。请重新填写 API Key 并保存，旧设置会一起清掉。",
     },
 }
 INTENT_MODES = ("nointent", "function_call")

@@ -5,6 +5,7 @@
 （DeepSeek 的 https://api.deepseek.com/anthropic/v1、Anthropic 官方等）。聊天模型用哪家都可以，和这里无关。
 """
 
+import asyncio
 import time
 from dataclasses import dataclass, field
 
@@ -29,8 +30,10 @@ DEFAULT_BASE_URL = "https://api.deepseek.com/anthropic/v1"
 DEFAULT_MODEL = "deepseek-v4-flash"
 DEFAULT_MAX_USES = 5
 MAX_USES_LIMIT = 10
-# 语音场景用户在干等：连不上 5 秒就放弃，整次搜索（可能搜好几轮）最多 20 秒（实测一般 3 到 5 秒）
-TIMEOUT = httpx.Timeout(20.0, connect=5.0)
+# 语音场景用户在干等：连不上 5 秒就放弃，整次搜索（可能搜好几轮）最多 20 秒（实测一般 3 到 5 秒）。
+# httpx 的超时只管每一段等待，整次的上限另用 asyncio.wait_for
+TOTAL_SECONDS = 20.0
+TIMEOUT = httpx.Timeout(TOTAL_SECONDS, connect=5.0)
 WEEKDAYS = "一二三四五六日"
 # 模型决定搜索时先播的一句，免得搜索那几秒没有声音
 SEARCHING_REPLY = "我上网查一下。"  # 句号不能省：合成按标点切句，没有就会和后面的回答连成一句
@@ -110,9 +113,11 @@ def settings_of(config: dict) -> dict:
         max_uses = int(cfg.get("max_uses") or DEFAULT_MAX_USES)
     except (TypeError, ValueError):
         max_uses = DEFAULT_MAX_USES
+    # 配置里还有旧版的 provider（秘塔、Tavily、Serply）：api_key 是给那些服务的，不能发给新接口，当成没填
+    legacy = bool(cfg.get("provider"))
     return {
         "base_url": str(cfg.get("base_url") or "").strip() or DEFAULT_BASE_URL,
-        "api_key": str(cfg.get("api_key") or "").strip(),
+        "api_key": "" if legacy else str(cfg.get("api_key") or "").strip(),
         "model": str(cfg.get("model") or "").strip() or DEFAULT_MODEL,
         "max_uses": min(max(max_uses, 1), MAX_USES_LIMIT),
     }
@@ -235,8 +240,8 @@ async def search(settings: dict, query: str) -> SearchResult:
     started = time.monotonic()
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-            response = await client.post(url, json=payload, headers=headers)
-    except httpx.TimeoutException:
+            response = await asyncio.wait_for(client.post(url, json=payload, headers=headers), TOTAL_SECONDS)
+    except (httpx.TimeoutException, asyncio.TimeoutError):
         raise SearchError(f"等了 {time.monotonic() - started:.0f} 秒没有结果，接口太慢或地址不通")
     except httpx.HTTPError as e:
         raise SearchError(f"连不上接口地址（{type(e).__name__}：{e}）")

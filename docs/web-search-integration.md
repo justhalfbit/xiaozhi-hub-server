@@ -8,7 +8,7 @@
 
 - 需要支持自带搜索的 Anthropic 协议接口，例如 DeepSeek（`https://api.deepseek.com/anthropic/v1`，用 DeepSeek 平台的 Key，见 [DeepSeek 文档](https://api-docs.deepseek.com/guides/anthropic_api)）、Anthropic 官方（`https://api.anthropic.com`）。
 - 聊天模型和这里无关，用哪家都可以；搜索接口单独设置。
-- 搜不到或出错时，插件会让模型告诉用户"这次没搜到"，不会卡住。整次搜索最多等 30 秒。
+- 搜不到或出错时，插件会让模型告诉用户"这次没搜到"，不会卡住。整次搜索最多等 20 秒（实测一般 3 到 5 秒）。
 
 ## 在管理后台设置（推荐）
 
@@ -44,4 +44,4 @@ Intent:
 
 改配置文件后重启服务生效。
 
-旧版本的 `provider`（秘塔、Tavily、Serply）和 `max_results` 已不再使用。
+旧版本的 `provider`（秘塔、Tavily、Serply）和 `max_results` 已不再使用。配置里还留着 `provider` 时，原来填的 Key 是给那些服务的，新版不会使用、也不会发出去，插件当成还没配置；在后台重新填 Key 并保存，会一起清掉旧设置。

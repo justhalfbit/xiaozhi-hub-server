@@ -1276,6 +1276,7 @@ async function openPluginSettings(id, label, onSaved) {
   box.innerHTML = `
     <div class="section-title" style="margin-top:0">${esc(label)} · 设置 ${d.configured ? '<span class="pill ok">已配置</span>' : '<span class="pill warn">还没配置</span>'}</div>
     ${d.note ? `<div class="banner info">${esc(d.note)}</div>` : ""}
+    ${d.legacy_note ? `<div class="banner warn">${esc(d.legacy_note)}</div>` : ""}
     <div class="grid2">
       ${d.fields.map((f) => `<label class="f ${f.type === "text" ? "full" : ""}">${esc(f.label)}${f.hint ? `<span class="hint">${esc(f.hint)}</span>` : ""}${input(f)}</label>`).join("")}
     </div>

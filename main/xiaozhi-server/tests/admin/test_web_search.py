@@ -285,3 +285,55 @@ def test_status_warns_only_when_plugins_used():
     assert len(_status(_merged("claude_cli", "nointent", on))) == 1
     assert len(_status(_merged("grok_bot", "nointent", on, api_intent="function_call"))) == 1
     assert _status(_merged("claude_cli", "nointent", on, api_intent="nointent")) == []
+
+
+# ---------- 升级：配置里还留着旧版（秘塔等）的设置 ----------
+
+LEGACY_YAML = """\
+selected_module:
+  LLM: ClaudeCLI
+  Intent: nointent
+plugins:
+  web_search:
+    provider: metaso
+    max_results: 5
+    api_key: mk-realmetasokey12345
+"""
+
+
+async def test_legacy_key_never_used_or_sent(tmp_path, fake_api):
+    # 插件：旧版的 Key 当成没填，不会发给新接口
+    assert ws.settings_of({"plugins": {"web_search": {"provider": "metaso", "api_key": "mk-real"}}})["api_key"] == ""
+    p = tmp_path / ".config.yaml"
+    p.write_text(LEGACY_YAML, encoding="utf-8")
+    m = config_store.load_merged(custom_path=p)
+    d = plugin_settings.describe(m, "web_search")
+    assert d["configured"] is False and d["legacy_note"]
+    assert next(f for f in d["fields"] if f["key"] == "api_key")["set"] is False
+    # 测试按钮留空 Key：不会拿旧 Key 去请求
+    with pytest.raises(ValueError, match="API Key"):
+        await plugin_settings.run_test("web_search", {}, m)
+    assert fake_api.calls == []
+    # 只改别的字段保存：旧字段和旧 Key 一起清掉
+    changed = plugin_settings.save("web_search", {"max_uses": "3"}, m, p)
+    assert set(changed) == {"max_uses", "api_key", "provider", "max_results"}
+    saved = config_store.load_merged(custom_path=p)["plugins"]["web_search"]
+    assert "provider" not in saved and "max_results" not in saved and saved["api_key"] == ""
+    d = plugin_settings.describe(config_store.load_merged(custom_path=p), "web_search")
+    assert d["legacy_note"] == "" and d["configured"] is False
+    plugin_settings.save("web_search", {"api_key": "sk-new"}, config_store.load_merged(custom_path=p), p)
+    assert plugin_settings.configured(config_store.load_merged(custom_path=p), "web_search") is True
+
+
+async def test_total_timeout(fake_api, monkeypatch):
+    import asyncio as aio
+    monkeypatch.setattr(ws, "TOTAL_SECONDS", 0.05)
+
+    async def slow_handler(request):
+        await aio.get_running_loop().run_in_executor(None, __import__("time").sleep, 0.3)
+        return httpx.Response(200, json=OK_BODY)
+    from httpx._client import AsyncClient as real
+    monkeypatch.setattr(ws.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(slow_handler), **kw))
+    with pytest.raises(ws.SearchError, match="没有结果") as e:
+        await ws.search(SETTINGS, "q")
+    assert e.value.kind == ws.TEMPORARY

@@ -81,7 +81,7 @@ async def test_search_request_and_parse(fake_api):
     text = ws.format_for_llm("今天新闻", r)
     assert "总结：今天的要点是某某事件。" in text and "https://" not in text
     assert "1. 第二条：某某事件 今天上午发生。 影响很大。" in text and "2. 第一条新闻（2026-11-03）" in text
-    assert "以原文片段为准" in text and "一两句" in text
+    assert "以原文片段为准" in text and "一到两句" in text and "60 个字" in text
 
 
 def test_snippet_and_source_limits():

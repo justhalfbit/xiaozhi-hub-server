@@ -265,8 +265,8 @@ def format_for_llm(query: str, result: SearchResult) -> str:
             snippet = f"：{item['snippet']}" if item["snippet"] else ""
             lines.append(f"{i}. {item['title']}{age}{snippet}")
     lines.append("回答要求：" + ("总结和原文片段对不上时，以原文片段为准；" if has_snippet else "")
-                 + "结果里没有的内容不要编。用口语先说一两句最重要的结论，不要一条条全念，也不要念网址；"
-                 "内容多的话，最后问一句用户还想听哪方面。")
+                 + "结果里没有的内容不要编。只用一到两句话、大约 60 个字以内说最重要的结论，"
+                 "细节等用户追问再说，不要念网址；内容多的话，最后问一句用户还想听哪方面。")
     return "\n".join(lines)
 
 

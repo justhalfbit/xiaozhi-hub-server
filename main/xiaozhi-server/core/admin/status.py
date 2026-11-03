@@ -85,10 +85,6 @@ def collect_status(config: dict, merged: dict) -> dict:
         if secrets:
             checks.append(_check("大模型密钥", not missing,
                                  "已填写" if not missing else f"{selected.get('LLM')} 未填写 {', '.join(missing)}"))
-        if llm_type == "openai" and config_store.entry_type(merged, "Intent") == "function_call" and \
-                "claude" in str(llm_entry.get("model_name", "")).lower():
-            checks.append(_check("意图识别", False, "Claude 在 function_call 模式下表情和回复长度都有问题，建议用 nointent",
-                                 level="warn"))
 
     # Grok Bot：勾选了 Bot 就要有能用的登录
     grok = [e for e in (merged.get("LLM") or {}).values() if isinstance(e, dict) and e.get("type") == "grok_bot"]

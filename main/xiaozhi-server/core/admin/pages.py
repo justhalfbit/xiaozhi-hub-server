@@ -382,13 +382,13 @@ def vendor_test_config(vendor_id: str, payload: dict, merged: dict) -> dict:
 
 def desired_intent(merged: dict, llm_name: str, path: Path = None):
     """切换大模型后意图识别应该是什么：Claude CLI 只能用 nointent；
-    API 模型恢复用户上次在 API 模式下的选择，没有选过时 Claude 用 nointent、其他用 function_call。"""
+    API 模型恢复用户上次在 API 模式下的选择，没有选过时用 function_call。"""
     if config_store.entry_type(merged, "LLM", llm_name) == "claude_cli":
         return "nointent"
     pref = (config_store.load_custom(path).get("admin") or {}).get("api_intent")
     if pref in catalog.INTENT_MODES:
         return pref
-    return "nointent" if llm_name == catalog.VENDOR_BY_ID["claude"]["entry"] else "function_call"
+    return "function_call"
 
 
 # ---------- 语音识别 ----------

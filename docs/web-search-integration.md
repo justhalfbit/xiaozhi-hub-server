@@ -1,79 +1,47 @@
-# 联网搜索插件使用指南
+# 联网搜索插件
 
 ## 功能简介
 
-联网搜索插件 `web_search` 支持在对话过程中实时联网搜索信息并返回结果。插件支持三个搜索源：秘塔（Metaso）、Tavily和Serply，用户可根据需要选择其中一个。
+联网搜索插件 `web_search` 让大模型在对话中查实时信息（新闻、天气以外的最新消息、价格、比分等）。
 
-## API Key申请指南
+做法和 DeepSeek Harness 一致：不接专门的搜索服务，而是向一个 **Anthropic 协议** 的接口发请求，带上接口自带的搜索工具 `web_search_20250305`，让那个模型去搜，拿回总结和搜索结果（标题、日期），再交给聊天模型回答。
 
-目前我们适配了`秘塔搜索`、`Tavily搜索`和`Serply搜索`。
-- Tavily搜索：每个月1000次免费额度。
-- 秘塔搜索：拥有较为优质的国内数据源。
-- Serply搜索：返回谷歌搜索结果，注册赠送2500次免费额度，额度用完后需要付费。
+- 需要支持自带搜索的 Anthropic 协议接口，例如 DeepSeek（`https://api.deepseek.com/anthropic/v1`，用 DeepSeek 平台的 Key，见 [DeepSeek 文档](https://api-docs.deepseek.com/guides/anthropic_api)）、Anthropic 官方（`https://api.anthropic.com`）。
+- 聊天模型和这里无关，用哪家都可以；搜索接口单独设置。
+- 搜不到或出错时，插件会让模型告诉用户"这次没搜到"，不会卡住。整次搜索最多等 20 秒（实测一般 3 到 5 秒）。
 
-## API Key申请指南
+## 在管理后台设置（推荐）
 
-### 方式一：使用秘塔搜索
+1. 打开管理后台的「意图识别」页，选「用插件」。
+2. 在「联网搜索」旁边点「设置」，填写：
+   - 接口地址：默认 `https://api.deepseek.com/anthropic/v1`（和 DeepSeek Harness 一致），写到 `/anthropic` 或 `/anthropic/v1` 都可以；
+   - API Key：只写不读，填过后显示"已配置"，留空表示不改；
+   - 模型：默认 `deepseek-v4-flash`；
+   - 单次最多搜索次数：默认 5（1–10）。
+3. 点「测试」会真搜一次：成功显示搜到几条和第一条标题，失败说明原因（Key 不对、地址不通、不是 Anthropic 协议、不支持自带搜索等）。
+4. 点「保存设置」后马上生效，不用重启；再勾选「联网搜索」并保存意图识别。
 
-- 访问 [秘塔搜索API](https://metaso.cn/search-api/api-keys)，注册并登录账号
-- 在API密钥管理页面，点击"创建新的Key"
-- 复制生成的API Key（以 `mk-` 为前缀），这是配置所需的关键信息
+> 网关装在设备上时，接口地址里的 `127.0.0.1` 指设备自己。要用另一台电脑上的接口，填那台电脑的局域网地址，并让那个服务监听局域网。
 
-### 方式二：使用Tavily搜索
+## 在配置文件里设置
 
-- 访问 [Tavily控制台](https://app.tavily.com/home)，注册并登录账号
-- 在控制台中创建API Key
-- 复制生成的API Key（以 `tvly-` 为前缀），这是配置所需的关键信息
-
-### 方式三：使用Serply搜索
-
-- 访问 [Serply](https://serply.io)，注册并登录账号
-- 在控制台中创建API Key
-- 复制生成的API Key，这是配置所需的关键信息
-- 接口说明见 [Serply文档](https://serply.io/docs)
-
-## 配置方式
-
-### 方式1. 使用智控台部署（推荐）
-
-- 登录智控台
-- 进入"配置角色"页面，选择要配置的智能体
-- 点击"编辑功能"按钮，在右侧参数配置区域找到"联网搜索"插件
-- 勾选"联网搜索"
-- 填入搜索源（`metaso`、`tavily`或`serply`），并将对应的`API Key`填入配置项
-- 保存配置，再保存智能体配置
-
-### 方式2. 单模块xiaozhi-server部署
-
-在 `data/.config.yaml` 中配置：
-
-- 将搜索源填入 `provider`，可选值为 `metaso`、`tavily` 或 `serply`
-- 将申请到的API Key填入 `api_key`
+在 `data/.config.yaml` 中：
 
 ```yaml
 plugins:
   web_search:
-    provider: "metaso"
+    base_url: "https://api.deepseek.com/anthropic/v1"
     api_key: "你的API Key"
+    model: "deepseek-v4-flash"
+    max_uses: 5
+    # 可选：工具描述，告诉大模型什么时候该搜
+    # description: "联网搜索工具。……"
+Intent:
+  function_call:
+    functions:
+      - web_search
 ```
 
-如需自定义返回结果数量和工具描述，可额外配置 `max_results` 和 `description`：
+改配置文件后重启服务生效。
 
-```yaml
-plugins:
-  web_search:
-    provider: "metaso"
-    description: "联网搜索工具。当用户明确需要联网搜索问题时使用此工具。"
-    max_results: 5
-    api_key: "你的API Key"
-```
-
-同时在 `functions` 列表中确保已启用 `web_search`：
-
-```yaml
-plugins:
-  functions:
-    - web_search
-```
-
-配置完成后重启服务即可生效。
+旧版本的 `provider`（秘塔、Tavily、Serply）和 `max_results` 已不再使用。配置里还留着 `provider` 时，原来填的 Key 是给那些服务的，新版不会使用、也不会发出去，插件当成还没配置；在后台重新填 Key 并保存，会一起清掉旧设置。

@@ -125,8 +125,8 @@ PLUGINS = [
     {"name": "get_news_from_newsnow", "label": "热点新闻", "desc": "澎湃新闻、百度热搜、财联社等热榜"},
     {"name": "get_news_from_chinanews", "label": "中新网新闻", "desc": "中国新闻网的社会、国际、财经新闻"},
     {"name": "play_music", "label": "放音乐", "desc": "播放电脑上 music 目录里的歌曲"},
-    {"name": "web_search", "label": "联网搜索", "desc": "需要在配置文件的 plugins.web_search 里填写搜索服务的 Key（秘塔、Tavily 等）",
-     "config": "web_search"},
+    {"name": "web_search", "label": "联网搜索", "desc": "用 Anthropic 协议接口自带的搜索查实时信息，点「设置」填接口和 Key",
+     "config": "web_search", "settings": "web_search"},
     {"name": "change_role", "label": "切换角色", "desc": "换人设和说话风格"},
     {"name": "hass_get_state", "label": "查智能家居状态", "desc": "需要在配置文件的 plugins.home_assistant 里填写地址和令牌",
      "config": "home_assistant"},
@@ -138,6 +138,34 @@ PLUGINS = [
      "config": "search_from_ragflow"},
 ]
 PLUGIN_NAMES = {p["name"] for p in PLUGINS}
+
+# 插件设置（后台插件旁边的「设置」）：按字段清单自动生成表单，值存在 plugins.<config> 下。
+# PLUGINS 条目加 "settings": <id> 指向这里。每份设置 {"note": 整体说明, "fields": [...]}，字段：
+#   key、label；type：text / secret（只写不读，留空表示不改）/ number（可带 min、max）；
+#   required：没填时插件显示"还没配置"（不写就是选填）；default：留空时实际用的值，页面上当占位提示；
+#   hint：字段旁边的说明文字。
+# legacy_keys：旧版插件才有的字段，配置里还有它们时，已保存的密钥当成没填（是给别的服务的），
+#   保存时删掉这些字段并清掉旧密钥；legacy_note 是页面上的提示。
+# 要有「测试」按钮，在 core/admin/plugin_settings.py 的 TESTS 里登记测试函数。
+PLUGIN_SETTINGS = {
+    "web_search": {
+        "note": "需要 Anthropic 协议、支持自带搜索（web_search）的接口，比如 DeepSeek、Anthropic 官方。"
+                "聊天模型用哪家都可以，和这里无关。注意：网关装在设备上时，127.0.0.1 指设备自己。",
+        "fields": [
+            {"key": "base_url", "label": "接口地址", "type": "text", "default": "https://api.deepseek.com/anthropic/v1",
+             "hint": "写到 /anthropic 或 /anthropic/v1 都可以；Anthropic 官方填 https://api.anthropic.com"},
+            {"key": "api_key", "label": "API Key", "type": "secret", "required": True},
+            {"key": "model", "label": "模型", "type": "text", "default": "deepseek-v4-flash",
+             "hint": "用来搜索和总结的模型，比如 deepseek-v4-flash、claude-haiku-5-5"},
+            {"key": "max_uses", "label": "单次最多搜索次数", "type": "number", "default": 5, "min": 1, "max": 10,
+             "hint": "一个问题里模型最多搜几轮；越多越全，也越慢"},
+        ],
+        # 旧版联网搜索（秘塔、Tavily、Serply）的字段：那时的 Key 不能发给新接口
+        "legacy_keys": ["provider", "max_results"],
+        "legacy_note": "配置里还留着旧版联网搜索（秘塔、Tavily、Serply）的设置，那时填的 Key 不能用在新接口上，"
+                       "新版不会使用它。请重新填写 API Key 并保存，旧设置会一起清掉。",
+    },
+}
 INTENT_MODES = ("nointent", "function_call")
 
 # ---------- 情绪（表情测试） ----------

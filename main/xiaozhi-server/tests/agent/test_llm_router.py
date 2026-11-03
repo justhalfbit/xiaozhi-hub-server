@@ -198,7 +198,7 @@ def test_intent_mode():
     cfg = intent_config()  # 后台默认 Claude Code（意图识别只能是 nointent）
     assert llm_router.intent_mode(cfg, "ClaudeCLI") == "nointent"
     assert llm_router.intent_mode(cfg, "DeepSeekLLM") == "function_call"
-    assert llm_router.intent_mode(cfg, "ClaudeAPI") == "nointent"  # Claude 在 function_call 下有问题
+    assert llm_router.intent_mode(cfg, "ClaudeAPI") == "function_call"  # 所有 API 模型都能用插件
     assert llm_router.intent_mode(intent_config(api_intent="nointent"), "DeepSeekLLM") == "nointent"  # 后台选过
     cfg = intent_config(default="DeepSeekLLM", intent="function_call")
     assert llm_router.intent_mode(cfg, "ClaudeCLI") == "nointent"

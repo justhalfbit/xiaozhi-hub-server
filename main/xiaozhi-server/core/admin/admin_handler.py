@@ -22,7 +22,7 @@ from pathlib import Path
 from aiohttp import web
 
 from config.logger import setup_logging
-from core.admin import auth, catalog, config_store, connections, pages, pipeline, updater
+from core.admin import auth, catalog, config_store, connections, pages, pipeline, plugin_settings, updater
 from core.admin.grokbot import GrokBotAdmin
 from core.admin.status import _claude_version, collect_status
 from core.agent import chat_history, llm_router, reports
@@ -110,6 +110,9 @@ class AdminHandler:
                 web.get("/admin/api/tts/preview", self.handle_tts_preview),
                 web.get("/admin/api/intent", self.handle_intent),
                 web.post("/admin/api/intent", self.handle_intent_save),
+                web.get("/admin/api/plugin-settings/{id}", self.handle_plugin_settings),
+                web.post("/admin/api/plugin-settings/{id}", self.handle_plugin_settings_save),
+                web.post("/admin/api/plugin-settings/{id}/test", self.handle_plugin_settings_test),
                 web.get("/admin/api/call-names", self.handle_call_names),
                 web.post("/admin/api/call-names", self.handle_call_names_save),
                 web.post("/admin/api/call-names/learn", self.handle_call_names_learn),
@@ -1013,6 +1016,54 @@ class AdminHandler:
         if result["note"] == "已经在使用" and notes:
             result["note"] = notes[-1]
         return self._json(result)
+
+    # ---------- 插件设置 ----------
+
+    async def handle_plugin_settings(self, request: web.Request):
+        self._require_login(request)
+        merged = await self._blocking(self._merged)
+        try:
+            return self._json({"ok": True, **plugin_settings.describe(merged, request.match_info["id"])})
+        except KeyError:
+            return self._error("没有这个插件设置", 404)
+
+    async def handle_plugin_settings_save(self, request: web.Request):
+        """保存后马上同步进运行中的配置和每个在线连接：插件每次调用都读 conn.config，不用重连。"""
+        self._require_login(request)
+        settings_id = request.match_info["id"]
+        body = await self._read_json(request)
+        try:
+            merged = await self._blocking(self._merged)
+            changed = await self._blocking(plugin_settings.save, settings_id, body, merged, self.config_path)
+            key = plugin_settings.config_key(settings_id)
+        except KeyError:
+            return self._error("没有这个插件设置", 404)
+        except ValueError as e:
+            return self._error(str(e), 400)
+        if not changed:
+            return self._json({"ok": True, "changed": [], "note": "没有修改",
+                               "configured": plugin_settings.configured(merged, settings_id)})
+        merged = await self._blocking(self._merged)
+        fresh = (merged.get("plugins") or {}).get(key) or {}
+        self.config.setdefault("plugins", {})[key] = copy.deepcopy(fresh)
+        for conn in connections.all_connections():
+            if isinstance(getattr(conn, "config", None), dict):
+                conn.config.setdefault("plugins", {})[key] = copy.deepcopy(fresh)
+        self.logger.bind(tag=TAG).info(f"管理后台更新了插件设置 {settings_id}: {', '.join(changed)}")
+        return self._json({"ok": True, "changed": changed, "note": "已保存，马上生效",
+                           "configured": plugin_settings.configured(merged, settings_id)})
+
+    async def handle_plugin_settings_test(self, request: web.Request):
+        self._require_login(request)
+        body = await self._read_json(request)
+        try:
+            merged = await self._blocking(self._merged)
+            result = await plugin_settings.run_test(request.match_info["id"], body, merged)
+        except KeyError:
+            return self._error("这个插件没有测试", 404)
+        except ValueError as e:
+            return self._error(str(e), 400)
+        return self._json({"ok": True, **result})
 
     # ---------- 在线设备与表情测试 ----------
 

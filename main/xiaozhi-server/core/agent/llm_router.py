@@ -131,7 +131,7 @@ def intent_mode(config: dict, name: str) -> Optional[str]:
 
     - 用的就是后台默认模型：和后台的设置一致；
     - Claude Code、Grok Bot：nointent；
-    - 其他 API 模型：后台在 API 模式下选过的，没选过时 Claude 用 nointent、其他用 function_call。
+    - 其他 API 模型：后台在 API 模式下选过的，没选过时用 function_call。
     后台的意图识别不是这两种（如 intent_llm）时返回 None：不按设备改。
     """
     selected = _entry_type(config, "Intent", (config.get("selected_module") or {}).get("Intent"))
@@ -144,9 +144,7 @@ def intent_mode(config: dict, name: str) -> Optional[str]:
     pref = (config.get("admin") or {}).get("api_intent")
     if pref in INTENT_MODES:
         return pref
-    from core.admin import catalog
-
-    return "nointent" if name == catalog.VENDOR_BY_ID["claude"]["entry"] else "function_call"
+    return "function_call"
 
 
 def _intent_entry(config: dict, mode: str) -> Optional[str]:

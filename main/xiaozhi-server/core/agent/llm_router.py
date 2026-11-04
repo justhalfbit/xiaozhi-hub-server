@@ -118,7 +118,7 @@ def not_ready_reply(conn: "ConnectionHandler") -> Optional[str]:
 
 
 INTENT_MODES = ("nointent", "function_call")
-AGENT_TYPES = ("claude_cli", "grok_bot")  # 自己处理工具和对话的 Agent：不走 function_call
+AGENT_TYPES = ("claude_cli", "grok_bot", "pi_cli")  # 自己处理工具和对话的 Agent：不走 function_call
 
 
 def _entry_type(config: dict, section: str, name: Optional[str]) -> Optional[str]:

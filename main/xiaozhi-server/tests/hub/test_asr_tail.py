@@ -3,7 +3,7 @@ import asyncio
 import json
 from types import SimpleNamespace
 
-from core.providers.asr.base import ASR_TAIL_BYTES, ASRProviderBase
+from core.providers.asr.base import ASR_PREROLL_BYTES, ASR_TAIL_BYTES, ASRProviderBase
 from core.providers.asr.dto.dto import InterfaceType
 
 FRAME = b"\x01\x00" * 320  # 20 ms
@@ -201,3 +201,27 @@ def test_hello_says_the_hub_sends_vad_events():
         asyncio.run(handleHelloMessage(conn, {"type": "hello", "features": features}))
         assert conn.websocket.sent[0].get("features") == expect
     assert "features" not in shared   # 共用的欢迎消息不被改掉
+
+
+def test_quick_short_word_after_silence_is_recognised():
+    """快说的"你好"：有声 0.3 秒，加上说话前留的 0.6 秒和尾部 0.3 秒，过得了"太短不识别"的门槛。"""
+    asr = FakeASR()
+    conn = make_conn(asr, {"vad_end": True})
+
+    async def run():
+        for _ in range(100):   # 唤醒后静了 2 秒
+            await asr.receive_audio(conn, FRAME, False)
+        await feed(asr, conn, voiced=15, silent=45)
+    asyncio.run(run())
+    assert len(asr.got) == ASR_PREROLL_BYTES + 15 * len(FRAME) + ASR_TAIL_BYTES
+    assert [m["state"] for m in conn.websocket.sent] == ["end"]
+
+
+def test_keep_last_bytes():
+    from core.providers.asr.base import keep_last_bytes
+    frames = [bytes([i]) * 640 for i in range(50)]                      # 20 ms 一帧
+    assert keep_last_bytes(frames, ASR_PREROLL_BYTES) == frames[-30:]
+    big = [bytes([i]) * 1920 for i in range(50)]                        # 60 ms 一帧
+    assert keep_last_bytes(big, ASR_PREROLL_BYTES) == big[-10:]
+    assert keep_last_bytes(frames[:3], ASR_PREROLL_BYTES) == frames[:3]
+    assert keep_last_bytes([], ASR_PREROLL_BYTES) == []

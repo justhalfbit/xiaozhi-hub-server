@@ -30,6 +30,9 @@ TAG = __name__
 logger = setup_logging()
 
 ASR_TAIL_BYTES = 16000 * 2 * 3 // 10  # [xiaozhi-hub] 送去识别的尾部静音：0.3 秒 16kHz 16 位
+# [xiaozhi-hub] 开始说话前保留的音频：0.6 秒。原来固定留 10 帧，按上游 60 ms 一帧是 0.6 秒，
+# 我们的客户端一帧 20 ms 只剩 0.2 秒，快说的"你好"（有声约 0.3 秒）凑不满下面 0.9 秒的"太短不识别"门槛
+ASR_PREROLL_BYTES = 16000 * 2 * 6 // 10
 SEGMENT_MIN_BYTES = 16000 * 2  # [xiaozhi-hub] 边说边识别：不到 1 秒的段不单独识别（太短没有上下文）
 # [xiaozhi-hub] 切在最后有声音之后 0.15 秒：停顿确认时（静音满 segment_pause_ms）下一个字可能已经开头了，
 # VAD 判定有声音要滞后约 0.1 秒，切在当下会把它的开头切进上一段（"我， 我要"）
@@ -46,6 +49,16 @@ async def send_vad_event(conn: "ConnectionHandler", state: str):
         await conn.websocket.send(json.dumps({"type": "vad", "state": state, "session_id": conn.session_id}))
     except Exception:
         pass
+
+
+def keep_last_bytes(frames, size):
+    """[xiaozhi-hub] 最后几帧，凑够 size 字节为止（帧长随客户端而定）。"""
+    total = 0
+    for i in range(len(frames) - 1, -1, -1):
+        total += len(frames[i])
+        if total >= size:
+            return frames[i:]
+    return frames
 
 
 def join_segments(texts: List[str]) -> str:
@@ -106,7 +119,7 @@ class ASRProviderBase(ABC):
 
             # 如果没有语音，且之前也没有声音，缓存部分音频
             if not audio_have_voice and not conn.client_have_voice:
-                conn.asr_audio = conn.asr_audio[-10:]
+                conn.asr_audio = keep_last_bytes(conn.asr_audio, ASR_PREROLL_BYTES)
                 return
 
             if conn.asr.interface_type != InterfaceType.STREAM and not conn.client_voice_stop:

@@ -7,7 +7,10 @@
 - 普通 HTTP 模型：新连接（或切到这个模型）时从库里载入这台设备这个模型最近 max_messages 条（load），
   每次发给模型时再按"最近 max_messages 条 + 约 max_tokens 个 token"截一个窗口（select_window）。
   窗口只从用户的话开始切，工具调用、工具结果和后面的回复跟着它那句话走，不会拆开；
-- 被窗口截掉的部分在后台增量总结成一段记忆（summarize），放进系统提示的 <memory>。记忆按设备一份，
+- 隔了 fresh_after_minutes（默认 30 分钟）没说话，再开口就是新对话：上一段不再载入给模型（屏幕上照样显示），
+  只靠记忆接上。语音设备隔一阵再问多半是另一件事（几个人共用的设备还可能是另一个人）；带着几个小时前的话题
+  容易答偏，每次请求也多带几千 token。30 分钟以内照旧接着聊；设成 0 就和原来一样一直接着聊；
+- 被窗口截掉、或因为隔太久没载入的部分在后台增量总结成一段记忆（summarize），放进系统提示的 <memory>。记忆按设备一份，
   这台设备所有普通 API 模型共用（记的是关于用户的事）；管理后台能查看、手改、清空（set_memory，马上生效）。
   只拿库里的真实对话去总结：上游 mem_local_short 把整份 dialogue 交给模型，工具调用示例（假对话）会混进记忆；
 - Claude Code、Grok Bot 的上下文和记忆在它们自己的会话里（网关只发最后一句），这里只存记录给屏幕显示，
@@ -15,7 +18,7 @@
 - 清除（clear）：只清本机——删库里这台设备的记录、清空记忆、清在线连接里网关这边的对话；
   Claude Code、Grok Bot 自己的会话和记忆不碰。
 
-配置（config.yaml 的 chat_history）：enabled、max_messages、max_tokens、summary、summary_min、summary_chars、
+配置（config.yaml 的 chat_history）：enabled、max_messages、max_tokens、fresh_after_minutes、summary、summary_min、summary_chars、
 summary_llm（总结用哪个 LLM 条目，空则用当前模型）、display_limit。
 """
 
@@ -37,6 +40,7 @@ DEFAULTS = {
     "enabled": True,
     "max_messages": 30,     # 每次最多带最近这么多条（用户、助手、工具消息都算）
     "max_tokens": 8000,     # 再加一道 token 上限（估算值）
+    "fresh_after_minutes": 30,  # 隔这么久没说话，下一句就开新对话（上一段只进记忆）；0 = 一直接着聊
     "summary": True,        # 截掉的部分总结成记忆
     "summary_min": 6,       # 截掉、还没总结的攒到这么多条才总结一次，免得每轮都调一次模型
     "summary_chars": 500,   # 记忆最多多少字
@@ -48,9 +52,17 @@ AGENT_KINDS = {"claude_cli", "grok_bot"}
 HINT_PREFIX = "[系统提示]"
 CUT_MARK = "……"  # reply_progress 给被打断的回复加的结尾
 SUMMARY_BATCH = 200  # 一次最多总结这么多条（第一次上线时库里可能已经有很长的记录）
-SUMMARY_PROMPT = """你负责给一个语音助手维护关于用户的长期记忆。下面给你【已有记忆】和【较早的对话】，这些对话之后不会再发给助手。
-请把两者合并成新的记忆：保留用户的个人信息、偏好、正在做的事、约定和待办、聊天中得出的关键结论；去掉寒暄、重复和已经过时的内容。
-用简洁的中文要点，每条一行，总共不超过 {chars} 字。只根据给你的对话内容写，不要编造，不要解释，只输出记忆本身；没有值得记的就输出"无"。"""
+# 原来的规则只说"去掉过时的内容"，模型把一次性的查询结果（某次的内存温度、某天的天气、一段股市分析）
+# 和"天气服务故障"都记了进去；后者在天气修好以后还会让模型以为查不了。所以把不记的东西写明
+SUMMARY_PROMPT = """你负责给一个语音助手维护关于用户的长期记忆。设备可能是几个人共用的，说话的不一定是同一个人。
+下面给你【已有记忆】和【较早的对话】，这些对话之后不会再发给助手。请把两者合并成新的记忆，只留下以后的对话里还用得上的事：
+- 用户的基本情况：称呼、家人、所在城市、常用的设备之类；
+- 偏好和习惯，包括对助手说话方式的要求；
+- 约定、计划、待办，以及还在进行、没有结束的事；
+- 用户纠正过助手的地方。
+不要记：一次性的查询和它的结果（天气、时间、新闻、股市、换算、设备的内存温度等状态数字）、讲过的笑话和故事、寒暄，
+以及工具或服务出错、查不到这类临时故障。已有记忆里属于这些的也删掉。
+用简洁的中文要点，每条一行，总共不超过 {chars} 字。只根据给你的内容写，不要编造，不要解释，只输出记忆本身；没有值得记的就输出"无"。"""
 
 _db = None
 _db_lock = threading.Lock()
@@ -294,6 +306,24 @@ def _msg_tokens(m) -> int:
     return estimate_tokens(get("content")) + estimate_tokens(get("tool_calls")) + 4
 
 
+def session_start(rows: List[dict], fresh_after_minutes, now: float = None) -> int:
+    """库里的记录（按时间排）里，当前这段对话从第几条开始：从最后一条往前，相邻两条隔了超过
+    fresh_after_minutes 就是上一段；最后一条离现在也超过了，就是全都属于上一段（返回 len(rows)）。
+    开头落在助手或工具消息上（残组）就挪到下一句用户的话。fresh_after_minutes 为 0 时返回 0。"""
+    gap = float(fresh_after_minutes or 0) * 60
+    if gap <= 0 or not rows:
+        return 0
+    now = time.time() if now is None else now
+    if now - (rows[-1].get("created") or now) > gap:
+        return len(rows)
+    i = len(rows) - 1
+    while i > 0 and (rows[i].get("created") or 0) - (rows[i - 1].get("created") or 0) <= gap:
+        i -= 1
+    while i < len(rows) and rows[i].get("role") != "user":
+        i += 1
+    return i
+
+
 def select_window(messages: list, max_messages: int, max_tokens: int) -> int:
     """返回窗口从第几条开始：按"一句用户的话 + 它后面的回复、工具调用和结果"成组，从新往旧装，
     超过条数或 token 上限就停。最新的一组总是带上（哪怕它自己就超了）。messages 是 Message 或 dict。"""
@@ -351,6 +381,11 @@ def load(conn, dialogue, name: str) -> None:
     except Exception as e:
         logger.bind(tag=TAG).error(f"读取聊天记录失败: {e}")
         return
+    fresh = session_start(rows, cfg["fresh_after_minutes"])
+    if fresh:
+        logger.bind(tag=TAG).info(f"设备 {device} 模型 {name}：距上次说话超过 {cfg['fresh_after_minutes']} 分钟，"
+                                  f"开新对话（{fresh} 条较早的记录只进记忆）")
+        rows = rows[fresh:]
     loaded = []
     for r in rows:
         m = Message(role=r["role"], content=r["content"], tool_calls=r["tool_calls"], tool_call_id=r["tool_call_id"])
@@ -452,6 +487,8 @@ def pending_summary(device: str, cfg: dict, config: dict):
             continue
         rows = store.after(device, name, progress.get(name, 0))
         start = select_window(rows, int(cfg["max_messages"]), int(cfg["max_tokens"]))
+        # 上一段对话（隔太久，不会再载入）也要总结，不然它既不在上下文里、也不在记忆里
+        start = max(start, session_start(rows, cfg["fresh_after_minutes"]))
         batch += [{**r, "model": name} for r in rows[:start]]
     return batch[:SUMMARY_BATCH], mem
 
@@ -509,7 +546,10 @@ def maybe_summarize(conn) -> None:
     def run():
         try:
             rows, _ = pending_summary(device, cfg, config)
-            if len(rows) < int(cfg["summary_min"]):
+            # 攒够 summary_min 条才总结；上一段对话已经结束的，哪怕只有一两句也总结掉
+            gap = float(cfg["fresh_after_minutes"] or 0) * 60
+            ended = gap > 0 and any(time.time() - (r.get("created") or 0) > gap for r in rows)
+            if not rows or (len(rows) < int(cfg["summary_min"]) and not ended):
                 return
             llm = _summary_llm(conn, key[1], cfg)
             if llm is not None:

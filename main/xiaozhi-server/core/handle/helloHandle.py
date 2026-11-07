@@ -90,7 +90,9 @@ async def checkWakeupWords(conn: "ConnectionHandler", text):
     if filtered_text not in conn.config.get("wakeup_words"):
         return False
 
+    # 和 receiveAudioHandle.mark_just_woken_up 一样，这里直接写避免循环导入
     conn.just_woken_up = True
+    conn.just_woken_up_at = time.monotonic()
     await send_tts_message(conn, "start")
 
     # 获取当前音色

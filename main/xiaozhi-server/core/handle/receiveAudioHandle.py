@@ -17,17 +17,30 @@ from core.handle.sendAudioHandle import send_stt_message, SentenceType
 
 TAG = __name__
 
+# 唤醒/文字提问后忽略音频的时长（秒），见 mark_just_woken_up
+JUST_WOKEN_UP_SECONDS = 2
+
+
+def mark_just_woken_up(conn: "ConnectionHandler"):
+    """唤醒后短暂忽略收到的音频（防问候语回声），从现在起 JUST_WOKEN_UP_SECONDS 秒内有效。"""
+    conn.just_woken_up = True
+    conn.just_woken_up_at = time.monotonic()
+
 
 async def handleAudioMessage(conn: "ConnectionHandler", pcm_frame):
     # 当前片段是否有人说话
     have_voice = conn.vad.is_vad(conn, pcm_frame)
-    # 如果设备刚刚被唤醒，短暂忽略VAD检测
-    if hasattr(conn, "just_woken_up") and conn.just_woken_up:
-        have_voice = False
-        # 设置一个短暂延迟后恢复VAD检测
-        if not hasattr(conn, "vad_resume_task") or conn.vad_resume_task.done():
-            conn.vad_resume_task = asyncio.create_task(resume_vad_detection(conn))
-        return
+    # 如果设备刚刚被唤醒，短暂忽略VAD检测。
+    # 窗口从打上标记时算起（JUST_WOKEN_UP_SECONDS），不是从第一帧音频算起：
+    # 文字提问后设备可能很久不送音频，旧写法会让标记一直留着，
+    # 下次语音唤醒时头 2 秒被扔掉，第一句识别为空。
+    if getattr(conn, "just_woken_up", False):
+        if (
+            time.monotonic() - getattr(conn, "just_woken_up_at", 0.0)
+            < JUST_WOKEN_UP_SECONDS
+        ):
+            return
+        conn.just_woken_up = False
     # 服务端AEC功能需要实时触发打断
     if conn.client_aec and have_voice:
         if conn.client_is_speaking and conn.client_listen_mode != "manual":
@@ -36,12 +49,6 @@ async def handleAudioMessage(conn: "ConnectionHandler", pcm_frame):
     await no_voice_close_connect(conn, have_voice)
     # 接收音频
     await conn.asr.receive_audio(conn, pcm_frame, have_voice)
-
-
-async def resume_vad_detection(conn: "ConnectionHandler"):
-    # 等待2秒后恢复VAD检测
-    await asyncio.sleep(2)
-    conn.just_woken_up = False
 
 
 async def startToChat(conn: "ConnectionHandler", text, gen=None):

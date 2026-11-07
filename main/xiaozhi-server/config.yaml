@@ -147,15 +147,25 @@ context_providers:
 
 # 插件的基础配置
 plugins:
-  # 获取天气插件的配置，这里填写你的api_key
-  # 这个密钥是项目共用的key，用多了可能会被限制
-  # 想稳定一点就自行申请替换，每天有1000次免费调用
-  # 申请地址：https://console.qweather.com/#/apps/create-key/over
-  # 申请后通过这个链接可以找到自己的apihost：https://console.qweather.com/setting?lang=zh
+  # 查天气插件。provider（数据源）：
+  #   auto（默认）：填了自己的和风 api_key 就用和风，否则用 Open-Meteo
+  #   open-meteo：https://open-meteo.com ，免费、不用注册、不用 Key
+  #   qweather：和风天气，要自己申请 Key（每天有 1000 次免费调用），并填自己账号的 API Host
+  #     申请地址：https://console.qweather.com/#/apps/create-key/over
+  #     API Host 在这里看：https://console.qweather.com/setting?lang=zh
+  # 以前写在这里的项目共用和风 Key 已经失效
   get_weather:
-    api_host: "mj7p3y7naa.re.qweatherapi.com"
-    api_key: "a861d0d5e7bf4ee1a83d9a9e4f96d4da"
+    provider: auto
+    api_host: ""
+    api_key: ""
+    # 没说地点、按 IP 也查不到城市时用这个
     default_location: "广州"
+    # 本地位置（可选）：填了经纬度，查本地天气直接用它，不按 IP 查城市；aliases 是也算本地的叫法
+    # local:
+    #   name: 北京
+    #   latitude: 39.9075
+    #   longitude: 116.3972
+    #   aliases: [Beijing]
   # 获取新闻插件的配置，这里根据需要的新闻类型传入对应的url链接，默认支持社会、科技、财经新闻
   # 更多类型的新闻列表查看 https://www.chinanews.com.cn/rss/
   get_news_from_chinanews:

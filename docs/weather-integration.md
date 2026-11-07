@@ -2,7 +2,29 @@
 
 ## 概述
 
-天气插件 `get_weather` 是小智ESP32语音助手的核心功能之一，支持通过语音查询全国各地的天气信息。插件基于和风天气API，提供实时天气和7天天气预报功能。
+天气插件 `get_weather` 是小智ESP32语音助手的核心功能之一，支持通过语音查询全国各地的天气信息，提供实时天气和7天天气预报功能。
+
+数据源有两个，由 `plugins.get_weather.provider` 决定：
+
+- `auto`（默认）：填了自己的和风天气 `api_key` 就用和风，否则用 Open-Meteo；
+- `open-meteo`：[Open-Meteo](https://open-meteo.com)，免费、不用注册、不用 Key，开箱即用；
+- `qweather`：和风天气，需要按下面的步骤申请自己的 `API Key` 和 `API Host`。
+
+以前配置里自带的项目共用和风 Key 已经失效，不申请 Key 时用 Open-Meteo 即可。
+
+想让"今天天气怎么样"这类不说地点的问题查得准，可以写上本地的经纬度（不写就按客户端 IP 查城市，查不到用 `default_location`）：
+
+```yaml
+plugins:
+  get_weather:
+    local:
+      name: 北京
+      latitude: 39.9075
+      longitude: 116.3972
+      aliases: [Beijing]   # 用户或模型说这些名字也算本地
+```
+
+下面是使用和风天气时的申请和配置步骤。
 
 ## API Key 申请指南
 
@@ -57,6 +79,7 @@
 ```yaml
 plugins:
   get_weather:
+    provider: qweather
     api_key: "你的和风天气API密钥"
     api_host: "你的和风天气API主机地址"
     default_location: "你的默认查询城市"

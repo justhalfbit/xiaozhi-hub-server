@@ -1280,7 +1280,7 @@ async function openPluginSettings(id, label, onSaved) {
     <div class="grid2">
       ${d.fields.map((f) => `<label class="f ${f.type === "text" ? "full" : ""}">${esc(f.label)}${f.hint ? `<span class="hint">${esc(f.hint)}</span>` : ""}${input(f)}</label>`).join("")}
     </div>
-    <p class="muted small" style="margin:8px 0 0">密钥只保存在网关的配置文件里，页面上只显示首尾 4 位。保存后马上生效，不用重启。</p>
+    <p class="muted small" style="margin:8px 0 0">${d.fields.some((f) => f.type === "secret") ? "密钥只保存在网关的配置文件里，页面上只显示首尾 4 位。" : ""}保存后马上生效，不用重启。</p>
     <div class="actions"><span class="result" id="ps-result"></span>
       <button class="btn" id="ps-close">收起</button>
       ${d.testable ? '<button class="btn" id="ps-test">测试</button>' : ""}

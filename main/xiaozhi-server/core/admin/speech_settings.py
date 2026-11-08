@@ -1,6 +1,8 @@
 """OpenAI-compatible speech settings; credentials remain write-only."""
 import math
 import re
+import hashlib
+import json
 from urllib.parse import urlsplit
 
 from ruamel.yaml.comments import CommentedMap
@@ -13,6 +15,19 @@ SPEECH = {
     'TTS': {'entry': 'OpenAITTS', 'endpoint': '/audio/speech', 'model_field': 'model',
             'url_field': 'api_url', 'model': 'tts-1'},
 }
+
+
+def tts_profile(config):
+    """Public voice identity for device audio caches; never include credentials."""
+    name = (config.get('selected_module') or {}).get('TTS')
+    entry = (config.get('TTS') or {}).get(name) or {}
+    fields = ('type', 'model', 'voice', 'private_voice', 'speed', 'speech_rate', 'volume',
+              'pitch_rate', 'format', 'pcm_sample_rate', 'api_protocol', 'api_url', 'base_url',
+              'ttsRate', 'ttsVolume', 'ttsPitch')
+    identity = {'entry': name, **{k: entry.get(k) for k in fields}}
+    revision = hashlib.sha256(json.dumps(identity, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:32]
+    return {'revision': revision, 'entry': name, 'type': entry.get('type'), 'model': entry.get('model'),
+            'voice': entry.get('private_voice') or entry.get('voice'), 'speed': entry.get('speed')}
 
 
 def describe(section, merged):

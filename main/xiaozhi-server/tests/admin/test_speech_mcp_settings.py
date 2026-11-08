@@ -122,6 +122,36 @@ def test_reply_language_preserves_original_prompt():
     assert 'Simplified Chinese' in apply(prompt, 'zh-Hans')
 
 
+def test_tts_profile_tracks_voice_model_and_speed_without_credentials():
+    import copy
+    config = {'selected_module': {'TTS': 'OpenAITTS'}, 'TTS': {'OpenAITTS': {
+        'type': 'openai', 'model': 'gemini-tts', 'voice': 'Leda', 'speed': 1,
+        'api_key': 'never-return-this-key', 'api_url': 'https://speech.example/v1/audio/speech'}}}
+    profile = speech_settings.tts_profile(config)
+    assert profile['voice'] == 'Leda' and 'never-return-this-key' not in json.dumps(profile)
+    assert 'speech.example' not in json.dumps(profile)
+    for field, value in [('voice', 'Kore'), ('model', 'another-model'), ('speed', 1.25), ('api_url', 'https://another.example/speech')]:
+        changed = copy.deepcopy(config); changed['TTS']['OpenAITTS'][field] = value
+        assert speech_settings.tts_profile(changed)['revision'] != profile['revision']
+
+
+@pytest.mark.asyncio
+async def test_tts_profile_is_local_only_and_reports_actual_instance(monkeypatch):
+    from types import SimpleNamespace
+    from core.admin import connections
+    config = {'selected_module': {'TTS': 'OpenAITTS'}, 'TTS': {'OpenAITTS': {'model': 'new', 'voice': 'Leda'}}}
+    h = AdminHandler(config)
+    tts = SimpleNamespace(model='actual-model', voice='actual-voice', last_request={'model': 'actual-model', 'voice': 'actual-voice'})
+    conn = SimpleNamespace(session_id='session', common_config=config, tts=tts)
+    monkeypatch.setattr(connections, 'all_connections', lambda: [conn])
+    denied = await h.handle_kiosk_tts_profile(SimpleNamespace(remote='192.0.2.5', headers={}))
+    assert denied.status == 403
+    response = await h.handle_kiosk_tts_profile(SimpleNamespace(remote='127.0.0.1', headers={}))
+    result = json.loads(response.text)
+    assert result['voice'] == 'Leda' and result['active'][0]['voice'] == 'actual-voice'
+    assert result['active'][0]['last_request']['voice'] == 'actual-voice'
+
+
 @pytest.mark.asyncio
 async def test_authenticated_speech_switch_and_mcp_roundtrip(tmp_path):
     path = tmp_path / '.config.yaml'; path.write_text('{}\n')

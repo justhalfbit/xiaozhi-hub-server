@@ -152,6 +152,7 @@ class AdminHandler:
                 web.post("/kiosk/reports", self.handle_kiosk_reports),
                 web.post("/kiosk/asr", self.handle_kiosk_asr),
                 web.post("/kiosk/tts", self.handle_kiosk_tts),
+                web.get('/kiosk/tts/profile', self.handle_kiosk_tts_profile),
                 web.get("/kiosk/chat/history", self.handle_kiosk_chat_history),
                 web.post("/kiosk/chat/clear", self.handle_kiosk_chat_clear),
             ]
@@ -718,7 +719,19 @@ class AdminHandler:
             if name and llm_router.model_ready(merged, name) and any(o["entry"] == name for o in options):
                 selected = name
         return {"selected": selected, "default": data["selected"], "kind": data["kind"], "vendor": data["vendor"],
-                "options": options}
+                "options": options, 'tts_profile': speech_settings.tts_profile(self.config)}
+
+    def _active_tts(self):
+        return [{'session_id': c.session_id, 'provider': type(c.tts).__module__,
+                 'model': getattr(c.tts, 'model', None), 'voice': getattr(c.tts, 'voice', None),
+                 'last_request': getattr(c.tts, 'last_request', None)}
+                for c in connections.all_connections()
+                if getattr(c, 'common_config', None) is self.config and getattr(c, 'tts', None)]
+
+    async def handle_kiosk_tts_profile(self, request):
+        if not self._from_this_machine(request):
+            return self._error('僅限本機', 403)
+        return self._json({'ok': True, **speech_settings.tts_profile(self.config), 'active': self._active_tts()})
 
     async def handle_kiosk_llm_use(self, request: web.Request):
         """把这台设备切到 body 指定的模型（{"kind": "cli"}、{"kind": "api", "vendor": …}、{"kind": "grok", "entry": …}，
@@ -1022,7 +1035,8 @@ class AdminHandler:
     async def handle_tts(self, request: web.Request):
         self._require_login(request)
         merged = await self._blocking(self._merged)
-        return self._json({"ok": True, **pages.describe_tts(merged), "running": self._running("TTS")})
+        return self._json({"ok": True, **pages.describe_tts(merged), "running": self._running("TTS"),
+                           'profile': speech_settings.tts_profile(self.config), 'active': self._active_tts()})
 
     async def handle_speech_save(self, request):
         self._require_login(request)

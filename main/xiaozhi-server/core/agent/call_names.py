@@ -157,7 +157,10 @@ _cache_dir = Path(get_project_dir()) / "data" / "call_reply_audio"
 def _cache_key(conn: "ConnectionHandler", text: str):
     # 存盘后后台改了音色、语速、音量（含 post_gain）都要重新合成，所以这些都算进来
     tts = conn.tts
-    return (type(tts).__name__, getattr(tts, "voice", None), getattr(tts, "speech_rate", None),
+    return (type(tts).__module__, type(tts).__name__, getattr(tts, 'model', None),
+            getattr(tts, 'api_url', None), getattr(tts, 'speed', None),
+            getattr(tts, 'response_format', None), getattr(tts, 'pcm_sample_rate', None),
+            getattr(tts, "voice", None), getattr(tts, "speech_rate", None),
             getattr(tts, "volume", None), getattr(tts, "pitch_rate", None), getattr(tts, "post_gain", None),
             getattr(conn, "sample_rate", None), text)
 

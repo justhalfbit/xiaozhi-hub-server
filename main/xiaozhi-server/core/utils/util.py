@@ -132,11 +132,34 @@ def get_ip_info(ip_addr, logger):
             return cached_ip_info
 
         # 缓存未命中，调用API
-        if is_private_ip(ip_addr):
-            ip_addr = ""
-        url = f"https://whois.pconline.com.cn/ipJson.jsp?json=true&ip={ip_addr}"
-        resp = requests.get(url).json()
-        ip_info = {"city": resp.get("city")}
+        target_ip = "" if is_private_ip(ip_addr) else ip_addr
+
+        ip_info = {}
+        # 1. 优先使用支持全球 IP 且原生支持中文返回的 ip-api.com
+        try:
+            url = f"http://ip-api.com/json/{target_ip}?lang=zh-CN"
+            resp = requests.get(url, timeout=3).json()
+            if resp.get("status") == "success" and resp.get("city"):
+                ip_info = {
+                    "city": resp.get("city"),
+                    "country": resp.get("country"),
+                    "region": resp.get("regionName"),
+                    "lat": resp.get("lat"),
+                    "lon": resp.get("lon"),
+                    "timezone": resp.get("timezone"),
+                }
+        except Exception as e:
+            logger.bind(tag=TAG).debug(f"ip-api.com lookup failed: {e}")
+
+        # 2. 若失败或未获取到城市，回退到国内接口 (pconline)
+        if not ip_info.get("city"):
+            try:
+                url = f"https://whois.pconline.com.cn/ipJson.jsp?json=true&ip={target_ip}"
+                resp = requests.get(url, timeout=3).json()
+                if resp.get("city"):
+                    ip_info = {"city": resp.get("city")}
+            except Exception as e:
+                logger.bind(tag=TAG).debug(f"pconline lookup failed: {e}")
 
         # 存入缓存
         cache_manager.set(CacheType.IP_INFO, ip_addr, ip_info)

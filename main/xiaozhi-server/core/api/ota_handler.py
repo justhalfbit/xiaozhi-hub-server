@@ -6,6 +6,7 @@ import hmac
 import os
 import re
 import glob
+from datetime import datetime
 from typing import Dict, List, Tuple
 from aiohttp import web
 
@@ -19,6 +20,26 @@ TAG = __name__
 def _safe_basename(filename: str) -> str:
     # Prevent directory traversal
     return os.path.basename(filename)
+
+
+def _get_system_timezone_offset_minutes() -> int:
+    try:
+        offset = datetime.now().astimezone().utcoffset()
+        if offset is not None:
+            return int(offset.total_seconds() // 60)
+    except Exception:
+        pass
+    return 8 * 60
+
+
+def _get_timezone_offset_minutes(server_config: dict) -> int:
+    tz_val = server_config.get("timezone_offset")
+    if tz_val is not None and str(tz_val).strip().lower() not in ("", "auto", "none"):
+        try:
+            return int(tz_val) * 60
+        except (ValueError, TypeError):
+            pass
+    return _get_system_timezone_offset_minutes()
 
 
 def _parse_version(ver: str) -> Tuple[int, ...]:
@@ -223,7 +244,7 @@ class OTAHandler(BaseHandler):
             return_json = {
                 "server_time": {
                     "timestamp": int(round(time.time() * 1000)),
-                    "timezone_offset": server_config.get("timezone_offset", 8) * 60,
+                    "timezone_offset": _get_timezone_offset_minutes(server_config),
                 },
                 "firmware": {
                     "version": device_version,

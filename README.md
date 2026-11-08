@@ -63,6 +63,22 @@
 
 ## 快速开始
 
+### 繁體中文、語音 API 與 MCP
+
+- 管理頁右上角可切換簡體／繁體中文，選擇會保存在瀏覽器中。在「記憶」頁可另設模型的回覆語言；新連線會帶上此系統提示偏好，不會改寫聊天原文。
+- 「語音識別」與「語音合成」現在都能設定 OpenAI 相容 API：分別填寫 Base URL、模型與 API Key，按「儲存並使用」。Base URL 例如 `https://api.openai.com/v1`，後台會自動加上 `/audio/transcriptions` 或 `/audio/speech`。兩種服務可使用不同廠商與金鑰；留空金鑰會保留原值，頁面不會讀回完整金鑰。原有本機辨識、豆包與免費 EdgeTTS 仍可選用。雲端辨識會把錄音送到所設定的服務商。
+- 轉寫可設定 `zh` 等 ISO 639 語言代碼與提示，例如「請以繁體中文轉寫，保留英文原文。」；TTS 可設定音色與語速。服務商必須實作相對應的語音 API，僅相容文字聊天 API 並不足夠。
+- 「MCP 工具」頁可新增、修改或刪除外部伺服器設定，支援 stdio、SSE 與 Streamable HTTP。資料寫入 `data/.mcp_server_settings.json`，裝置重新連線後生效。API 模型須支援工具呼叫，並在「意圖識別」啟用插件；Claude Code 使用自己的 MCP 設定。
+
+MCP 設定範例：
+
+```json
+{"url":"http://localhost:8000/mcp","transport":"streamable-http","headers":{"Authorization":"Bearer YOUR_TOKEN"}}
+```
+
+`headers`、`env` 與舊版 `API_ACCESS_TOKEN` 的值不會讀回；編輯時空字串保留原值，刪除欄位則移除。
+stdio 使用 `command`、`args` 與可選的 `env`，以網關帳號執行，只應加入信任的伺服器。本次修改沿用既有的 MCP 用戶端與音訊 provider，沒有新增執行時相依套件。
+
 开始前：电脑和设备连在同一个局域网，电脑上装好 git。要用 Claude Code 的话，先装好它并在终端运行一次 `claude` 登录；没装时会改用 Claude API，到管理后台填 API Key 就行。
 
 ### 1. 安装

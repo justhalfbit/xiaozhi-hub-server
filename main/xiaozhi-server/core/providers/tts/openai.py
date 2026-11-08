@@ -1,4 +1,5 @@
 import requests
+import asyncio
 from core.utils.util import check_model_key
 from core.providers.tts.base import TTSProviderBase
 from config.logger import setup_logging
@@ -47,7 +48,7 @@ class TTSProvider(TTSProviderBase):
             "response_format": self.audio_file_type,
             "speed": self.speed,
         }
-        response = requests.post(
+        response = await asyncio.to_thread(requests.post,
             self.api_url, json=data, headers=headers, timeout=self.tts_timeout
         )
         if response.status_code == 200:
@@ -58,5 +59,5 @@ class TTSProvider(TTSProviderBase):
                 return response.content
         else:
             raise Exception(
-                f"OpenAI TTS请求失败: {response.status_code} - {response.text}"
+                f"OpenAI TTS请求失败: HTTP {response.status_code}"
             )

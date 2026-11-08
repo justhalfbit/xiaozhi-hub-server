@@ -44,7 +44,7 @@ GET_WEATHER_FUNCTION_DESC = {
             "properties": {
                 "location": {
                     "type": "string",
-                    "description": "地点，城市或区县，例如 杭州、深圳南山区、东京；景点请换成它所在的区县或城市。查本地天气时不传",
+                    "description": "地点，城市或区县，例如 杭州、深圳南山区、东京；用户说的是省份就传省会城市（广东→广州），景点请换成它所在的区县或城市。查本地天气时不传",
                 },
             },
             "required": [],

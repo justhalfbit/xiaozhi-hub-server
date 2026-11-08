@@ -695,46 +695,13 @@ class ConnectionHandler:
 
         tool_names = {t.get("function", {}).get("name") for t in tools}
 
-        # === few-shot 示例（is_temporary）===
-        # 展示 direct_answer 携带 response 参数的用法，一次调用完成回复
+        # === few-shot 示例（is_temporary）：内容见 dialogue.fewshot_messages，管理后台显示的也是它 ===
+        from core.utils.dialogue import fewshot_messages
 
-        # 示例1：direct_answer（回复内容写在 response 参数里，无需递归）
-        da_tc_id = "fewshot_da_001"
-        self.dialogue.put(Message(role="user", content="给我讲个故事吧", is_temporary=True))
-        self.dialogue.put(Message(
-            role="assistant",
-            tool_calls=[{
-                "id": da_tc_id,
-                "function": {"arguments": '{"response": "好呀，你想听什么类型的呀？童话、冒险还是搞笑的？选一个我给你开讲~"}', "name": "direct_answer"},
-                "type": "function", "index": 0,
-            }],
-            is_temporary=True,
-        ))
-        self.dialogue.put(Message(
-            role="tool", tool_call_id=da_tc_id,
-            content="已直接回复", is_temporary=True,
-        ))
-
-        # 示例2：真实工具调用（handle_exit_intent）
-        if "handle_exit_intent" in tool_names:
-            tc_id = "fewshot_exit_001"
-            self.dialogue.put(Message(role="user", content="拜拜", is_temporary=True))
-            self.dialogue.put(Message(
-                role="assistant",
-                tool_calls=[{
-                    "id": tc_id,
-                    "function": {"arguments": '{"say_goodbye": "再见，下次再聊~"}', "name": "handle_exit_intent"},
-                    "type": "function", "index": 0,
-                }],
-                is_temporary=True,
-            ))
-            self.dialogue.put(Message(
-                role="tool", tool_call_id=tc_id,
-                content="退出意图已处理", is_temporary=True,
-            ))
-            self.dialogue.put(Message(
-                role="assistant", content="再见，下次再聊~", is_temporary=True,
-            ))
+        template = getattr(getattr(self, "prompt_manager", None), "base_prompt_template", None) or ""
+        weather_in_context = "weather_info" in template   # 模板里已有本地天气时不给查天气的示例
+        for m in fewshot_messages(tool_names, weather_in_context):
+            self.dialogue.put(m)
 
         self.logger.bind(tag=TAG).debug("已注入工具调用 few-shot 示例")
 

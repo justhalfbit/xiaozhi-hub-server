@@ -26,6 +26,34 @@ def render_fewshot(messages) -> str:
     return "<tool_call_examples>\n" + FEWSHOT_INTRO + "\n" + "\n".join(lines) + "\n</tool_call_examples>"
 
 
+def fewshot_messages(tool_names, weather_in_context: bool = False) -> list:
+    """[xiaozhi-hub] 工具调用示例（is_temporary 的消息）：connection 注入到对话里，管理后台照样显示同一份。
+    原来第一个示例是"讲个故事"→先反问想听什么类型，等于教模型先问再做；换成直接开讲的故事，模型又会把示例里的
+    故事原样照讲（实测三次都是）。所以示例只放答案唯一、照抄也对的内容；"讲故事直接开讲"写在模板规则里。
+    只给有这个工具的示例。查本地天气不传地点（weather_in_context：模板里已经有本地 7 天天气时不给这个示例，
+    那时应该直接回答）。"""
+    names = set(tool_names or ())
+    out = []
+
+    def turn(user, name, args, result, said=None):
+        tc_id = f"fewshot_{name}_{len(out):03d}"
+        out.append(Message(role="user", content=user, is_temporary=True))
+        out.append(Message(role="assistant", is_temporary=True, tool_calls=[{
+            "id": tc_id, "type": "function", "index": 0, "function": {"name": name, "arguments": args}}]))
+        out.append(Message(role="tool", tool_call_id=tc_id, content=result, is_temporary=True))
+        if said:
+            out.append(Message(role="assistant", content=said, is_temporary=True))
+
+    turn("一公斤等于几斤", "direct_answer", '{"response": "一公斤等于两斤。"}', "已直接回复")
+    if "get_weather" in names and not weather_in_context:
+        turn("明天要带伞吗", "get_weather", '{"lang": "zh_CN"}',
+             "您查询的位置是：广州\n…\n明天 11月8日 周日：小雨，气温 18~23°C，降水概率 80%\n…",
+             "明天有小雨，降水概率八成，带把伞吧。")
+    if "handle_exit_intent" in names:
+        turn("拜拜", "handle_exit_intent", '{"say_goodbye": "再见，有事再叫我。"}', "退出意图已处理", "再见，有事再叫我。")
+    return out
+
+
 class Message:
     def __init__(
             self,

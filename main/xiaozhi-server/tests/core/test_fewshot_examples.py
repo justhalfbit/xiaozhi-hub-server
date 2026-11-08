@@ -14,7 +14,7 @@ CONFIG = {
     "LLM": {"DeepSeekLLM": {"type": "openai", "model_name": "deepseek-chat", "base_url": "https://x", "api_key": "sk-1"}},
     "chat_history": {"max_messages": 4, "max_tokens": 8000, "summary_min": 2},
 }
-EXAMPLE_WORDS = ("讲个故事", "拜拜", "再见，下次再聊", "已直接回复", "退出意图已处理")
+EXAMPLE_WORDS = ("一公斤等于几斤", "拜拜", "再见，有事再叫我", "已直接回复", "退出意图已处理", "带伞")
 
 
 def make_conn():
@@ -40,7 +40,7 @@ def has_example(text) -> bool:
 
 def test_examples_are_injected():
     conn = make_conn()
-    assert [m.content for m in conn.dialogue.dialogue if m.is_temporary and m.role == "user"] == ["给我讲个故事吧", "拜拜"]
+    assert [m.content for m in conn.dialogue.dialogue if m.is_temporary and m.role == "user"] == ["一公斤等于几斤", "拜拜"]
 
 
 def test_asking_what_was_said_sends_no_example_turns():
@@ -57,7 +57,7 @@ def test_asking_what_was_said_sends_no_example_turns():
     assert system.startswith("你是语音助手")
     block = system[system.index("<tool_call_examples>"):]
     assert FEWSHOT_INTRO in block and "不是和用户的真实对话" in block
-    assert "用户：给我讲个故事吧" in block and "调用工具 direct_answer" in block
+    assert "用户：一公斤等于几斤" in block and "调用工具 direct_answer" in block
     assert "用户：拜拜" in block and "调用工具 handle_exit_intent" in block
 
 
@@ -107,3 +107,74 @@ def test_examples_never_go_into_memory_summary():
     llm = FakeLLM()
     assert chat_history.summarize_now(llm, "dev-1", chat_history.settings(CONFIG), CONFIG)
     assert "用户：我叫小明" in llm.calls[0] and not has_example(llm.calls[0])
+
+
+# ---------- 示例的内容（dialogue.fewshot_messages） ----------
+
+def _users(names):
+    from core.utils.dialogue import fewshot_messages
+    return [m.content for m in fewshot_messages(names) if m.role == "user"]
+
+
+def test_examples_follow_the_tools_there_are():
+    assert _users({"handle_exit_intent"}) == ["一公斤等于几斤", "拜拜"]
+    assert _users({"handle_exit_intent", "get_weather"}) == ["一公斤等于几斤", "明天要带伞吗", "拜拜"]
+
+
+def test_no_weather_example_when_the_template_already_has_local_weather():
+    """agent-base-prompt.txt 带本地 7 天天气（weather_info），那时问本地天气应该直接回答，不给调用工具的示例。"""
+    from core.utils.dialogue import fewshot_messages
+    users = [m.content for m in fewshot_messages({"handle_exit_intent", "get_weather"}, weather_in_context=True)
+             if m.role == "user"]
+    assert users == ["一公斤等于几斤", "拜拜"]
+
+
+def test_examples_act_instead_of_asking_back():
+    """直接回答、查本地天气不传地点：示例里的回答不以问句收尾。"""
+    import json
+    from core.utils.dialogue import fewshot_messages
+    msgs = fewshot_messages({"handle_exit_intent", "get_weather"})
+    calls = {tc["function"]["name"]: json.loads(tc["function"]["arguments"])
+             for m in msgs if m.tool_calls for tc in m.tool_calls}
+    assert calls["direct_answer"]["response"] == "一公斤等于两斤。"
+    assert calls["get_weather"] == {"lang": "zh_CN"}
+    spoken = [calls["direct_answer"]["response"]] + [m.content for m in msgs if m.role == "assistant" and m.content]
+    assert spoken and not any(t.rstrip().endswith(("？", "?")) for t in spoken)
+    # 每个工具调用都有对应的结果
+    ids = [tc["id"] for m in msgs if m.tool_calls for tc in m.tool_calls]
+    assert ids == [m.tool_call_id for m in msgs if m.role == "tool"] and len(set(ids)) == len(ids)
+
+
+def test_admin_page_shows_the_same_examples():
+    from core.admin.pipeline import _fewshot_text
+    from core.utils.dialogue import fewshot_messages, render_fewshot
+    names = {"handle_exit_intent", "get_lunar", "get_weather"}
+    assert _fewshot_text(["get_weather"]) == render_fewshot(fewshot_messages(names))
+    assert _fewshot_text(["get_weather"], True) == render_fewshot(fewshot_messages(names, True))
+
+
+def test_template_rules():
+    """默认模板：工具能答就直接调、不先问；只在真需要时反问；讲故事直接开讲；声纹的说话人说明还在。"""
+    from config.config_loader import get_project_dir
+    import os
+    with open(os.path.join(get_project_dir(), "hub-base-prompt.txt"), encoding="utf-8") as f:
+        text = f.read()
+    assert "don't ask “要不要我查一下” first" in text
+    assert "Ask back only when needed" in text and "just start telling a short one" in text
+    assert "<speaker_recognition>" in text
+    assert "Muse" not in text and "ask_muse" not in text
+
+
+def test_connection_skips_the_weather_example_when_the_template_has_local_weather():
+    def injected(template):
+        d = Dialogue()
+        conn = SimpleNamespace(device_id="dev-1", session_id="s-1", config=CONFIG, dialogue=d, logger=MagicMock(),
+                               hub_route=None, intent_type="function_call",
+                               prompt_manager=SimpleNamespace(base_prompt_template=template),
+                               func_handler=SimpleNamespace(get_functions=lambda: [
+                                   {"type": "function", "function": {"name": n}} for n in ("handle_exit_intent", "get_weather")]))
+        ConnectionHandler._inject_tool_call_fewshot(conn)
+        return [m.content for m in d.dialogue if m.is_temporary and m.role == "user"]
+
+    assert injected("{{base_prompt}}") == ["一公斤等于几斤", "明天要带伞吗", "拜拜"]
+    assert injected("- Local upcoming weather: {{weather_info}}") == ["一公斤等于几斤", "拜拜"]

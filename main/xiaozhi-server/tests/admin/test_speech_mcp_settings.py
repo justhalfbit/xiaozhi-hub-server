@@ -287,14 +287,16 @@ async def test_failed_asr_apply_does_not_close_sessions(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_speech_probes_use_saved_protocol_and_separate_credentials(tmp_path, monkeypatch):
+@pytest.mark.parametrize('language, phrase', [('en', 'Hello, this is an English speech test.'),
+                                           ('yue-HK', '你好，呢個係廣東話語音測試。')])
+async def test_speech_probes_use_saved_protocol_and_separate_credentials(tmp_path, monkeypatch, language, phrase):
     import base64
     import io
     import wave
     from types import SimpleNamespace
     from core.admin.admin_handler import COOKIE_NAME
     from core.providers.asr import openai as provider
-    path = tmp_path / '.config.yaml'; path.write_text('{}\n')
+    path = tmp_path / '.config.yaml'; path.write_text('reply_language: ' + language + '\n')
     for section in ('ASR', 'TTS'):
         speech_settings.save(section, {'api_key': section + '-private-key', 'api_protocol': 'zenmux',
                                        'voice': 'Kore', 'format': 'pcm'},
@@ -312,6 +314,7 @@ async def test_speech_probes_use_saved_protocol_and_separate_credentials(tmp_pat
             assert base64.b64decode(kw['json']['input_audio']['data']) == wav_bytes
             return SimpleNamespace(status_code=200, json=lambda: {'text': '轉寫成功'})
         assert kw['json']['response_format'] == 'pcm'
+        assert kw['json']['input'] == phrase  # never put language instructions in the spoken transcript
         return SimpleNamespace(status_code=200, content=b'json',
                                json=lambda: {'audio': base64.b64encode(wav_bytes).decode(), 'mime_type': 'audio/wav'})
     monkeypatch.setattr(provider.requests, 'post', post)
@@ -322,6 +325,7 @@ async def test_speech_probes_use_saved_protocol_and_separate_credentials(tmp_pat
         r = await c.post('/admin/api/speech/tts/test', json={}, cookies=cookie)
         assert r.status == 200
         result = await r.json()
+        assert result['language'] == language and result['text'] == phrase
         assert base64.b64decode(result['audio']) == wav_bytes and result['mime_type'] == 'audio/wav'
         r = await c.post('/admin/api/speech/asr/test', json={'audio': base64.b64encode(wav_bytes).decode()}, cookies=cookie)
         assert r.status == 200 and (await r.json())['text'] == '轉寫成功'

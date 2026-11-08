@@ -11,7 +11,7 @@ from pathlib import Path
 from ruamel.yaml.comments import CommentedMap, CommentedSeq
 
 from config.config_loader import get_project_dir
-from core.admin import catalog, config_store, plugin_settings
+from core.admin import catalog, config_store, plugin_settings, speech_settings
 from core.agent import asr_text
 
 CLAUDE_CLI_ENTRY = "ClaudeCLI"
@@ -461,6 +461,8 @@ def asr_choice(merged: dict) -> str:
         return "local"
     if name == catalog.DOUBAO_ASR_ENTRY and entry.get("type") == "doubao_stream":
         return "doubao"
+    if name == speech_settings.SPEECH['ASR']['entry'] and entry.get('type') == 'openai':
+        return 'openai'
     return "other"
 
 
@@ -480,6 +482,7 @@ def describe_asr(merged: dict) -> dict:
         "local": {"exists": local.get("type") == "sherpa_onnx_local", "label": asr_label(local),
                   "model": asr_model_check(local)},
         "doubao": describe_doubao(merged),
+        "openai": speech_settings.describe('ASR', merged),
         "vad": describe_vad(merged),
         "hotwords": describe_hotwords(merged),
         "corrections": describe_corrections(merged),
@@ -718,6 +721,9 @@ def describe_tts(merged: dict) -> dict:
         "type": entry.get("type", name),
         "voice": str(entry.get("voice") or ""),
         "voices": catalog.EDGE_VOICES,
+        "openai": speech_settings.describe('TTS', merged),
+        "edge_entry": next((n for n, e in (merged.get('TTS') or {}).items()
+                            if isinstance(e, dict) and e.get('type') == 'edge'), None),
     }
 
 

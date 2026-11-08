@@ -46,7 +46,7 @@ from core.utils.voiceprint_provider import VoiceprintProvider
 from core.utils.util import get_system_error_response
 from core.utils import reply_progress, textUtils, turn_gen
 from core.utils.tool_markup import ToolMarkupFilter, strip_tool_markup
-from core.agent import chat_history, llm_router
+from core.agent import chat_history, llm_router, reply_language
 
 
 TAG = __name__
@@ -1056,7 +1056,7 @@ class ConnectionHandler:
             asyncio.run_coroutine_threadsafe(self.func_handler._initialize(), self.loop)
 
     def change_system_prompt(self, prompt):
-        self.prompt = prompt
+        self.prompt = reply_language.apply(prompt, self.config.get('reply_language'))
         # 更新系统prompt至上下文
         self.dialogue.update_system_message(self.prompt)
 

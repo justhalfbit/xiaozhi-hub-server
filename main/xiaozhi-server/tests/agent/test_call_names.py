@@ -9,6 +9,29 @@ from core.agent import call_names, llm_router
 from core.agent.call_names import handle_call_name, match_call_name
 
 
+def test_default_call_reply_follows_language_but_custom_text_is_preserved():
+    assert call_names.reply_text({}, 'yue-HK') == '我喺度'
+    assert call_names.reply_text({}, 'en') == "I'm here"
+    assert call_names.reply_text({'reply': '自訂回覆'}, 'en') == '自訂回覆'
+
+
+def test_reply_audio_cache_separates_provider_model_endpoint_and_speed():
+    class TTS:
+        voice = 'Leda'
+        model = 'gemini-a'
+        api_url = 'https://one.example/speech'
+        speed = 1
+    tts = TTS(); conn = SimpleNamespace(tts=tts, sample_rate=24000)
+    original = call_names._cache_key(conn, '我在')
+    for field, value in [('model', 'gemini-b'), ('api_url', 'https://two.example/speech'), ('speed', 1.25)]:
+        old = getattr(tts, field); setattr(tts, field, value)
+        assert call_names._cache_key(conn, '我在') != original
+        setattr(tts, field, old)
+    OtherTTS = type('TTS', (), {'__module__': 'other.provider', 'voice': 'Leda', 'model': tts.model,
+                               'api_url': tts.api_url, 'speed': tts.speed})
+    assert call_names._cache_key(SimpleNamespace(tts=OtherTTS(), sample_rate=24000), '我在') != original
+
+
 @pytest.mark.parametrize("asr_text", ["Hi, cloud.", "Hi, cloud. Hi, cloud.", "High cloud.", "嗨 Claude", "hey，克劳德！",
                                       "He cloud.", "Heい cloud。", "Hei cloud", "H, cloud."])  # "嘿"被识别成 he、h（真机实测）
 def test_only_call_name(asr_text):

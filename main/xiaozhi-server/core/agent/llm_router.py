@@ -102,7 +102,8 @@ def not_ready_reply(conn: "ConnectionHandler") -> Optional[str]:
             except Exception as e:
                 logger.bind(tag=TAG).error(f"切到默认模型 {default} 失败: {e}")
         st["not_ready"] = True
-        return NOT_READY_REPLY
+        from core.agent import reply_language
+        return reply_language.phrase('not_ready', conn.config.get('reply_language') or '')
     if st.pop("not_ready", False):
         # 用户听到提示后在后台填好了，连接还没断：手上的实例是拿占位 Key 建的，换成按新配置建的
         try:

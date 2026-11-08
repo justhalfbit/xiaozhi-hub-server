@@ -24,10 +24,10 @@ from pathlib import Path
 from aiohttp import web
 
 from config.logger import setup_logging
-from core.admin import auth, catalog, config_store, connections, pages, pipeline, plugin_settings, updater
+from core.admin import auth, catalog, config_store, connections, pages, pipeline, plugin_settings, updater, speech_settings, speech_probe, mcp_settings
 from core.admin.grokbot import GrokBotAdmin
 from core.admin.status import _claude_version, collect_status
-from core.agent import chat_history, llm_router, reports
+from core.agent import chat_history, llm_router, reports, reply_language
 from core.agent.agent_session import ErrorKind
 from core.agent.grokbot_client import GrokBotError
 from core.utils.modules_initialize import initialize_modules
@@ -79,6 +79,7 @@ class AdminHandler:
         self.sessions = auth.SessionStore()
         # 后台点了更新网关、网关重启后，接着用重启前的登录（文件在 data/ 下，和配置放在一起）
         data_dir = Path(config_path).parent if config_path else updater.SERVER_DIR / "data"
+        self.mcp_config_path = data_dir / '.mcp_server_settings.json'
         self.sessions_handover = data_dir / ".admin-sessions.json"
         if self.sessions.restore(self.sessions_handover):
             logger.bind(tag=TAG).info("更新网关后沿用了更新前的后台登录")
@@ -93,6 +94,7 @@ class AdminHandler:
             [
                 web.get("/admin", self.handle_index),
                 web.get("/admin/", self.handle_index),
+                web.get('/admin/i18n/{asset}', self.handle_i18n_asset),
                 web.get("/admin/api/state", self.handle_state),
                 web.post("/admin/api/setup", self.handle_setup),
                 web.post("/admin/api/login", self.handle_login),
@@ -104,6 +106,7 @@ class AdminHandler:
                 web.get("/admin/api/devices", self.handle_devices),
                 web.get("/admin/api/memory", self.handle_memory),
                 web.post("/admin/api/memory/save", self.handle_memory_save),
+                web.post('/admin/api/language', self.handle_reply_language),
                 web.post("/admin/api/devices/{session_id}/emotion", self.handle_emotion_one),
                 web.post("/admin/api/devices/{session_id}/emotion-test", self.handle_emotion_test),
                 web.post("/admin/api/devices/{session_id}/emotion-test/stop", self.handle_emotion_stop),
@@ -114,6 +117,12 @@ class AdminHandler:
                 web.post("/admin/api/llm/use", self.handle_llm_use),
                 web.get("/admin/api/pipeline", self.handle_pipeline),
                 web.get("/admin/api/asr", self.handle_asr),
+                web.get('/admin/api/mcp', self.handle_mcp),
+                web.post('/admin/api/mcp', self.handle_mcp_save),
+                web.post('/admin/api/mcp/delete', self.handle_mcp_delete),
+                web.post('/admin/api/speech/{section}', self.handle_speech_save),
+                web.post('/admin/api/speech/{section}/test', self.handle_speech_test),
+                web.post('/admin/api/tts/use', self.handle_tts_use),
                 web.post("/admin/api/vad", self.handle_vad_save),
                 web.post("/admin/api/asr/use", self.handle_asr_use),
                 web.post("/admin/api/asr/doubao", self.handle_doubao_save),
@@ -143,6 +152,7 @@ class AdminHandler:
                 web.post("/kiosk/reports", self.handle_kiosk_reports),
                 web.post("/kiosk/asr", self.handle_kiosk_asr),
                 web.post("/kiosk/tts", self.handle_kiosk_tts),
+                web.get('/kiosk/tts/profile', self.handle_kiosk_tts_profile),
                 web.get("/kiosk/chat/history", self.handle_kiosk_chat_history),
                 web.post("/kiosk/chat/clear", self.handle_kiosk_chat_clear),
             ]
@@ -200,6 +210,12 @@ class AdminHandler:
     async def handle_index(self, request: web.Request):
         html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
         return web.Response(text=html, content_type="text/html", headers=SECURITY_HEADERS)
+
+    async def handle_i18n_asset(self, request):
+        asset = request.match_info['asset']
+        if asset not in ('runtime.js', 'zh-Hant.js'):
+            raise web.HTTPNotFound()
+        return web.FileResponse(STATIC_DIR / 'i18n' / asset, headers=SECURITY_HEADERS)
 
     async def handle_state(self, request: web.Request):
         return self._json(
@@ -304,8 +320,8 @@ class AdminHandler:
 
         if section == "TTS" or self.ws_server is None:
             commit()
-            if section == "TTS":
-                return {"applied": True, "note": "已保存，设备重新连接后生效"}
+            if section == "TTS" and self.ws_server is not None:
+                return await self._refresh_speech_connections()
             return {"applied": False, "note": "已保存，重启服务后生效"}
         flags = {"LLM": "init_llm", "Intent": "init_intent", "ASR": "init_asr"}
         attr = {"LLM": "_llm", "Intent": "_intent", "ASR": "_asr"}[section]
@@ -320,12 +336,29 @@ class AdminHandler:
                 old = getattr(self.ws_server, attr, None)
                 setattr(self.ws_server, attr, modules[key])
             self._retire(old, modules[key])
+            if section == 'ASR':
+                return await self._refresh_speech_connections()
             return {"applied": True, "note": "已生效，设备重新连接后使用新配置"}
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"热加载 {section} 失败: {e}")
             error = str(e).strip().rstrip("。.") or type(e).__name__
             return {"applied": False, "failed": True, "error": error,
                     "note": f"已保存，但加载失败：{error}。服务仍在使用原来的配置，请检查后重试"}
+
+    async def _refresh_speech_connections(self):
+        """Connections own ASR/TTS instances; end stale sessions before the next turn."""
+        async def close(conn):
+            try:
+                await asyncio.wait_for(conn.websocket.close(code=1012, reason='Speech settings changed'), timeout=3)
+                return True
+            except Exception:
+                return False
+        active = [c for c in connections.all_connections()
+                  if getattr(c, 'common_config', None) is self.config and getattr(c, 'websocket', None)]
+        results = await asyncio.gather(*(close(c) for c in active))
+        failed = results.count(False)
+        return {'applied': True, 'sessions_closed': results.count(True), 'reconnect_failed': failed,
+                'note': '已套用，下一次對話使用新語音設定' if not failed else '已套用；部分連線無法關閉，請在裝置結束對話後再試'}
 
     def _retire(self, old, new) -> None:
         """通知被替换的旧实例退役（如 claude_cli 在连接都关闭后结束后台线程）。
@@ -686,7 +719,19 @@ class AdminHandler:
             if name and llm_router.model_ready(merged, name) and any(o["entry"] == name for o in options):
                 selected = name
         return {"selected": selected, "default": data["selected"], "kind": data["kind"], "vendor": data["vendor"],
-                "options": options}
+                "options": options, 'tts_profile': speech_settings.tts_profile(self.config)}
+
+    def _active_tts(self):
+        return [{'session_id': c.session_id, 'provider': type(c.tts).__module__,
+                 'model': getattr(c.tts, 'model', None), 'voice': getattr(c.tts, 'voice', None),
+                 'last_request': getattr(c.tts, 'last_request', None)}
+                for c in connections.all_connections()
+                if getattr(c, 'common_config', None) is self.config and getattr(c, 'tts', None)]
+
+    async def handle_kiosk_tts_profile(self, request):
+        if not self._from_this_machine(request):
+            return self._error('僅限本機', 403)
+        return self._json({'ok': True, **speech_settings.tts_profile(self.config), 'active': self._active_tts()})
 
     async def handle_kiosk_llm_use(self, request: web.Request):
         """把这台设备切到 body 指定的模型（{"kind": "cli"}、{"kind": "api", "vendor": …}、{"kind": "grok", "entry": …}，
@@ -881,8 +926,12 @@ class AdminHandler:
             name = catalog.DOUBAO_ASR_ENTRY
             if not d["doubao"]["configured"]:
                 return self._error("豆包还没配置好，请先填写 API Key（或 APP ID 和 Access Token）并保存", 400)
+        elif choice == 'openai':
+            name = speech_settings.SPEECH['ASR']['entry']
+            if not d['openai']['configured']:
+                return self._error('請先儲存 OpenAI 相容語音辨識的 API 設定', 400)
         else:
-            return self._error("只能选本地 X-ASR 或豆包", 400)
+            return self._error("只能选本地 X-ASR、豆包或 OpenAI 相容 API", 400)
         try:
             result = await self._switch("ASR", name)
         except KeyError:
@@ -986,7 +1035,78 @@ class AdminHandler:
     async def handle_tts(self, request: web.Request):
         self._require_login(request)
         merged = await self._blocking(self._merged)
-        return self._json({"ok": True, **pages.describe_tts(merged), "running": self._running("TTS")})
+        return self._json({"ok": True, **pages.describe_tts(merged), "running": self._running("TTS"),
+                           'profile': speech_settings.tts_profile(self.config), 'active': self._active_tts(),
+                           'reply_language': merged.get('reply_language') or '', 'language_options': reply_language.OPTIONS})
+
+    async def handle_speech_save(self, request):
+        self._require_login(request)
+        section = request.match_info['section'].upper()
+        if section not in speech_settings.SPEECH:
+            return self._error('不支援的語音類型', 404)
+        body = await self._read_json(request)
+        try:
+            merged = await self._blocking(self._merged)
+            changed = await self._blocking(speech_settings.save, section, body, merged, self.config_path)
+        except ValueError as e:
+            return self._error(str(e), 400)
+        name = speech_settings.SPEECH[section]['entry']
+        return self._json({'ok': True, 'changed': changed,
+                           **await self._apply_if_selected(section, name, changed)})
+
+    async def handle_speech_test(self, request):
+        self._require_login(request)
+        section = request.match_info['section'].upper()
+        if section not in speech_settings.SPEECH:
+            return self._error('不支援的語音類型', 404)
+        body = await self._read_json(request)
+        try:
+            merged = await self._blocking(self._merged)
+            result = await speech_probe.test(section, body, merged)
+        except (ValueError, RuntimeError) as exc:
+            return self._error(str(exc), 400)
+        except Exception:
+            return self._error('無法完成語音 API 測試，請檢查服務網址與網路連線', 400)
+        return self._json({'ok': True, **result})
+
+    async def handle_mcp(self, request):
+        self._require_login(request)
+        try:
+            data = await self._blocking(mcp_settings.describe, self.mcp_config_path)
+        except (ValueError, OSError):
+            return self._error('無法讀取 MCP 設定，請檢查 JSON 格式與檔案權限', 400)
+        return self._json({'ok': True, **data})
+
+    async def _save_mcp(self, request, delete=False):
+        self._require_login(request)
+        body = await self._read_json(request)
+        try:
+            await self._blocking(mcp_settings.save, self.mcp_config_path, body.get('name'), body.get('config'), delete)
+        except ValueError as e:
+            return self._error(str(e), 400)
+        return self._json({'ok': True, **await self._blocking(mcp_settings.describe, self.mcp_config_path)})
+
+    async def handle_mcp_save(self, request):
+        return await self._save_mcp(request)
+
+    async def handle_mcp_delete(self, request):
+        return await self._save_mcp(request, delete=True)
+
+    async def handle_tts_use(self, request):
+        self._require_login(request)
+        body = await self._read_json(request)
+        merged = await self._blocking(self._merged)
+        details = pages.describe_tts(merged)
+        if body.get('choice') == 'edge':
+            name = details['edge_entry']
+        elif body.get('choice') == 'openai' and details['openai']['configured']:
+            name = speech_settings.SPEECH['TTS']['entry']
+        else:
+            return self._error('請先儲存 API 設定，或選擇 EdgeTTS', 400)
+        if not name:
+            return self._error('找不到 EdgeTTS 設定', 404)
+        result = await self._switch('TTS', name)
+        return self._json(result) if result['ok'] else self._error(result['note'], 400)
 
     async def handle_tts_save(self, request: web.Request):
         self._require_login(request)
@@ -1135,7 +1255,8 @@ class AdminHandler:
         devices = await self._blocking(chat_history.describe_memories, merged)
         for d in devices:
             d["online"] = d["device"] in online
-        return self._json({"ok": True, "devices": devices,
+        return self._json({"ok": True, "devices": devices, 'reply_language': merged.get('reply_language', ''),
+                           'language_options': reply_language.OPTIONS,
                            "settings": {k: cfg[k] for k in ("enabled", "summary", "max_messages", "max_tokens",
                                                             "summary_min", "summary_chars")}})
 
@@ -1156,6 +1277,21 @@ class AdminHandler:
         if not ok:
             return self._json({"ok": False, "error": "你编辑期间记忆被自动总结更新了，请看过新内容再改", "memory": memory}, 409)
         return self._json({"ok": True, "memory": memory})
+
+    async def handle_reply_language(self, request):
+        self._require_login(request)
+        body = await self._read_json(request)
+        language = body.get('language')
+        if language not in reply_language.LANGUAGES:
+            return self._error('不支援的回覆語言', 400)
+        def save():
+            with config_store.edit_custom(self.config_path) as data:
+                data['reply_language'] = language
+        await self._blocking(save)
+        self._push_config('reply_language', language)
+        result = (await self._refresh_speech_connections() if self.ws_server is not None
+                  else {'note': '已儲存，裝置重新連線後生效'})
+        return self._json({'ok': True, 'language': language, **result})
 
     async def handle_devices(self, request: web.Request):
         self._require_login(request)

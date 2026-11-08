@@ -63,6 +63,26 @@
 
 ## 快速开始
 
+### 繁體中文、語音 API 與 MCP
+
+- 管理頁右上角可切換簡體／繁體中文，選擇會保存在瀏覽器中。在「語音合成 → 說話語言」可自行選擇國語（繁體）、普通話（簡體）、香港粵語、英語、日語、韓語、西班牙語或法語，也可沿用模型設定；「記憶」頁的選單會同步。儲存後結束舊連線，下次對話帶上新的語言偏好；喚醒提示、預設稱呼回覆及語音測試也會使用該語言。開啟選單或更新程式不會替使用者改選語言。
+- 說話語言控制模型回覆用語，TTS 依回覆文字朗讀；發音及口音仍取決於 TTS 模型和音色，不會把翻譯或朗讀指令塞入要朗讀的文字。Gemini TTS 的自動語言偵測與支援語言見 [Google 官方語音文件](https://ai.google.dev/gemini-api/docs/speech-generation#supported-languages)。自訂的固定回覆文字保持原樣。
+- 「語音識別」與「語音合成」現在都能設定 OpenAI 相容 API：分別填寫 Base URL、模型與 API Key，按「儲存並使用」。Base URL 例如 `https://api.openai.com/v1`，後台會自動加上 `/audio/transcriptions` 或 `/audio/speech`。兩種服務可使用不同廠商與金鑰；留空金鑰會保留原值，頁面不會讀回完整金鑰。原有本機辨識、豆包與免費 EdgeTTS 仍可選用。雲端辨識會把錄音送到所設定的服務商。
+- 轉寫可設定 `zh` 等 ISO 639 語言代碼與提示，例如「請以繁體中文轉寫，保留英文原文。」；TTS 可設定音色與語速。服務商必須實作相對應的語音 API，僅相容文字聊天 API 並不足夠。
+- 使用 ZenMux 時，兩頁的「語音協定」都選 `ZenMux`：轉寫以 JSON `input_audio` 傳送音檔，TTS 會解開 JSON 中的 Base64 音訊。Gemini TTS 請選 `pcm` 格式與 Gemini 音色（例如 `Kore`）；原始 PCM 會加上 WAV 容器供播放，預設取樣率為 24000 Hz。已回傳 WAV 的音訊不會重複包裝。
+- 網關會提供不含金鑰的 TTS 設定識別碼，讓 ThinkSmart 的喚醒提示跟隨所選模型與音色；稱呼回覆的音訊快取也會區分模型、服務網址與語速。本機診斷介面 `GET /kiosk/tts/profile` 顯示執行中的設定、各連線實際的 TTS 模型／音色與最近請求參數；遠端請求與反向代理請求不允許存取。
+- 「儲存」只保留尚未啟用的服務設定；「儲存並使用」會套用設定並結束舊的裝置連線，下一次對話使用新服務。可用「測試語音」實際合成並播放，或上傳短 WAV 音檔「測試轉寫」；測試使用已儲存的設定並可能產生服務商費用，HTTP 失敗會顯示錯誤。
+- 「MCP 工具」頁可新增、修改或刪除外部伺服器設定，支援 stdio、SSE 與 Streamable HTTP。資料寫入 `data/.mcp_server_settings.json`，裝置重新連線後生效。API 模型須支援工具呼叫，並在「意圖識別」啟用插件；Claude Code 使用自己的 MCP 設定。
+
+MCP 設定範例：
+
+```json
+{"url":"http://localhost:8000/mcp","transport":"streamable-http","headers":{"Authorization":"Bearer YOUR_TOKEN"}}
+```
+
+`headers`、`env` 與舊版 `API_ACCESS_TOKEN` 的值不會讀回；編輯時空字串保留原值，刪除欄位則移除。
+stdio 使用 `command`、`args` 與可選的 `env`，以網關帳號執行，只應加入信任的伺服器。本次修改沿用既有的 MCP 用戶端與音訊 provider，沒有新增執行時相依套件。
+
 开始前：电脑和设备连在同一个局域网，电脑上装好 git。要用 Claude Code 的话，先装好它并在终端运行一次 `claude` 登录；没装时会改用 Claude API，到管理后台填 API Key 就行。
 
 ### 1. 安装

@@ -24,7 +24,7 @@ from pathlib import Path
 from aiohttp import web
 
 from config.logger import setup_logging
-from core.admin import auth, catalog, config_store, connections, pages, pipeline, plugin_settings, updater, speech_settings, mcp_settings
+from core.admin import auth, catalog, config_store, connections, pages, pipeline, plugin_settings, updater, speech_settings, speech_probe, mcp_settings
 from core.admin.grokbot import GrokBotAdmin
 from core.admin.status import _claude_version, collect_status
 from core.agent import chat_history, llm_router, reports, reply_language
@@ -121,6 +121,7 @@ class AdminHandler:
                 web.post('/admin/api/mcp', self.handle_mcp_save),
                 web.post('/admin/api/mcp/delete', self.handle_mcp_delete),
                 web.post('/admin/api/speech/{section}', self.handle_speech_save),
+                web.post('/admin/api/speech/{section}/test', self.handle_speech_test),
                 web.post('/admin/api/tts/use', self.handle_tts_use),
                 web.post("/admin/api/vad", self.handle_vad_save),
                 web.post("/admin/api/asr/use", self.handle_asr_use),
@@ -318,8 +319,8 @@ class AdminHandler:
 
         if section == "TTS" or self.ws_server is None:
             commit()
-            if section == "TTS":
-                return {"applied": True, "note": "已保存，设备重新连接后生效"}
+            if section == "TTS" and self.ws_server is not None:
+                return await self._refresh_speech_connections()
             return {"applied": False, "note": "已保存，重启服务后生效"}
         flags = {"LLM": "init_llm", "Intent": "init_intent", "ASR": "init_asr"}
         attr = {"LLM": "_llm", "Intent": "_intent", "ASR": "_asr"}[section]
@@ -334,12 +335,29 @@ class AdminHandler:
                 old = getattr(self.ws_server, attr, None)
                 setattr(self.ws_server, attr, modules[key])
             self._retire(old, modules[key])
+            if section == 'ASR':
+                return await self._refresh_speech_connections()
             return {"applied": True, "note": "已生效，设备重新连接后使用新配置"}
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"热加载 {section} 失败: {e}")
             error = str(e).strip().rstrip("。.") or type(e).__name__
             return {"applied": False, "failed": True, "error": error,
                     "note": f"已保存，但加载失败：{error}。服务仍在使用原来的配置，请检查后重试"}
+
+    async def _refresh_speech_connections(self):
+        """Connections own ASR/TTS instances; end stale sessions before the next turn."""
+        async def close(conn):
+            try:
+                await asyncio.wait_for(conn.websocket.close(code=1012, reason='Speech settings changed'), timeout=3)
+                return True
+            except Exception:
+                return False
+        active = [c for c in connections.all_connections()
+                  if getattr(c, 'common_config', None) is self.config and getattr(c, 'websocket', None)]
+        results = await asyncio.gather(*(close(c) for c in active))
+        failed = results.count(False)
+        return {'applied': True, 'sessions_closed': results.count(True), 'reconnect_failed': failed,
+                'note': '已套用，下一次對話使用新語音設定' if not failed else '已套用；部分連線無法關閉，請在裝置結束對話後再試'}
 
     def _retire(self, old, new) -> None:
         """通知被替换的旧实例退役（如 claude_cli 在连接都关闭后结束后台线程）。
@@ -1020,6 +1038,21 @@ class AdminHandler:
         name = speech_settings.SPEECH[section]['entry']
         return self._json({'ok': True, 'changed': changed,
                            **await self._apply_if_selected(section, name, changed)})
+
+    async def handle_speech_test(self, request):
+        self._require_login(request)
+        section = request.match_info['section'].upper()
+        if section not in speech_settings.SPEECH:
+            return self._error('不支援的語音類型', 404)
+        body = await self._read_json(request)
+        try:
+            merged = await self._blocking(self._merged)
+            result = await speech_probe.test(section, body, merged)
+        except (ValueError, RuntimeError) as exc:
+            return self._error(str(exc), 400)
+        except Exception:
+            return self._error('無法完成語音 API 測試，請檢查服務網址與網路連線', 400)
+        return self._json({'ok': True, **result})
 
     async def handle_mcp(self, request):
         self._require_login(request)

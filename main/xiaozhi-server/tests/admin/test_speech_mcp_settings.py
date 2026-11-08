@@ -105,7 +105,7 @@ async def test_new_admin_routes_require_login(tmp_path):
     h = AdminHandler({}, config_path=tmp_path / '.config.yaml')
     app = web.Application(); h.register(app)
     async with TestClient(TestServer(app)) as c:
-        for path in ('mcp', 'speech/asr', 'speech/tts', 'tts/use', 'mcp/delete', 'language'):
+        for path in ('mcp', 'speech/asr', 'speech/tts', 'speech/asr/test', 'speech/tts/test', 'tts/use', 'mcp/delete', 'language'):
             r = await c.post('/admin/api/' + path, json={})
             assert r.status == 401
         assert (await c.get('/admin/api/mcp')).status == 401
@@ -143,3 +143,110 @@ async def test_authenticated_speech_switch_and_mcp_roundtrip(tmp_path):
         assert 'test-secret' not in await r.text()
         assert (await c.post('/admin/api/language', json={'language': 'zh-Hant'})).status == 200
         assert config_store.load_merged(custom_path=path)['reply_language'] == 'zh-Hant'
+
+
+@pytest.mark.parametrize('section', ['ASR', 'TTS'])
+def test_zenmux_settings_and_validation(tmp_path, section):
+    path = tmp_path / 'config.yaml'; path.write_text('{}\n')
+    merged = config_store.load_merged(custom_path=path)
+    speech_settings.save(section, {'api_key': 'key', 'api_protocol': 'zenmux', 'format': 'pcm',
+                                   'pcm_sample_rate': 24000}, merged, path)
+    merged = config_store.load_merged(custom_path=path)
+    assert speech_settings.describe(section, merged)['api_protocol'] == 'zenmux'
+    original = path.read_bytes()
+    for bad in ({'api_protocol': 'other'}, *([{'format': 'bad'}, {'pcm_sample_rate': 1}] if section == 'TTS' else [])):
+        with pytest.raises(ValueError):
+            speech_settings.save(section, bad, merged, path)
+        assert path.read_bytes() == original
+
+
+@pytest.mark.asyncio
+async def test_speech_apply_closes_only_this_gateways_stale_sessions(tmp_path, monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from core.admin import connections
+    from core.admin import admin_handler as ah
+    path = tmp_path / '.config.yaml'; path.write_text('{}\n')
+    config = config_store.load_merged(custom_path=path)
+    ws = SimpleNamespace(config_lock=asyncio.Lock(), _asr=object())
+    handler = AdminHandler(config, ws_server=ws, config_path=path)
+    mine = SimpleNamespace(common_config=config, websocket=SimpleNamespace(close=AsyncMock()))
+    other = SimpleNamespace(common_config={}, websocket=SimpleNamespace(close=AsyncMock()))
+    monkeypatch.setattr(connections, 'all_connections', lambda: [mine, other])
+    monkeypatch.setattr(ah, 'initialize_modules', lambda *a, **k: {'asr': object()})
+    for section in ('ASR', 'TTS'):
+        mine.websocket.close.reset_mock()
+        result = await handler._apply(section)
+        assert result['sessions_closed'] == 1
+        mine.websocket.close.assert_awaited_once_with(code=1012, reason='Speech settings changed')
+        other.websocket.close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_failed_asr_apply_does_not_close_sessions(tmp_path, monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from core.admin import admin_handler as ah, connections
+    path = tmp_path / '.config.yaml'; path.write_text('{}\n')
+    config = config_store.load_merged(custom_path=path)
+    conn = SimpleNamespace(common_config=config, websocket=SimpleNamespace(close=AsyncMock()))
+    monkeypatch.setattr(connections, 'all_connections', lambda: [conn])
+    def fail(*a, **kw):
+        raise RuntimeError('model unavailable')
+    monkeypatch.setattr(ah, 'initialize_modules', fail)
+    h = AdminHandler(config, ws_server=SimpleNamespace(config_lock=asyncio.Lock(), _asr=object()), config_path=path)
+    assert (await h._apply('ASR'))['failed']
+    conn.websocket.close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_speech_probes_use_saved_protocol_and_separate_credentials(tmp_path, monkeypatch):
+    import base64
+    import io
+    import wave
+    from types import SimpleNamespace
+    from core.admin.admin_handler import COOKIE_NAME
+    from core.providers.asr import openai as provider
+    path = tmp_path / '.config.yaml'; path.write_text('{}\n')
+    for section in ('ASR', 'TTS'):
+        speech_settings.save(section, {'api_key': section + '-private-key', 'api_protocol': 'zenmux',
+                                       'voice': 'Kore', 'format': 'pcm'},
+                             config_store.load_merged(custom_path=path), path)
+    config = config_store.load_merged(custom_path=path)
+    selected = dict(config['selected_module'])
+    buffer = io.BytesIO()
+    with wave.open(buffer, 'wb') as wav:
+        wav.setnchannels(1); wav.setsampwidth(2); wav.setframerate(16000); wav.writeframes(b'\0\0'*1600)
+    wav_bytes = buffer.getvalue()
+    def post(url, **kw):
+        section = 'TTS' if url.endswith('/speech') else 'ASR'
+        assert kw['headers']['Authorization'] == 'Bearer ' + section + '-private-key'
+        if section == 'ASR':
+            assert base64.b64decode(kw['json']['input_audio']['data']) == wav_bytes
+            return SimpleNamespace(status_code=200, json=lambda: {'text': '轉寫成功'})
+        assert kw['json']['response_format'] == 'pcm'
+        return SimpleNamespace(status_code=200, content=b'json',
+                               json=lambda: {'audio': base64.b64encode(wav_bytes).decode(), 'mime_type': 'audio/wav'})
+    monkeypatch.setattr(provider.requests, 'post', post)
+    h = AdminHandler(config, config_path=path)
+    cookie = {COOKIE_NAME: h.sessions.create()}
+    app = web.Application(); h.register(app)
+    async with TestClient(TestServer(app)) as c:
+        r = await c.post('/admin/api/speech/tts/test', json={}, cookies=cookie)
+        assert r.status == 200
+        result = await r.json()
+        assert base64.b64decode(result['audio']) == wav_bytes and result['mime_type'] == 'audio/wav'
+        r = await c.post('/admin/api/speech/asr/test', json={'audio': base64.b64encode(wav_bytes).decode()}, cookies=cookie)
+        assert r.status == 200 and (await r.json())['text'] == '轉寫成功'
+        r = await c.post('/admin/api/speech/asr/test', json={'audio': 'invalid-base64'}, cookies=cookie)
+        assert r.status == 400
+        def error(*a, **kw):
+            return SimpleNamespace(status_code=400, json=lambda: {'error': {'message': 'Unsupported voice TTS-private-key'}})
+        monkeypatch.setattr(provider.requests, 'post', error)
+        r = await c.post('/admin/api/speech/tts/test', json={}, cookies=cookie)
+        assert r.status == 400
+        message = await r.text()
+        assert 'Unsupported voice' in message and 'TTS-private-key' not in message
+    assert config_store.load_merged(custom_path=path)['selected_module'] == selected

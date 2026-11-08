@@ -28,6 +28,11 @@ def key(tts, text: str, sample_rate: int) -> Optional[tuple]:
         return None
     return (
         type(tts).__module__,
+        getattr(tts, 'model', None),
+        getattr(tts, 'api_url', None),
+        getattr(tts, 'speed', None),
+        getattr(tts, 'response_format', None),
+        getattr(tts, 'pcm_sample_rate', None),
         getattr(tts, "voice", None),
         getattr(tts, "speech_rate", None),
         getattr(tts, "volume", None),

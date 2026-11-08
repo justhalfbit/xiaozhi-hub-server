@@ -1225,7 +1225,9 @@ async function renderTTS(root) {
 function renderSpeechForm(box, section, d, reload) {
   box.innerHTML = `<h3>OpenAI ${UII18n.t("相容語音 API")}</h3>
     <p class="muted small">${UII18n.t("只在使用雲端服務時產生服務商費用。金鑰留空會保留已儲存的值。")}</p>
+    <p class="muted small">${UII18n.t("儲存只保留設定；儲存並使用會結束目前對話，下一次對話套用新設定。")}</p>
     <div class="grid2">
+      <label class="f full">${UII18n.t("語音協定")}<select class="in" id="sp-protocol"><option value="openai">OpenAI</option><option value="zenmux">ZenMux</option></select></label>
       <label class="f full">Base URL<input class="in" id="sp-url" value="${esc(d.base_url)}" placeholder="https://api.openai.com/v1"></label>
       <label class="f">${UII18n.t("模型")}<input class="in" id="sp-model" value="${esc(d.model)}"></label>
       <label class="f">API Key<input class="in" id="sp-key" type="password" autocomplete="off" placeholder="${d.key_set ? UII18n.t("已設定，留空保留") : UII18n.t("尚未設定")}"></label>
@@ -1233,24 +1235,46 @@ function renderSpeechForm(box, section, d, reload) {
         <label class="f">${UII18n.t("語言")}<input class="in" id="sp-language" value="${esc(d.language)}" placeholder="zh；${UII18n.t("留空自動偵測")}"></label>
         <label class="f full">${UII18n.t("轉寫提示")}<textarea class="in" id="sp-prompt" placeholder="${UII18n.t("請以繁體中文轉寫，保留英文原文。")}">${esc(d.prompt)}</textarea></label>` : `
         <label class="f">${UII18n.t("音色")}<input class="in" id="sp-voice" value="${esc(d.voice)}"></label>
-        <label class="f">${UII18n.t("語速")}<input class="in" id="sp-speed" type="number" min="0.25" max="4" step="0.05" value="${esc(d.speed)}"></label>`}
+        <label class="f">${UII18n.t("語速")}<input class="in" id="sp-speed" type="number" min="0.25" max="4" step="0.05" value="${esc(d.speed)}"></label>
+        <label class="f">${UII18n.t("音訊格式")}<select class="in" id="sp-format">${['wav','mp3','pcm','opus','aac','flac'].map(v => `<option value="${v}">${v}</option>`).join('')}</select></label>
+        <label class="f">${UII18n.t("PCM 取樣率")}<select class="in" id="sp-rate">${[8000,16000,22050,24000,32000,44100,48000].map(v=>`<option value="${v}">${v} Hz</option>`).join('')}</select></label>
+        <p class="muted small">${UII18n.t("ZenMux Gemini TTS 請選 pcm，並使用 Gemini 音色，例如 Kore。")}</p>`}
     </div>
     <div class="actions"><span class="result">${d.conflict ? UII18n.t("同名設定不是 OpenAI 類型，請先修正設定檔。") : ''}</span>
       <button class="btn" id="sp-save" ${d.conflict ? 'disabled' : ''}>${UII18n.t("儲存")}</button>
-      <button class="btn primary" id="sp-use" ${d.conflict ? 'disabled' : ''}>${UII18n.t("儲存並使用")}</button></div>`;
-  const values = () => ({base_url: $('sp-url').value, model: $('sp-model').value, api_key: $('sp-key').value,
+      <button class="btn primary" id="sp-use" ${d.conflict ? 'disabled' : ''}>${UII18n.t("儲存並使用")}</button></div>
+    <div class="actions">${section === 'asr' ? `<input type="file" id="sp-audio" accept=".wav,audio/wav" aria-label="${UII18n.t("測試 WAV 音檔")}">` : ''}
+      <button class="btn" id="sp-test">${UII18n.t(section === 'asr' ? '測試轉寫' : '測試語音')}</button><span class="result" id="sp-result"></span></div>
+    <p class="muted small">${UII18n.t("測試使用已儲存的設定，會呼叫服務商 API 並可能產生費用。WAV 音檔限 700 KB、30 秒。")}</p>`;
+  $('sp-protocol').value = d.api_protocol || 'openai';
+  if (section === 'tts') { $('sp-format').value = d.format || 'wav'; $('sp-rate').value = d.pcm_sample_rate || 24000; }
+  const values = () => ({api_protocol: $('sp-protocol').value, base_url: $('sp-url').value, model: $('sp-model').value, api_key: $('sp-key').value,
     ...(section === 'asr' ? {language: $('sp-language').value, prompt: $('sp-prompt').value}
-                         : {voice: $('sp-voice').value, speed: $('sp-speed').value})});
+                         : {voice: $('sp-voice').value, speed: $('sp-speed').value, format: $('sp-format').value, pcm_sample_rate: $('sp-rate').value})});
   const dirty = snapshot(values);
   const save = (use) => async (e) => busy(e.target, async () => {
     try {
       const r = await api('speech/' + section, values());
       if (r.failed) { toast(r.note, true); return; }
-      if (use) { const switched = await api(section + '/use', {choice: 'openai'}); if (switched.failed) throw Error(switched.note); }
-      page.dirty = null; toast(use ? UII18n.t("已儲存並切換") : UII18n.t("已儲存")); await reload();
+      let note = r.note;
+      if (use) { const switched = await api(section + '/use', {choice: 'openai'}); if (switched.failed) throw Error(switched.note); note = switched.note; }
+      page.dirty = null; toast(note || UII18n.t("已儲存")); await reload();
     } catch (err) { toast(err.message, true); }
   });
   $('sp-save').onclick = save(false); $('sp-use').onclick = save(true);
+  $('sp-test').onclick = (e) => busy(e.target, async () => {
+    try {
+      const body = {};
+      if (section === 'asr') {
+        const file = $('sp-audio').files[0];
+        if (!file || file.size > 700000) throw Error(UII18n.t('請選擇小於 700 KB 的 WAV 音檔'));
+        body.audio = await new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(reader.result.split(',')[1]); reader.onerror = reject; reader.readAsDataURL(file); });
+      }
+      const r = await api('speech/' + section + '/test', body);
+      $('sp-result').textContent = section === 'asr' ? (r.text || UII18n.t('沒有辨識到語音')) : UII18n.t('語音測試成功');
+      if (section === 'tts') { if (audio) audio.pause(); audio = new Audio(`data:${r.mime_type};base64,${r.audio}`); await audio.play(); }
+    } catch (err) { $('sp-result').textContent = err.message; toast(err.message, true); }
+  });
   return dirty;
 }
 

@@ -90,3 +90,14 @@ def test_prompt_phrases_from_config():
         "DeepSeekLLM": {"type": "openai"},
     }}
     assert tts_phrase_cache.prompt_phrases(cfg) == ["交给 Grok Bot 了", "还在处理 请稍等", "稍等 我想想", "还在弄"]
+
+
+def test_speech_cache_changes_with_model_endpoint_and_speed():
+    from types import SimpleNamespace
+    provider = SimpleNamespace(model='model-a', api_url='https://a/speech', speed=1, voice='Kore')
+    key = tts_phrase_cache.key(provider, '你好', 16000)
+    for field, value in [('model', 'model-b'), ('api_url', 'https://b/speech'), ('speed', 1.5)]:
+        old = getattr(provider, field)
+        setattr(provider, field, value)
+        assert tts_phrase_cache.key(provider, '你好', 16000) != key
+        setattr(provider, field, old)

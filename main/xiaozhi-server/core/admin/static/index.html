@@ -1296,7 +1296,7 @@ async function openPluginSettings(id, label, onSaved) {
     result('<span class="muted">正在真搜一次，最多等 30 秒…</span>');
     try {
       const r = await api(`plugin-settings/${encodeURIComponent(id)}/test`, values());
-      result(`<span style="color:var(--ok)">✓ 搜到 ${r.count} 条，用时 ${r.seconds} 秒。第一条：${esc(r.first)}</span>`);
+      result(`<span style="color:var(--ok)">✓ ${r.message ? esc(r.message) : `搜到 ${r.count} 条，用时 ${r.seconds} 秒。第一条：${esc(r.first)}`}</span>`);
     } catch (err) { bad(err.message); }
   });
   $("ps-save").onclick = (e) => busy(e.target, async () => {

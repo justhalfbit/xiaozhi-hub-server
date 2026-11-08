@@ -164,7 +164,23 @@ async def _test_web_search(values: dict) -> dict:
     return {"seconds": result.seconds, "count": len(result.results), "first": result.results[0]["title"]}
 
 
-TESTS = {"web_search": _test_web_search}
+async def _test_weather(values: dict) -> dict:
+    """用页面上填的所在地查一次（没填就是 IP 判断的城市），看地名认得对不对。"""
+    from types import SimpleNamespace
+
+    from plugins_func.functions import get_weather
+
+    conn = SimpleNamespace(config={"plugins": {"get_weather": values}}, client_ip="127.0.0.1")
+    try:
+        report = await get_weather.local_report(conn)
+    except get_weather.WeatherError as e:
+        raise ValueError(str(e))
+    lines = report.splitlines()
+    place = lines[0].removeprefix("地点：")
+    return {"place": place, "message": f"查到的地点是 {place}。{lines[1] if len(lines) > 1 else ''}"}
+
+
+TESTS = {"web_search": _test_web_search, "get_weather": _test_weather}
 
 
 def _redact(message: str, values: dict, settings_id: str) -> str:

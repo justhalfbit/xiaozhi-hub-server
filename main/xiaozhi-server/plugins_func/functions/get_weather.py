@@ -1,8 +1,17 @@
+"""查天气：天气和空气质量用 Open-Meteo，地名用 OpenStreetMap 的 Nominatim 换成经纬度（查不到再试 Open-Meteo 自带的地名查询）。
+都免费、不用 Key。原来用和风天气：项目共用的 Key 已经失效（2026-11 起返回 401），天气数据还是抓网页解析的，已舍弃。
+
+没说地点时查「本地」：后台设置的所在地 > 宽带公网 IP 定位的城市 > 配置里的 default_location。
+"""
+
+import asyncio
+import time
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+
 import httpx
-from bs4 import BeautifulSoup
 from config.logger import setup_logging
 from plugins_func.register import register_function, ToolType, ActionResponse, Action
-from core.utils.util import get_ip_info
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -11,221 +20,323 @@ if TYPE_CHECKING:
 TAG = __name__
 logger = setup_logging()
 
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+OM_GEO_URL = "https://geocoding-api.open-meteo.com/v1/search"
+FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+AIR_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
+# Nominatim 的使用规定：要带能认出应用的 User-Agent，每秒最多 1 次，结果要缓存
+USER_AGENT = "xiaozhi-hub-server weather plugin (https://github.com/justhalfbit/xiaozhi-hub-server)"
+TIMEOUT = httpx.Timeout(8.0, connect=4.0)  # 设备上实测每个接口 1.5 秒左右
+NOMINATIM_INTERVAL = 1.1
+DEFAULT_LOCATION = "广州"
+FORECAST_DAYS = 7
+REPORT_TTL = 3600  # 天气缓存 1 小时
+PLACE_MISS_TTL = 600  # 查不到的地名 10 分钟内不再查
+WEEKDAYS = "一二三四五六日"
+
 GET_WEATHER_FUNCTION_DESC = {
     "type": "function",
     "function": {
         "name": "get_weather",
-        "description": (
-            "获取某个地点的天气，用户应提供一个位置，比如用户说杭州天气，参数为：杭州。"
-            "如果用户说的是省份，默认用省会城市。如果用户说的不是省份或城市而是一个地名，默认用该地所在省份的省会城市。"
-            "重要：本地未来7天天气已在上下文中提供，用户未指明其他城市时绝对不要调用此工具。"
-        ),
+        "description": "查天气：现在的天气、未来 7 天预报、接下来 12 小时会不会下雨下雪、空气质量。用户没说地点时不传 location，查本地。",
         "parameters": {
             "type": "object",
             "properties": {
                 "location": {
                     "type": "string",
-                    "description": "地点名，例如杭州。可选参数，如果不提供则不传",
-                },
-                "lang": {
-                    "type": "string",
-                    "description": "返回用户使用的语言code，例如zh_CN/zh_HK/en_US/ja_JP等，默认zh_CN",
+                    "description": "地点，城市或区县，例如 杭州、深圳南山区、东京；景点请换成它所在的区县或城市。查本地天气时不传",
                 },
             },
-            "required": ["lang"],
+            "required": [],
         },
     },
 }
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36"
-    )
+# WMO 天气代码 https://open-meteo.com/en/docs
+WMO = {
+    0: "晴", 1: "晴间多云", 2: "多云", 3: "阴",
+    45: "雾", 48: "雾凇",
+    51: "毛毛雨", 53: "毛毛雨", 55: "毛毛雨", 56: "冻毛毛雨", 57: "冻毛毛雨",
+    61: "小雨", 63: "中雨", 65: "大雨", 66: "冻雨", 67: "冻雨",
+    71: "小雪", 73: "中雪", 75: "大雪", 77: "米雪",
+    80: "阵雨", 81: "阵雨", 82: "强阵雨", 85: "阵雪", 86: "大阵雪",
+    95: "雷阵雨", 96: "雷阵雨伴有冰雹", 99: "雷阵雨伴有冰雹",
 }
-
-# 天气代码 https://dev.qweather.com/docs/resource/icons/#weather-icons
-WEATHER_CODE_MAP = {
-    "100": "晴",
-    "101": "多云",
-    "102": "少云",
-    "103": "晴间多云",
-    "104": "阴",
-    "150": "晴",
-    "151": "多云",
-    "152": "少云",
-    "153": "晴间多云",
-    "300": "阵雨",
-    "301": "强阵雨",
-    "302": "雷阵雨",
-    "303": "强雷阵雨",
-    "304": "雷阵雨伴有冰雹",
-    "305": "小雨",
-    "306": "中雨",
-    "307": "大雨",
-    "308": "极端降雨",
-    "309": "毛毛雨/细雨",
-    "310": "暴雨",
-    "311": "大暴雨",
-    "312": "特大暴雨",
-    "313": "冻雨",
-    "314": "小到中雨",
-    "315": "中到大雨",
-    "316": "大到暴雨",
-    "317": "暴雨到大暴雨",
-    "318": "大暴雨到特大暴雨",
-    "350": "阵雨",
-    "351": "强阵雨",
-    "399": "雨",
-    "400": "小雪",
-    "401": "中雪",
-    "402": "大雪",
-    "403": "暴雪",
-    "404": "雨夹雪",
-    "405": "雨雪天气",
-    "406": "阵雨夹雪",
-    "407": "阵雪",
-    "408": "小到中雪",
-    "409": "中到大雪",
-    "410": "大到暴雪",
-    "456": "阵雨夹雪",
-    "457": "阵雪",
-    "499": "雪",
-    "500": "薄雾",
-    "501": "雾",
-    "502": "霾",
-    "503": "扬沙",
-    "504": "浮尘",
-    "507": "沙尘暴",
-    "508": "强沙尘暴",
-    "509": "浓雾",
-    "510": "强浓雾",
-    "511": "中度霾",
-    "512": "重度霾",
-    "513": "严重霾",
-    "514": "大雾",
-    "515": "特强浓雾",
-    "900": "热",
-    "901": "冷",
-    "999": "未知",
-}
+RAIN_CODES = set(range(51, 68)) | {80, 81, 82}
+SNOW_CODES = {71, 73, 75, 77, 85, 86}
+WIND_DIRS = ["北", "东北", "东", "东南", "南", "西南", "西", "西北"]
+# 风速（km/h）上限 → 风力等级
+BEAUFORT = [1, 6, 12, 20, 29, 39, 50, 62, 75, 89, 103, 118]
+# PM2.5（μg/m³，24 小时）分级，HJ 633
+PM25_LEVELS = [(35, "优"), (75, "良"), (115, "轻度污染"), (150, "中度污染"), (250, "重度污染")]
 
 
-async def fetch_city_info(location, api_key, api_host):
-    url = f"https://{api_host}/geo/v2/city/lookup?key={api_key}&location={location}&lang=zh"
-    async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=3.0)) as client:
-        response = await client.get(url, headers=HEADERS)
-    data = response.json()
-    if data.get("error") is not None:
-        logger.bind(tag=TAG).error(
-            f"获取天气失败，原因：{data.get('error', {}).get('detail')}"
-        )
+class WeatherError(Exception):
+    """查天气失败，message 可以直接告诉用户。"""
+
+
+@dataclass(frozen=True)
+class Place:
+    name: str  # 念给用户听的名字，例如 天河区（广州市）
+    lat: float
+    lon: float
+
+
+# ---------- 地名 ----------
+
+_places = {}  # 地名 -> (时间, Place 或 None)
+_nominatim_lock = asyncio.Lock()
+_nominatim_last = 0.0
+
+
+def _client():
+    return httpx.AsyncClient(timeout=TIMEOUT, headers={"User-Agent": USER_AGENT})
+
+
+async def _nominatim(name: str):
+    global _nominatim_last
+    async with _nominatim_lock:
+        wait = _nominatim_last + NOMINATIM_INTERVAL - time.monotonic()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        try:
+            async with _client() as client:
+                # featureType=settlement：只在城市、区县、乡镇这些居民点和行政区里找。不加的话模糊匹配太宽，
+                # 「杭州西湖区」会查成一所大学、乱说的地名会查成某家餐馆
+                resp = await client.get(NOMINATIM_URL, params={
+                    "q": name, "format": "jsonv2", "limit": 1, "accept-language": "zh-CN",
+                    "featureType": "settlement"})
+        finally:
+            _nominatim_last = time.monotonic()
+    resp.raise_for_status()
+    items = resp.json()
+    if not items:
         return None
-    return data.get("location", [])[0] if data.get("location") else None
+    item = items[0]
+    # display_name 例如「天河区, 广州市, 广东省, 中国」；国外的会带几种写法，例如「纽约;紐約, 纽约州;紐約州, 美国;美國」「东京都/東京都, 日本」
+    parts = [p.split(";")[0].split("/")[0].strip() for p in item.get("display_name", name).split(",")]
+    return Place(_label(parts), float(item["lat"]), float(item["lon"]))
 
 
-async def fetch_weather_page(url):
-    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=3.0)) as client:
-        response = await client.get(url, headers=HEADERS)
-    return BeautifulSoup(response.text, "html.parser") if response.status_code == 200 else None
+def _label(parts) -> str:
+    """念给用户听的地名：本身 +（省市区），例如「南山街道（广东省深圳市南山区）」。只写上一级会分不清同名的
+    （深圳和鹤岗都有南山区）。去掉邮编和最后的国家名。"""
+    parts = [p for p in parts if p and not p.isdigit()]
+    upper = list(reversed(parts[1:-1]))  # 中间是上级行政区，最后一个是国家
+    return parts[0] + (f"（{''.join(upper)}）" if upper else "")
 
 
-def parse_weather_info(soup):
-    city_name = soup.select_one("h1.c-submenu__location").get_text(strip=True)
+async def _open_meteo_geo(name: str):
+    """Open-Meteo 的地名查询只认得大城市，而且不认「市」「区」后缀；按人口挑最大的那个。"""
+    async with _client() as client:
+        for q in dict.fromkeys([name, name.rstrip("市")]):
+            resp = await client.get(OM_GEO_URL, params={"name": q, "count": 10, "language": "zh", "format": "json"})
+            resp.raise_for_status()
+            results = [r for r in resp.json().get("results") or [] if r.get("population")]
+            if results:
+                r = max(results, key=lambda r: r["population"])
+                admin = r.get("admin1")
+                label = r["name"] + (f"（{admin}）" if admin and admin != r["name"] else "")
+                return Place(label, float(r["latitude"]), float(r["longitude"]))
+    return None
 
-    current_abstract = soup.select_one(".c-city-weather-current .current-abstract")
-    current_abstract = (
-        current_abstract.get_text(strip=True) if current_abstract else "未知"
+
+async def find_place(name: str) -> Place:
+    name = name.strip()
+    cached = _places.get(name)
+    if cached and (cached[1] is not None or time.time() - cached[0] < PLACE_MISS_TTL):
+        if cached[1] is None:
+            raise WeatherError(f"没找到「{name}」这个地方")
+        return cached[1]
+    place, failed = None, None
+    for lookup in (_nominatim, _open_meteo_geo):
+        try:
+            place = await lookup(name)
+        except (httpx.HTTPError, ValueError, KeyError) as e:
+            failed = e
+            logger.bind(tag=TAG).warning(f"查地名「{name}」失败（{lookup.__name__}）: {e!r}")
+            continue
+        if place:
+            break
+    if place is None and failed is not None:
+        raise WeatherError("地名查询服务连不上")
+    _places[name] = (time.time(), place)
+    if place is None:
+        raise WeatherError(f"没找到「{name}」这个地方")
+    return place
+
+
+# ---------- 天气 ----------
+
+_reports = {}  # 经纬度 -> (时间, 报告)
+
+
+def _num(value, digits=0):
+    if value is None:
+        return "?"
+    return f"{value:.{digits}f}" if digits else f"{round(value)}"
+
+
+def _wind(speed_kmh, degrees) -> str:
+    if speed_kmh is None:
+        return ""
+    level = next((i for i, top in enumerate(BEAUFORT) if speed_kmh < top), 12)
+    if level == 0:
+        return "无风"
+    direction = WIND_DIRS[round((degrees or 0) / 45) % 8] + "风" if degrees is not None else "风"
+    return f"{direction} {level} 级"
+
+
+def _day_weather(code, rain_mm) -> str:
+    """一天的天气：Open-Meteo 的日代码取一天里最严重的天气，零点几毫米的毛毛雨也会报成雨（和和风对比过），
+    雨量不到 1 毫米说成「多云，可能有零星小雨」。"""
+    text = WMO.get(code, "未知")
+    if code in RAIN_CODES and (rain_mm or 0) < 1.0:
+        return "多云，可能有零星小雨"
+    if code in (51, 53, 55):
+        return "小雨"
+    return text
+
+
+def _pm25_level(pm25) -> str:
+    return next((name for top, name in PM25_LEVELS if pm25 <= top), "严重污染")
+
+
+def _day_label(day: date, today: date) -> str:
+    names = {0: "今天", 1: "明天", 2: "后天"}
+    prefix = names.get((day - today).days, "")
+    return f"{prefix}{day.month}月{day.day}日 周{WEEKDAYS[day.weekday()]}"
+
+
+def _rain_next_hours(hourly: dict, now: datetime, hours=12) -> str:
+    """接下来 12 小时哪几个钟头可能下雨或下雪（概率 ≥ 50% 或降水 ≥ 0.3 毫米）。"""
+    wet = []
+    for t, prob, mm, code in zip(hourly.get("time", []), hourly.get("precipitation_probability", []),
+                                 hourly.get("precipitation", []), hourly.get("weather_code", [])):
+        start = datetime.fromisoformat(t)
+        if start + timedelta(hours=1) <= now or start > now + timedelta(hours=hours):
+            continue
+        if (prob or 0) >= 50 or (mm or 0) >= 0.3:
+            wet.append((start, prob or 0, code))
+    if not wet:
+        return f"接下来 {hours} 小时：基本不会下雨"
+    what = "下雪" if any(code in SNOW_CODES for _, _, code in wet) else "下雨"
+
+    def clock(t):
+        return ("" if t.date() == now.date() else "明天") + f"{t.hour} 点"
+
+    first, last = wet[0][0], wet[-1][0] + timedelta(hours=1)
+    top = max(p for _, p, _ in wet)
+    span = clock(first) if len(wet) == 1 else f"{clock(first)}到{clock(last)}"
+    return f"接下来 {hours} 小时：{span}可能{what}，降水概率最高 {top}%"
+
+
+def format_report(place: Place, forecast: dict, air: dict = None) -> str:
+    cur = forecast.get("current") or {}
+    daily = forecast.get("daily") or {}
+    now = datetime.fromisoformat(cur["time"]) if cur.get("time") else datetime.now()
+    lines = [f"地点：{place.name}"]
+    wind = _wind(cur.get("wind_speed_10m"), cur.get("wind_direction_10m"))
+    lines.append(
+        f"现在（{now:%H:%M}）：{WMO.get(cur.get('weather_code'), '未知')}，{_num(cur.get('temperature_2m'))}°C，"
+        f"体感 {_num(cur.get('apparent_temperature'))}°C，湿度 {_num(cur.get('relative_humidity_2m'))}%"
+        + (f"，{wind}" if wind else "")
     )
+    pm25 = ((air or {}).get("current") or {}).get("pm2_5")
+    if pm25 is not None:
+        lines.append(f"空气质量：{_pm25_level(pm25)}（PM2.5 {_num(pm25)}）")
+    lines.append(_rain_next_hours(forecast.get("hourly") or {}, now))
+    today = now.date()
 
-    current_basic = {}
-    for item in soup.select(
-        ".c-city-weather-current .current-basic .current-basic___item"
-    ):
-        parts = item.get_text(strip=True, separator=" ").split(" ")
-        if len(parts) == 2:
-            key, value = parts[1], parts[0]
-            current_basic[key] = value
+    def column(name, i):
+        values = daily.get(name) or []
+        return values[i] if i < len(values) else None
 
-    temps_list = []
-    for row in soup.select(".city-forecast-tabs__row")[:7]:  # 取前7天的数据
-        date = row.select_one(".date-bg .date").get_text(strip=True)
-        weather_code = (
-            row.select_one(".date-bg .icon")["src"].split("/")[-1].split(".")[0]
+    for i, day in enumerate(daily.get("time", [])):
+        d = date.fromisoformat(day)
+        weather = _day_weather(column("weather_code", i), column("precipitation_sum", i))
+        prob = column("precipitation_probability_max", i)
+        lines.append(
+            f"{_day_label(d, today)}：{weather}，{_num(column('temperature_2m_min', i))}～"
+            f"{_num(column('temperature_2m_max', i))}°C" + (f"，降水概率 {prob}%" if prob is not None else "")
         )
-        weather = WEATHER_CODE_MAP.get(weather_code, "未知")
-        temps = [span.get_text(strip=True) for span in row.select(".tmp-cont .temp")]
-        high_temp, low_temp = (temps[0], temps[-1]) if len(temps) >= 2 else (None, None)
-        temps_list.append((date, weather, high_temp, low_temp))
+    return "\n".join(lines)
 
-    return city_name, current_abstract, current_basic, temps_list
+
+async def fetch_report(place: Place) -> str:
+    key = f"{place.lat:.2f},{place.lon:.2f}"
+    cached = _reports.get(key)
+    if cached and time.time() - cached[0] < REPORT_TTL:
+        return cached[1]
+    common = {"latitude": place.lat, "longitude": place.lon, "timezone": "auto"}
+    try:
+        async with _client() as client:
+            forecast_req = client.get(FORECAST_URL, params={
+                **common, "forecast_days": FORECAST_DAYS,
+                "current": "temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,"
+                           "wind_speed_10m,wind_direction_10m",
+                "hourly": "precipitation_probability,precipitation,weather_code",
+                "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,"
+                         "precipitation_probability_max",
+            })
+            air_req = client.get(AIR_URL, params={**common, "current": "pm2_5"})
+            forecast_resp, air_resp = await asyncio.gather(forecast_req, air_req, return_exceptions=True)
+        if isinstance(forecast_resp, Exception):
+            raise forecast_resp
+        forecast_resp.raise_for_status()
+        forecast = forecast_resp.json()
+        air = None
+        if isinstance(air_resp, httpx.Response) and air_resp.status_code == 200:
+            air = air_resp.json()
+        else:
+            logger.bind(tag=TAG).warning(f"空气质量没查到: {air_resp!r}")
+        report = format_report(place, forecast, air)
+    except (httpx.HTTPError, ValueError, KeyError) as e:
+        logger.bind(tag=TAG).error(f"查天气失败（{place.name}）: {e!r}")
+        raise WeatherError("天气服务暂时连不上")
+    _reports[key] = (time.time(), report)
+    return report
+
+
+# ---------- 本地 ----------
+
+def _ip_city(conn) -> str:
+    """宽带公网 IP 所在的城市（按设备地址缓存）。"""
+    from core.utils.cache.manager import cache_manager, CacheType
+    from core.utils.util import get_ip_info
+
+    ip = getattr(conn, "client_ip", None)
+    if not ip:
+        return ""
+    info = cache_manager.get(CacheType.IP_INFO, ip)
+    if info is None:
+        info = get_ip_info(ip, logger)
+        if info:
+            cache_manager.set(CacheType.IP_INFO, ip, info)
+    return ((info or {}).get("city") or "").strip()
+
+
+def local_query(conn) -> str:
+    """本地查哪里：后台设置的所在地 > IP 定位的城市 > default_location。"""
+    cfg = (conn.config.get("plugins") or {}).get("get_weather") or {}
+    location = str(cfg.get("location") or "").strip()
+    if location:
+        return location
+    return _ip_city(conn) or str(cfg.get("default_location") or "").strip() or DEFAULT_LOCATION
+
+
+async def local_report(conn) -> str:
+    query = await asyncio.to_thread(local_query, conn)  # IP 定位是同步请求
+    return await fetch_report(await find_place(query))
 
 
 @register_function("get_weather", GET_WEATHER_FUNCTION_DESC, ToolType.SYSTEM_CTL)
 async def get_weather(conn: "ConnectionHandler", location: str = None, lang: str = "zh_CN"):
-    from core.utils.cache.manager import cache_manager, CacheType
-
-    weather_config = conn.config.get("plugins", {}).get("get_weather", {})
-    api_host = weather_config.get("api_host", "mj7p3y7naa.re.qweatherapi.com")
-    api_key = weather_config.get("api_key", "a861d0d5e7bf4ee1a83d9a9e4f96d4da")
-    default_location = weather_config.get("default_location", "广州")
-    client_ip = conn.client_ip
-
-    # 优先使用用户提供的location参数
-    if not location:
-        # 通过客户端IP解析城市
-        if client_ip:
-            # 先从缓存获取IP对应的城市信息
-            cached_ip_info = cache_manager.get(CacheType.IP_INFO, client_ip)
-            if cached_ip_info:
-                location = cached_ip_info.get("city")
-            else:
-                # 缓存未命中，调用API获取
-                ip_info = get_ip_info(client_ip, logger)
-                if ip_info:
-                    cache_manager.set(CacheType.IP_INFO, client_ip, ip_info)
-                    location = ip_info.get("city")
-
-            if not location:
-                location = default_location
+    try:
+        if location and location.strip():
+            report = await fetch_report(await find_place(location))
         else:
-            # 若无IP，使用默认位置
-            location = default_location
-    # 尝试从缓存获取完整天气报告
-    weather_cache_key = f"full_weather_{location}_{lang}"
-    cached_weather_report = cache_manager.get(CacheType.WEATHER, weather_cache_key)
-    if cached_weather_report:
-        return ActionResponse(Action.REQLLM, cached_weather_report, None)
-
-    # 缓存未命中，获取实时天气数据
-    city_info = await fetch_city_info(location, api_key, api_host)
-    if not city_info:
-        return ActionResponse(
-            Action.REQLLM, f"未找到相关的城市: {location}，请确认地点是否正确", None
-        )
-    soup = await fetch_weather_page(city_info["fxLink"])
-    if not soup:
-        return ActionResponse(Action.REQLLM, None, "请求失败")
-    city_name, current_abstract, current_basic, temps_list = parse_weather_info(soup)
-
-    weather_report = f"您查询的位置是：{city_name}\n\n当前天气: {current_abstract}\n"
-
-    # 添加有效的当前天气参数
-    if current_basic:
-        weather_report += "详细参数：\n"
-        for key, value in current_basic.items():
-            if value != "0":  # 过滤无效值
-                weather_report += f"  · {key}: {value}\n"
-
-    # 添加7天预报
-    weather_report += "\n未来7天预报：\n"
-    for date, weather, high, low in temps_list:
-        weather_report += f"{date}: {weather}，气温 {low}~{high}\n"
-
-    # 提示语
-    weather_report += "\n（如需某一天的具体天气，请告诉我日期）"
-
-    # 缓存完整的天气报告
-    cache_manager.set(CacheType.WEATHER, weather_cache_key, weather_report)
-
-    return ActionResponse(Action.REQLLM, weather_report, None)
+            report = await local_report(conn)
+    except WeatherError as e:
+        return ActionResponse(Action.REQLLM, f"没查到天气：{e}。请简短告诉用户这次没查到，稍后再试。", None)
+    return ActionResponse(Action.REQLLM, report, None)

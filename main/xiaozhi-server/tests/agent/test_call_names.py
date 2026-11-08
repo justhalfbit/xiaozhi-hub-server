@@ -9,6 +9,12 @@ from core.agent import call_names, llm_router
 from core.agent.call_names import handle_call_name, match_call_name
 
 
+def test_default_call_reply_follows_language_but_custom_text_is_preserved():
+    assert call_names.reply_text({}, 'yue-HK') == '我喺度'
+    assert call_names.reply_text({}, 'en') == "I'm here"
+    assert call_names.reply_text({'reply': '自訂回覆'}, 'en') == '自訂回覆'
+
+
 def test_reply_audio_cache_separates_provider_model_endpoint_and_speed():
     class TTS:
         voice = 'Leda'

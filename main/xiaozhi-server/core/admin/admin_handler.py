@@ -1036,7 +1036,8 @@ class AdminHandler:
         self._require_login(request)
         merged = await self._blocking(self._merged)
         return self._json({"ok": True, **pages.describe_tts(merged), "running": self._running("TTS"),
-                           'profile': speech_settings.tts_profile(self.config), 'active': self._active_tts()})
+                           'profile': speech_settings.tts_profile(self.config), 'active': self._active_tts(),
+                           'reply_language': merged.get('reply_language') or '', 'language_options': reply_language.OPTIONS})
 
     async def handle_speech_save(self, request):
         self._require_login(request)
@@ -1255,6 +1256,7 @@ class AdminHandler:
         for d in devices:
             d["online"] = d["device"] in online
         return self._json({"ok": True, "devices": devices, 'reply_language': merged.get('reply_language', ''),
+                           'language_options': reply_language.OPTIONS,
                            "settings": {k: cfg[k] for k in ("enabled", "summary", "max_messages", "max_tokens",
                                                             "summary_min", "summary_chars")}})
 
@@ -1287,7 +1289,9 @@ class AdminHandler:
                 data['reply_language'] = language
         await self._blocking(save)
         self._push_config('reply_language', language)
-        return self._json({'ok': True, 'note': '已儲存，裝置重新連線後生效'})
+        result = (await self._refresh_speech_connections() if self.ws_server is not None
+                  else {'note': '已儲存，裝置重新連線後生效'})
+        return self._json({'ok': True, 'language': language, **result})
 
     async def handle_devices(self, request: web.Request):
         self._require_login(request)

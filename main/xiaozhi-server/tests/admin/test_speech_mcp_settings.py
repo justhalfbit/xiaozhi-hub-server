@@ -122,6 +122,61 @@ def test_reply_language_preserves_original_prompt():
     assert 'Simplified Chinese' in apply(prompt, 'zh-Hans')
 
 
+def test_spoken_languages_have_reply_rules_localized_prompts_and_separate_voice_cache():
+    from core.agent import reply_language
+    config = {'selected_module': {'TTS': 'OpenAITTS'}, 'TTS': {'OpenAITTS': {'type': 'openai', 'voice': 'Leda'}}}
+    revisions = set()
+    for language in reply_language.LANGUAGES:
+        profile = speech_settings.tts_profile({**config, 'reply_language': language})
+        revisions.add(profile['revision'])
+        assert profile['wake_text'] == reply_language.phrase('wake', language)
+        assert reply_language.phrase('test', language)
+        if language:
+            assert reply_language.apply('Original prompt', language).startswith('Original prompt')
+            assert len(reply_language.apply('', language)) > 20
+    assert len(revisions) == len(reply_language.LANGUAGES)
+    assert reply_language.phrase('wake', 'yue-HK') == '喺度'
+    assert reply_language.phrase('wake', 'en') == "I'm here."
+
+
+@pytest.mark.asyncio
+async def test_users_choose_language_without_changing_provider_or_interface(tmp_path):
+    import copy
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from core.admin import connections
+    from core.admin.admin_handler import COOKIE_NAME
+    path = tmp_path / '.config.yaml'; path.write_text('reply_language: zh-Hant\n')
+    config = config_store.load_merged(custom_path=path)
+    selected = copy.deepcopy(config['selected_module'])
+    h = AdminHandler(config, ws_server=object(), config_path=path)
+    conn = SimpleNamespace(session_id='language-selection-test', common_config=config,
+                           config=copy.deepcopy(config), websocket=SimpleNamespace(close=AsyncMock()))
+    connections.register(conn)
+    cookie = {COOKIE_NAME: h.sessions.create()}
+    app = web.Application(); h.register(app)
+    try:
+        async with TestClient(TestServer(app)) as c:
+            before = path.read_bytes()
+            d = await (await c.get('/admin/api/tts', cookies=cookie)).json()
+            assert d['reply_language'] == 'zh-Hant'
+            assert {'yue-HK', 'en', 'ja', 'ko', 'es', 'fr'} <= {o['value'] for o in d['language_options']}
+            assert path.read_bytes() == before  # opening the menu never chooses for the user
+            r = await c.post('/admin/api/language', json={'language': 'unsupported'}, cookies=cookie)
+            assert r.status == 400 and path.read_bytes() == before
+            r = await c.post('/admin/api/language', json={'language': 'yue-HK'}, cookies=cookie)
+            assert r.status == 200
+            assert config_store.load_custom(path)['reply_language'] == 'yue-HK'
+            assert config['reply_language'] == conn.config['reply_language'] == 'yue-HK'
+            conn.websocket.close.assert_awaited_once()
+            memory = await (await c.get('/admin/api/memory', cookies=cookie)).json()
+            assert memory['reply_language'] == 'yue-HK'
+            assert memory['language_options'] == d['language_options']
+            assert config['selected_module'] == selected
+    finally:
+        connections.unregister(conn)
+
+
 def test_tts_profile_tracks_voice_model_and_speed_without_credentials():
     import copy
     config = {'selected_module': {'TTS': 'OpenAITTS'}, 'TTS': {'OpenAITTS': {

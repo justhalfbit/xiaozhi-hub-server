@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 from ruamel.yaml.comments import CommentedMap
 
 from core.admin import config_store
+from core.agent import reply_language
 
 SPEECH = {
     'ASR': {'entry': 'OpenAIASR', 'endpoint': '/audio/transcriptions', 'model_field': 'model_name',
@@ -24,10 +25,12 @@ def tts_profile(config):
     fields = ('type', 'model', 'voice', 'private_voice', 'speed', 'speech_rate', 'volume',
               'pitch_rate', 'format', 'pcm_sample_rate', 'api_protocol', 'api_url', 'base_url',
               'ttsRate', 'ttsVolume', 'ttsPitch')
-    identity = {'entry': name, **{k: entry.get(k) for k in fields}}
+    language = config.get('reply_language') or ''
+    identity = {'entry': name, 'language': language, **{k: entry.get(k) for k in fields}}
     revision = hashlib.sha256(json.dumps(identity, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:32]
     return {'revision': revision, 'entry': name, 'type': entry.get('type'), 'model': entry.get('model'),
-            'voice': entry.get('private_voice') or entry.get('voice'), 'speed': entry.get('speed')}
+            'voice': entry.get('private_voice') or entry.get('voice'), 'speed': entry.get('speed'),
+            'language': language, 'wake_text': reply_language.phrase('wake', language)}
 
 
 def describe(section, merged):

@@ -1170,6 +1170,10 @@ function vadCard(v) {
 // ---------- 语音合成 ----------
 
 let audio = null;
+function languageChoices(options) {
+  return (options || []).map(o => `<option value="${esc(o.value)}">${esc(UII18n.t(o.label))}</option>`).join('');
+}
+
 async function renderTTS(root) {
   const d = await api("tts");
   const isEdge = d.type === "edge";
@@ -1180,6 +1184,11 @@ async function renderTTS(root) {
   root.innerHTML = `
     <div class="page-head"><div><h1>${UII18n.t("语音合成")}</h1><p class="sub">${UII18n.t("把回复转成语音。EdgeTTS 免费、不需要 Key，换音色不用下载任何文件。")}</p></div>
       <span class="pill ok">${UII18n.t("当前：")}${esc(d.selected)}${cur ? ` · ${esc(cur.name)}` : ""}</span></div>
+    <div class="card panel"><h3>${UII18n.t("說話語言")}</h3>
+      <p class="muted small">${UII18n.t("選擇模型回覆、喚醒提示與語音測試使用的語言。儲存後會結束目前對話。朗讀發音取決於所選 TTS 模型與音色支援。")}</p>
+      <div class="actions"><select class="in" id="tts-language" aria-label="${UII18n.t("說話語言")}">${languageChoices(d.language_options)}</select>
+      <button class="btn primary" id="tts-language-save">${UII18n.t("儲存說話語言")}</button></div>
+    </div>
     <div class="card panel" id="speech-api-form"></div>
     ${isEdge ? '' : UII18n.t("<button class=\"btn\" id=\"tts-edge\">切回免費 EdgeTTS</button>")}
     <div class="card panel ${isEdge ? "" : "disabled-area"}">
@@ -1215,7 +1224,15 @@ async function renderTTS(root) {
   });
   const edgeDirty = page.dirty;
   const apiDirty = renderSpeechForm($('speech-api-form'), 'tts', d.openai, () => openPage('tts', true));
-  page.dirty = () => edgeDirty() || apiDirty();
+  let savedLanguage = d.reply_language || '';
+  $('tts-language').value = savedLanguage;
+  page.dirty = () => edgeDirty() || apiDirty() || $('tts-language').value !== savedLanguage;
+  $('tts-language-save').onclick = e => busy(e.target, async () => {
+    try {
+      const language = $('tts-language').value;
+      const r = await api('language', {language}); savedLanguage = language; toast(r.note);
+    } catch (err) { toast(err.message, true); }
+  });
   if ($('tts-edge')) $('tts-edge').onclick = (e) => busy(e.target, async () => {
     try { const r = await api('tts/use', {choice: 'edge'}); toast(r.note); page.dirty = null; await openPage('tts', true); }
     catch (err) { toast(err.message, true); }
@@ -1271,7 +1288,7 @@ function renderSpeechForm(box, section, d, reload) {
         body.audio = await new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(reader.result.split(',')[1]); reader.onerror = reject; reader.readAsDataURL(file); });
       }
       const r = await api('speech/' + section + '/test', body);
-      $('sp-result').textContent = section === 'asr' ? (r.text || UII18n.t('沒有辨識到語音')) : UII18n.t('語音測試成功');
+      $('sp-result').textContent = r.text || UII18n.t(section === 'asr' ? '沒有辨識到語音' : '語音測試成功');
       if (section === 'tts') { if (audio) audio.pause(); audio = new Audio(`data:${r.mime_type};base64,${r.audio}`); await audio.play(); }
     } catch (err) { $('sp-result').textContent = err.message; toast(err.message, true); }
   });
@@ -1521,10 +1538,10 @@ async function renderMemory(root) {
     <div class="page-head"><div><h1>${UII18n.t("记忆")}</h1><p class="sub">${UII18n.t("聊天记录按设备和模型存在本机（data/chat.db），每次只把最近")} ${st.max_messages} ${UII18n.t("条（约")} ${st.max_tokens} token ${UII18n.t("以内）发给模型；")}
       ${UII18n.t("更早的部分自动总结成这里的记忆，放进系统提示。同一台设备的所有 API 模型共用一份记忆，Claude Code 和 Grok Bot 不用它（它们的上下文在自己的会话里）。")}
       ${UII18n.t("在这里修改或清空后，下一次提问就按新的来。")}</p></div>${status}</div>
-    <div class="card panel"><h3>${UII18n.t("回覆語言")}</h3>
-      <p class="muted small">${UII18n.t("保留聊天原文，只把語言偏好加入模型系統提示。裝置重新連線後生效。")}</p>
-      <select class="in" id="reply-language"><option value="">${UII18n.t("沿用模型設定")}</option><option value="zh-Hans">${UII18n.t("简体中文")}</option><option value="zh-Hant">${UII18n.t("繁體中文")}</option></select>
-      <button class="btn primary" id="reply-language-save">${UII18n.t("儲存回覆語言")}</button>
+    <div class="card panel"><h3>${UII18n.t("說話語言")}</h3>
+      <p class="muted small">${UII18n.t("選擇模型回覆、喚醒提示與語音測試使用的語言。儲存後會結束目前對話。朗讀發音取決於所選 TTS 模型與音色支援。")}</p>
+      <select class="in" id="reply-language">${languageChoices(d.language_options)}</select>
+      <button class="btn primary" id="reply-language-save">${UII18n.t("儲存說話語言")}</button>
     </div>
     <div id="mem-list"></div>`;
   $('reply-language').value = d.reply_language || '';

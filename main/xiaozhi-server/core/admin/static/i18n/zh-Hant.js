@@ -887,7 +887,13 @@ window.UI_ZH_HANT = {
   "；取消的 Bot 对正连着的设备要等它重新连接才生效": "；取消的 Bot 對正連著的裝置要等它重新連線才生效",
   "；热词重新加载失败：": "；熱詞重新載入失敗：",
   "；配置里没有 ": "；配置裡沒有 ",
-  "现在更新网关吗？\\n\\n": "現在更新閘道器嗎？\\n\\n"
+  "现在更新网关吗？\\n\\n": "現在更新閘道器嗎？\\n\\n",
+  "仲未設定語言模型，請喺電腦開網關管理頁，填好 API Key。": "仲未設定語言模型，請喺電腦開閘道器管理頁，填好 API Key。",
+  "こんにちは。これは日本語の音声テストです。": "こんにちは。これは日本語の音聲テストです。",
+  "你好，这是普通话语音测试。": "你好，這是普通話語音測試。",
+  "還沒設定大語言模型，請在電腦上開啟網關管理頁填好 API Key。": "還沒設定大語言模型，請在電腦上開啟閘道器管理頁填好 API Key。",
+  "言語モデルが設定されていません。パソコンでゲートウェイ管理画面を開き、API キーを入力してください。": "言語モデルが設定されていません。パソコンでゲートウェイ管理畫面を開き、API キーを入力してください。",
+  "还没配置大模型，请在电脑上打开网关后台填好 API Key。": "還沒配置大模型，請在電腦上開啟閘道器後臺填好 API Key。"
 };
 window.UI_ZH_HANS = {
   " 已存在，但不是 OpenAI 相容類型": " 已存在，但不是 OpenAI 相容类型",
@@ -979,5 +985,28 @@ window.UI_ZH_HANS = {
   "測試音檔長度須介於 0 和 30 秒之間": "测试音档长度须介于 0 和 30 秒之间",
   "已套用，下一次對話使用新語音設定": "已套用，下一次对话使用新语音设定",
   "ZenMux Gemini TTS 請選 pcm，並使用 Gemini 音色，例如 Kore。": "ZenMux Gemini TTS 请选 pcm，并使用 Gemini 音色，例如 Kore。",
-  "沒有辨識到語音": "没有辨识到语音"
+  "沒有辨識到語音": "没有辨识到语音",
+  "西班牙語 Español": "西班牙语 Español",
+  "日語 日本語": "日语 日本语",
+  "英語 English": "英语 English",
+  "仲未設定語言模型，請喺電腦開網關管理頁，填好 API Key。": "仲未设定语言模型，请喺电脑开网关管理页，填好 API Key。",
+  "こんにちは。これは日本語の音声テストです。": "こんにちは。これは日本语の音声テストです。",
+  "說話語言": "说话语言",
+  "你好，呢個係廣東話語音測試。": "你好，呢个系广东话语音测试。",
+  "廣東話／粵語（香港）": "广东话／粤语（香港）",
+  "Reply in natural colloquial Hong Kong Cantonese (廣東話／粵語), written in Traditional Chinese. Use Cantonese wording such as 係、唔、嘅、喺、冇 rather than written Mandarin. Preserve code and proper names. Follow an explicit user request for another language.": "Reply in natural colloquial Hong Kong Cantonese (广东话／粤语), written in Traditional Chinese. Use Cantonese wording such as 系、唔、嘅、喺、冇 rather than written Mandarin. Preserve code and proper names. Follow an explicit user request for another language.",
+  "還沒設定大語言模型，請在電腦上開啟網關管理頁填好 API Key。": "还没设定大语言模型，请在电脑上开启网关管理页填好 API Key。",
+  "言語モデルが設定されていません。パソコンでゲートウェイ管理画面を開き、API キーを入力してください。": "言语モデルが设定されていません。パソコンでゲートウェイ管理画面を开き、API キーを入力してください。",
+  "法語 Français": "法语 Français",
+  "僅限本機": "仅限本机",
+  "自動／沿用模型設定": "自动／沿用模型设定",
+  "國語（繁體中文）": "国语（繁体中文）",
+  "你好，這是國語語音測試。": "你好，这是国语语音测试。",
+  "選擇模型回覆、喚醒提示與語音測試使用的語言。儲存後會結束目前對話。朗讀發音取決於所選 TTS 模型與音色支援。": "选择模型回复、唤醒提示与语音测试使用的语言。储存后会结束目前对话。朗读发音取决于所选 TTS 模型与音色支援。",
+  "儲存說話語言": "储存说话语言",
+  "Reply in Traditional Chinese (繁體中文), using natural Mandarin wording, unless the user explicitly requests another language. Preserve code and proper names.": "Reply in Traditional Chinese (繁体中文), using natural Mandarin wording, unless the user explicitly requests another language. Preserve code and proper names.",
+  "Reply in Japanese (日本語) unless the user explicitly requests another language. Preserve code and proper names.": "Reply in Japanese (日本语) unless the user explicitly requests another language. Preserve code and proper names.",
+  "普通話（簡體中文）": "普通话（简体中文）",
+  "韓語 한국어": "韩语 한국어",
+  "はい、聞いています。": "はい、闻いています。"
 };

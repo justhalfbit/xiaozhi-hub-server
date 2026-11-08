@@ -7,6 +7,7 @@ import wave
 from pathlib import Path
 
 from core.admin import speech_settings
+from core.agent import reply_language
 from core.utils.modules_initialize import initialize_asr, initialize_tts
 
 
@@ -17,8 +18,10 @@ async def test(section, body, merged):
     config = {**merged, 'selected_module': {**merged.get('selected_module', {}), section: details['entry']}}
     if section == 'TTS':
         provider = initialize_tts(config)
-        audio = await provider.text_to_speak('你好，這是語音測試。', None)
+        text = reply_language.phrase('test', merged.get('reply_language') or '')
+        audio = await provider.text_to_speak(text, None)
         return {'audio': base64.b64encode(audio).decode('ascii'),
+                'text': text, 'language': merged.get('reply_language') or '',
                 'mime_type': 'audio/mpeg' if provider.audio_file_type == 'mp3' else 'audio/' + provider.audio_file_type}
     try:
         audio = base64.b64decode(body.get('audio', ''), validate=True)

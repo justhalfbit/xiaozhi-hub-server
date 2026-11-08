@@ -217,9 +217,11 @@ async def _fill_cache(conn: "ConnectionHandler", text: str) -> None:
     await asyncio.shield(_filling[key])
 
 
-def reply_text(cfg: dict) -> str:
+def reply_text(cfg: dict, language='') -> str:
     """只喊称呼时回的话。"""
-    return one_segment((cfg or {}).get("reply") or "") or DEFAULT_REPLY
+    from core.agent import reply_language
+    text = one_segment((cfg or {}).get('reply') or '') or DEFAULT_REPLY
+    return one_segment(reply_language.phrase('call', language)) if text == DEFAULT_REPLY else text
 
 
 async def warm_up(conn: "ConnectionHandler") -> None:
@@ -233,7 +235,7 @@ async def warm_up(conn: "ConnectionHandler") -> None:
         await asyncio.sleep(0.2)
     if not conn.tts:
         return
-    text = reply_text(cfg)
+    text = reply_text(cfg, conn.config.get('reply_language') or '')
     if await asyncio.to_thread(_load_cached, _cache_key(conn, text)) is None:
         await _fill_cache(conn, text)
 
@@ -332,7 +334,7 @@ async def handle_call_name(conn: "ConnectionHandler", text: str):
         conn.logger.bind(tag=TAG).info(f"呼名 {model}：去掉称呼后交给模型：{rest}")
         return rest
 
-    reply = reply_text(cfg)
+    reply = reply_text(cfg, conn.config.get('reply_language') or '')
     # 切回一个在外面干活的 Bot（Grok Bot）：它做完的活还没念过的，跟在"我在"后面一起念
     bot_id, pending = _pending_report(conn, model)
     if pending:

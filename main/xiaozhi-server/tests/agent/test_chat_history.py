@@ -709,3 +709,84 @@ def test_clear_bumps_memory_version_so_running_summary_is_dropped(project):
     chat_history.clear("dev-1", CONFIG)
     mem = chat_history.db().memory("dev-1")
     assert mem["summary"] == "" and mem["version"] == before + 1 and chat_history.db().progress("dev-1") == {}
+
+
+# ---------- 隔太久就开新对话（fresh_after_minutes） ----------
+
+def _at(monkeypatch, t):
+    monkeypatch.setattr(chat_history.time, "time", lambda: t)
+
+
+def test_session_start():
+    rows = [{"role": "user", "created": 0}, {"role": "assistant", "created": 5},
+            {"role": "user", "created": 3600}, {"role": "assistant", "created": 3610},
+            {"role": "user", "created": 4000}, {"role": "assistant", "created": 4005}]
+    assert chat_history.session_start(rows, 30, now=4100) == 2       # 隔了一小时的那句开始
+    assert chat_history.session_start(rows, 30, now=4005 + 1801) == 6  # 最后一句也过了 30 分钟：全是上一段
+    assert chat_history.session_start(rows, 0, now=99999) == 0         # 关掉：一直接着聊
+    assert chat_history.session_start(rows, 120, now=4100) == 0
+    # 开头不能是残组：挪到用户的话
+    tail = [{"role": "user", "created": 0}, {"role": "tool", "created": 4000}, {"role": "user", "created": 4001}]
+    assert chat_history.session_start(tail, 30, now=4002) == 2
+
+
+def test_a_new_conversation_after_30_minutes(monkeypatch):
+    _at(monkeypatch, 1000.0)
+    conn = make_conn()
+    chat_history.load(conn, conn.dialogue, "DeepSeekLLM")
+    chat(conn, "今天去爬山了", "听起来不错")
+    # 10 分钟后：接着聊
+    _at(monkeypatch, 1600.0)
+    conn2 = make_conn()
+    chat_history.load(conn2, conn2.dialogue, "DeepSeekLLM")
+    assert sent(conn2) == [("user", "今天去爬山了"), ("assistant", "听起来不错")]
+    chat(conn2, "累死了", "早点休息")
+    # 再过 31 分钟：新对话，屏幕上的记录还在
+    _at(monkeypatch, 1600.0 + 31 * 60)
+    conn3 = make_conn()
+    chat_history.load(conn3, conn3.dialogue, "DeepSeekLLM")
+    assert sent(conn3) == []
+    assert len(chat_history.history("dev-1", 100)["DeepSeekLLM"]) == 4
+
+
+def test_fresh_after_minutes_zero_keeps_one_conversation(monkeypatch):
+    config = {**CONFIG, "chat_history": {**CONFIG["chat_history"], "fresh_after_minutes": 0}}
+    _at(monkeypatch, 1000.0)
+    conn = make_conn(config=config)
+    chat_history.load(conn, conn.dialogue, "DeepSeekLLM")
+    chat(conn, "我叫小明", "你好小明")
+    _at(monkeypatch, 1000.0 + 86400)
+    conn2 = make_conn(config=config)
+    chat_history.load(conn2, conn2.dialogue, "DeepSeekLLM")
+    assert sent(conn2)[0] == ("user", "我叫小明")
+
+
+def test_the_earlier_conversation_is_summarized_even_if_short(monkeypatch):
+    """上一段只有一问一答（不到 summary_min），也要总结：它不会再被载入，不总结就丢了。"""
+    config = {**CONFIG, "chat_history": {**CONFIG["chat_history"], "summary_min": 6}}
+    _at(monkeypatch, 1000.0)
+    conn = make_conn(config=config)
+    chat_history.load(conn, conn.dialogue, "DeepSeekLLM")
+    chat(conn, "我下周三要去上海出差", "好的，记住了")
+    _at(monkeypatch, 1000.0 + 40 * 60)
+    conn2 = make_conn(config=config)
+    chat_history.load(conn2, conn2.dialogue, "DeepSeekLLM")
+    chat(conn2, "现在几点", "下午三点")
+    cfg = chat_history.settings(config)
+    rows, _ = chat_history.pending_summary("dev-1", cfg, config)
+    assert [r["content"] for r in rows] == ["我下周三要去上海出差", "好的，记住了"]   # 这一段的不算
+    llm = FakeLLM("- 下周三去上海出差")
+    monkeypatch.setattr(chat_history, "_summary_llm", lambda conn, name, cfg: llm)
+    chat_history.maybe_summarize(conn2)
+    for _ in range(100):
+        if llm.calls:
+            break
+        import time as _t
+        _t.sleep(0.01)
+    assert llm.calls and chat_history.memory_for(conn2) == "- 下周三去上海出差"
+
+
+def test_summary_prompt_says_what_not_to_keep():
+    p = chat_history.SUMMARY_PROMPT
+    for word in ("天气", "股市", "内存温度", "临时故障", "共用"):
+        assert word in p

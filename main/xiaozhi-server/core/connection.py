@@ -46,7 +46,7 @@ from core.utils.voiceprint_provider import VoiceprintProvider
 from core.utils.util import get_system_error_response
 from core.utils import reply_progress, textUtils, turn_gen
 from core.utils.tool_markup import ToolMarkupFilter, strip_tool_markup
-from core.agent import chat_history, llm_router
+from core.agent import chat_history, llm_router, scheduled_policy
 
 
 TAG = __name__
@@ -1184,9 +1184,9 @@ class ConnectionHandler:
                 # 使用支持functions的streaming接口
                 llm_responses = self.llm.response_with_functions(
                     self.session_id,
-                    self.dialogue.get_llm_dialogue_with_memory(
+                    scheduled_policy.with_policy(self.dialogue.get_llm_dialogue_with_memory(
                         memory_str, self.config.get("voiceprint", {}), speaker_for_system
-                    ),
+                    ), functions),
                     functions=functions,
                 )
             else:

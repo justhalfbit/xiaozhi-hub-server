@@ -203,3 +203,17 @@ def test_weather_settings_test_button(fake_api):
     fake_api.routes["nominatim.openstreetmap.org"] = lambda req: httpx.Response(200, json=[])
     with pytest.raises(ValueError, match="没找到「火星」"):
         asyncio.run(plugin_settings.run_test("get_weather", {"location": "火星"}, {"plugins": {}}))
+
+
+@pytest.mark.parametrize("explicit", [True, False])
+def test_scheduled_query_can_bypass_report_cache(fake_api, monkeypatch, explicit):
+    conn = conn_with("天河", monkeypatch=monkeypatch)
+    kwargs = {"location": "天河"} if explicit else {}
+    asyncio.run(gw.get_weather(conn, **kwargs))
+    first = len(fake_api.calls)
+    asyncio.run(gw.get_weather(conn, **kwargs))
+    assert len(fake_api.calls) == first
+    asyncio.run(gw.get_weather(conn, fresh=True, **kwargs))
+    assert len(fake_api.calls) == first + 2  # fresh forecast + air; place lookup remains cached
+    asyncio.run(gw.get_weather(conn, **kwargs))
+    assert len(fake_api.calls) == first + 2

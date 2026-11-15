@@ -263,10 +263,10 @@ def format_report(place: Place, forecast: dict, air: dict = None) -> str:
     return "\n".join(lines)
 
 
-async def fetch_report(place: Place) -> str:
+async def fetch_report(place: Place, *, fresh=False) -> str:
     key = f"{place.lat:.2f},{place.lon:.2f}"
     cached = _reports.get(key)
-    if cached and time.time() - cached[0] < REPORT_TTL:
+    if not fresh and cached and time.time() - cached[0] < REPORT_TTL:
         return cached[1]
     common = {"latitude": place.lat, "longitude": place.lon, "timezone": "auto"}
     try:
@@ -325,18 +325,18 @@ def local_query(conn) -> str:
     return _ip_city(conn) or str(cfg.get("default_location") or "").strip() or DEFAULT_LOCATION
 
 
-async def local_report(conn) -> str:
+async def local_report(conn, *, fresh=False) -> str:
     query = await asyncio.to_thread(local_query, conn)  # IP 定位是同步请求
-    return await fetch_report(await find_place(query))
+    return await fetch_report(await find_place(query), fresh=fresh)
 
 
 @register_function("get_weather", GET_WEATHER_FUNCTION_DESC, ToolType.SYSTEM_CTL)
-async def get_weather(conn: "ConnectionHandler", location: str = None, lang: str = "zh_CN"):
+async def get_weather(conn: "ConnectionHandler", location: str = None, lang: str = "zh_CN", *, fresh=False):
     try:
         if location and location.strip():
-            report = await fetch_report(await find_place(location))
+            report = await fetch_report(await find_place(location), fresh=fresh)
         else:
-            report = await local_report(conn)
+            report = await local_report(conn, fresh=fresh)
     except WeatherError as e:
         return ActionResponse(Action.REQLLM, f"没查到天气：{e}。请简短告诉用户这次没查到，稍后再试。", None)
     return ActionResponse(Action.REQLLM, report, None)

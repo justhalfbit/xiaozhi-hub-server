@@ -86,6 +86,10 @@ class AdminHandler:
         self._emotion_runs = {}  # session_id -> {"task", "index", "total", "emotion"}
         self._voice_samples = {}  # 音色 -> mp3 字节（试听缓存）
         self.logger = logger
+        self._scheduled_busy = False
+        self._scheduled_job = None
+        self._scheduled_key = None
+        self._scheduled_cancelled = {}
         self.grokbot = GrokBotAdmin(grokbot_credentials, logger=logger.bind(tag=TAG))
 
     def register(self, app: web.Application) -> None:
@@ -143,6 +147,8 @@ class AdminHandler:
                 web.post("/kiosk/reports", self.handle_kiosk_reports),
                 web.post("/kiosk/asr", self.handle_kiosk_asr),
                 web.post("/kiosk/tts", self.handle_kiosk_tts),
+                web.post('/kiosk/tasks/run', self.handle_kiosk_task),
+                web.post('/kiosk/tasks/cancel', self.handle_kiosk_task_cancel),
                 web.get("/kiosk/chat/history", self.handle_kiosk_chat_history),
                 web.post("/kiosk/chat/clear", self.handle_kiosk_chat_clear),
             ]
@@ -779,6 +785,60 @@ class AdminHandler:
         started = time.monotonic()
         text = await self._blocking(asr.recognize_pcm, pcm)
         return self._json({"ok": True, "text": text, "ms": round((time.monotonic() - started) * 1000)})
+
+    async def handle_kiosk_task(self, request: web.Request):
+        if not self._from_this_machine(request):
+            return self._error('仅限本机', 403)
+        from core import scheduled_tasks
+        body = await self._read_json(request)
+        try:
+            scheduled_tasks.validate(body)
+        except ValueError as e:
+            return self._error(str(e), 400)
+        key = (body.get('device'), body.get('run_id'))
+        if not all(isinstance(v, str) and 1 <= len(v) <= 128 for v in key):
+            return self._error('缺少 device 或 run_id', 400)
+        self._scheduled_cancelled = {k: until for k, until in self._scheduled_cancelled.items()
+                                     if until > time.monotonic()}
+        if key in self._scheduled_cancelled:
+            return self._error('本次任务已停止', 409)
+        if self._scheduled_busy:
+            return self._error('另一项定时任务正在执行', 409)
+        self._scheduled_busy = True
+        job = asyncio.create_task(scheduled_tasks.execute(copy.deepcopy(self.config), body))
+        self._scheduled_job = job
+        self._scheduled_key = key
+        try:
+            return self._json(await asyncio.wait_for(job, scheduled_tasks.TOTAL_SECONDS))
+        except asyncio.CancelledError:
+            if job.cancelled():
+                return self._error('本次任务已停止', 409)
+            raise
+        except scheduled_tasks.TaskError as e:
+            return self._error(str(e), 502)
+        except asyncio.TimeoutError:
+            return self._error('定时任务执行超时', 504)
+        except Exception:
+            return self._error('定时任务执行失败，请检查模型及查询工具设置', 502)
+        finally:
+            self._scheduled_busy = False
+            self._scheduled_job = self._scheduled_key = None
+
+    async def handle_kiosk_task_cancel(self, request: web.Request):
+        if not self._from_this_machine(request):
+            return self._error('仅限本机', 403)
+        body = await self._read_json(request)
+        key = (str(body.get('device') or ''), str(body.get('run_id') or ''))
+        stopped = False
+        if key[0] and key[1] and all(len(v) <= 128 for v in key):
+            # A cancel can overtake a request still being accepted. Bound these short-lived tombstones.
+            self._scheduled_cancelled[key] = time.monotonic() + 125
+            while len(self._scheduled_cancelled) > 100:
+                self._scheduled_cancelled.pop(next(iter(self._scheduled_cancelled)))
+        if key[0] and key[1] and key == self._scheduled_key and self._scheduled_job:
+            self._scheduled_job.cancel()
+            stopped = True
+        return self._json({'ok': True, 'stopped': stopped})
 
     async def handle_kiosk_tts(self, request: web.Request):
         """{"text"}：只合成、不对话，返回 16 位单声道 WAV（24 kHz）。

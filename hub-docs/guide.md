@@ -96,6 +96,10 @@ Linux 服务器的安装方法和上面一样。云服务器上一般没有 Clau
 
 所有设置都保存在 `main/xiaozhi-server/data/.config.yaml`，这个文件不会提交到 Git。API Key 在里面是明文，管理密码只保存哈希值。
 
+### 全局 CLI 代理
+
+在管理后台「大模型 → 全局 CLI 代理」开启开关并保存。默认关闭，地址预填 `127.0.0.1:7890`，指向运行 Hub 的机器。设置在下次启动 Claude Code、Codex CLI 或 Codex 登录进程时生效。关闭开关会保留地址，恢复原有的联网方式。
+
 ### Codex CLI
 
 在运行 Hub 的账户下安装 Codex CLI，并用 `codex login status` 检查登录。ThinkSmart 的 Hub 以普通用户 `ubuntu` 运行。服务需要能访问该账户的 Codex 安装和登录目录，以及 OpenAI 服务。已验证的 CLI 版本为 0.170.0。

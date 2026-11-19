@@ -941,6 +941,11 @@ async function renderLLM(root) {
     ${d.running && d.running !== d.selected ? `<div class="banner warn">配置里的默认模型是 ${esc(d.selected)}，但服务仍在用 ${esc(d.running)}。</div>` : ""}
 
     <div class="section-title">本地 CLI 与智能体 · 用你自己的账号，不走下面的 API Key</div>
+    <div class="card panel">
+      <h3>全局 CLI 代理</h3><label><input type="checkbox" id="proxy-enabled"> 为 Claude Code 和 Codex CLI 启用代理</label>
+      <label class="f">代理地址<input class="in mono" id="proxy-url" placeholder="127.0.0.1:7890"></label>
+      <div class="actions"><span class="result" id="proxy-result"></span><button class="btn" id="proxy-save">保存代理设置</button></div>
+    </div>
     <div class="choices three">
       <button type="button" class="choice" id="claude-choice">
         <div class="mark" style="background:#fef3c7;color:#b45309">C</div>
@@ -1014,6 +1019,22 @@ async function renderLLM(root) {
       <small>${d.vendor === x.id ? "✓ 默认" : x.configured ? (d.callable[x.entry] ? `称呼：${esc(d.callable[x.entry][0])}` : "已配置") : "未配置"}</small></button>`).join("")}</div>
     <div class="card panel" id="api-form"></div>`;
 
+  const proxyValues = () => ({enabled: $("proxy-enabled").checked, url: $("proxy-url").value});
+  const proxyForm = drafts.proxy || d.cli_proxy;
+  $("proxy-result").textContent = d.cli_proxy_warning || "";
+  $("proxy-enabled").checked = proxyForm.enabled;
+  $("proxy-url").value = proxyForm.url;
+  const proxyDirty = () => JSON.stringify(proxyValues()) !== JSON.stringify({enabled:d.cli_proxy.enabled,url:d.cli_proxy.url});
+  $("proxy-save").onclick = async () => {
+    $("proxy-save").disabled = true;
+    try {
+      const r = await api("llm/cli-proxy", proxyValues());
+      d.cli_proxy = r.cli_proxy;
+      $("proxy-url").value = r.cli_proxy.url;
+      $("proxy-result").textContent = r.warning ? "已保存。" + r.warning : "已保存，新启动的 CLI 将使用此设置";
+    } catch (e) { $("proxy-result").textContent = e.message; }
+    finally { $("proxy-save").disabled = false; }
+  };
   function selectCli(key) {
     selectedCli=key;
     for(const [name,id] of [["claude","cli-form"],["codex","codex-form"]]){
@@ -1027,6 +1048,7 @@ async function renderLLM(root) {
   const codexForm=renderCodexForm($("codex-form"),d,current,reload,drafts.codex);
   async function reload(owner) {
     cliDrafts={};
+    if(proxyDirty())cliDrafts.proxy=proxyValues();
     if(owner!=="codex" && codexForm.dirty())cliDrafts.codex=codexForm.values();
     if(owner!=="claude" && cliDirty()){cliDrafts.claude=cliValues();cliDrafts.claudeBase=claudeBase;}
     page.dirty=null;await openPage("llm",true);
@@ -1135,7 +1157,7 @@ async function renderLLM(root) {
     renderApi();
   }));
   renderApi();
-  page.dirty = () => cliDirty() || codexForm.dirty() || apiDirty();
+  page.dirty = () => proxyDirty() || cliDirty() || codexForm.dirty() || apiDirty();
 }
 
 // ---------- 语音识别 ----------

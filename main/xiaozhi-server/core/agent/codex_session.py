@@ -1,5 +1,6 @@
 """Non-interactive Codex CLI transport for the Hub agent lifecycle."""
 import asyncio
+from core.agent import cli_proxy
 import json
 import os
 import shutil
@@ -104,7 +105,7 @@ class CodexSession(AgentSession):
             args.extend(["resume", self._id])
         args.append("-")
         proc = await asyncio.create_subprocess_exec(
-            *args, cwd=cwd, stdin=asyncio.subprocess.PIPE,
+            *args, cwd=cwd, env=cli_proxy.child_env(), stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
             start_new_session=os.name == "posix", limit=8 * 1024 * 1024)
         self.process = proc

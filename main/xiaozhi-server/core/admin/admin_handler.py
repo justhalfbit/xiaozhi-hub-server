@@ -29,6 +29,7 @@ from core.admin import auth, catalog, config_store, connections, pages, pipeline
 from core.admin.codex_login import CodexLogin, LoginEnded, LoginError
 from core.admin.grokbot import GrokBotAdmin
 from core.admin.status import _claude_version, collect_status
+from core.agent import cli_proxy
 from core.admin import codex_settings
 from core.agent import chat_history, llm_router, reports
 from core.agent.agent_session import ErrorKind
@@ -113,6 +114,7 @@ class AdminHandler:
                 web.post("/admin/api/devices/{session_id}/emotion-test", self.handle_emotion_test),
                 web.post("/admin/api/devices/{session_id}/emotion-test/stop", self.handle_emotion_stop),
                 web.get("/admin/api/llm", self.handle_llm),
+                web.post("/admin/api/llm/cli-proxy", self.handle_cli_proxy),
                 web.post("/admin/api/llm/codex", self.handle_llm_codex),
                 web.post("/admin/api/llm/codex/login/{action:start|complete|cancel}", self.handle_codex_login),
                 web.post("/admin/api/llm/claude", self.handle_llm_claude),
@@ -522,11 +524,22 @@ class AdminHandler:
         self._require_login(request)
         merged = await self._blocking(self._merged)
         data = pages.describe_llm(merged)
+        data["cli_proxy"] = cli_proxy.settings(merged)
+        data["cli_proxy_warning"] = await self._blocking(cli_proxy.connection_warning, data["cli_proxy"])
         data["claude"]["install"] = await self._blocking(self._claude_install, merged)
         codex = merged.get("LLM", {}).get(pages.CODEX_ENTRY, {})
         data["codex"] = await self._blocking(codex_settings.describe, codex)
         data["running"] = self._running("LLM")
         return self._json({"ok": True, **data})
+
+    async def handle_cli_proxy(self, request):
+        self._require_login(request)
+        body = await self._read_json(request)
+        try:
+            value, warning = await self._blocking(cli_proxy.save, body, self.config_path)
+        except ValueError as exc:
+            return self._error(str(exc), 400)
+        return self._json({"ok": True, "cli_proxy": value, "warning": warning})
 
     async def handle_codex_login(self, request: web.Request):
         self._require_login(request)

@@ -1,5 +1,6 @@
 """Interactive ChatGPT sign-in using the device's own Codex credential store."""
 import asyncio
+from core.agent import cli_proxy
 import json
 from urllib.parse import parse_qs, urlencode, urlsplit
 
@@ -89,7 +90,7 @@ class CodexLogin:
 
     async def _start(self, cli):
         self.process = await asyncio.create_subprocess_exec(
-            cli, "app-server", stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            cli, "app-server", env=cli_proxy.child_env(), stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL, limit=2**20)
         await self._rpc("initialize", {"clientInfo": {"name": "xiaozhi_hub", "version": "1"}}, 1)
         await self._rpc("initialized", {})

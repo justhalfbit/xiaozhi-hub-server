@@ -96,6 +96,10 @@ Linux 服务器的安装方法和上面一样。云服务器上一般没有 Clau
 
 所有设置都保存在 `main/xiaozhi-server/data/.config.yaml`，这个文件不会提交到 Git。API Key 在里面是明文，管理密码只保存哈希值。
 
+### ThinkSmart 上的 Clash Party
+
+Hub 和客户端安装在同一台 ThinkSmart 时，登录后台并打开「Clash Party」，即可操作设备上的原版窗口。首次安装使用设备触屏的「设置 → Clash Party」。添加订阅时，先点原版窗口的订阅地址框，再把链接填入窗口下方的输入框，点「粘贴到窗口」。离开页签后代理继续运行。
+
 ### 全局 CLI 代理
 
 在管理后台「大模型 → 全局 CLI 代理」开启开关并保存。默认关闭，地址预填 `127.0.0.1:7890`，指向运行 Hub 的机器。设置在下次启动 Claude Code、Codex CLI 或 Codex 登录进程时生效。关闭开关会保留地址，恢复原有的联网方式。

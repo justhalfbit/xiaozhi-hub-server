@@ -196,6 +196,19 @@ async def test_requires_login_and_json(client):
     assert r.status == 415
 
 
+async def test_clash_window_requires_admin_and_same_origin(client):
+    base = "/admin/api/clash-party"
+    assert (await client.get(base)).status == 401
+    assert (await client.get(base + "/display")).status == 401
+    assert (await client.get("/admin/clash-view/core/rfb.js")).status == 401
+    assert (await client.post(base + "/paste", json={"text": "abc"})).status == 401
+    await client.post("/admin/api/setup", json={"password": "pass-1234"})
+    assert (await client.get(base)).status == 200
+    for headers in ({}, {"Origin": "http://other.local"}):
+        assert (await client.get(base + "/display", headers=headers)).status == 403
+        assert (await client.post(base + "/paste", headers=headers, json={"text": "abc"})).status == 403
+
+
 async def test_setup_allowed_from_remote(cfg_path, monkeypatch):
     """首次设置密码不限制来源：部署到云端服务器时，从自己的电脑远程打开后台也能直接设置。"""
     monkeypatch.setattr(web.BaseRequest, "remote", property(lambda self: "203.0.113.5"))  # 模拟公网上的访问者

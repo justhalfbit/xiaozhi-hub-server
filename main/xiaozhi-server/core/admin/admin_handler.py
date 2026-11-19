@@ -26,6 +26,7 @@ from aiohttp import web
 
 from config.logger import setup_logging
 from core.admin import auth, catalog, config_store, connections, pages, pipeline, plugin_settings, updater
+from core.admin.clash_window import ClashWindow
 from core.admin.codex_login import CodexLogin, LoginEnded, LoginError
 from core.admin.grokbot import GrokBotAdmin
 from core.admin.status import _claude_version, collect_status
@@ -94,6 +95,7 @@ class AdminHandler:
         self.grokbot = GrokBotAdmin(grokbot_credentials, logger=logger.bind(tag=TAG))
 
     def register(self, app: web.Application) -> None:
+        ClashWindow(self._require_login, self._logged_in, self._read_json).register(app)
         app.on_cleanup.append(self.codex_login.close)
         app.add_routes(
             [

@@ -311,6 +311,7 @@
     <nav class="nav" id="nav">
       <button data-page="status"><span class="ico">◎</span>状态</button>
       <button data-page="how"><span class="ico">⇄</span>工作原理</button>
+      <button data-page="clash-party"><span class="ico">⇄</span>Clash Party</button>
       <button data-page="llm"><span class="ico">✦</span>大模型</button>
       <button data-page="calls"><span class="ico">☎</span>呼名</button>
       <button data-page="grokbot"><span class="ico">☁</span>Grok Bot</button>
@@ -395,6 +396,7 @@ async function route() {
   try { st = await (await fetch("/admin/api/state")).json(); } catch (e) { return; }
   if (st.needs_setup || !st.logged_in) {
     authMode = st.needs_setup ? "setup" : "login";
+    closeClashWindow();
     clearInterval(page.timer); page.name = "";
     clearInterval(onlineTimer); onlineTimer = null;
     $("app").classList.add("hidden"); $("auth").classList.remove("hidden");
@@ -430,7 +432,57 @@ $("auth-form").addEventListener("submit", async (ev) => {
 });
 $("logout").onclick = async () => { if (!confirmLeave()) return; page.dirty = null; await api("logout", {}); await route(); };
 
-const PAGES = { status: renderStatus, how: renderHow, llm: renderLLM, calls: renderCallNames, grokbot: renderGrokBot, memory: renderMemory, asr: renderASR, tts: renderTTS, intent: renderIntent, update: renderUpdate };
+let closeClashWindow = () => {};
+async function renderClashParty(root) {
+  root.innerHTML = `<h1>Clash Party</h1>
+    <div class="row"><span id="clash-state" role="status">正在连接设备窗口…</span>
+      <button class="btn" id="clash-retry" hidden>重新连接</button></div>
+    <div id="clash-window" style="width:100%;aspect-ratio:1200 / 680;max-height:70vh;background:#181818" hidden></div>
+    <form id="clash-paste" hidden><input aria-label="粘贴内容" placeholder="先选中窗口中的输入框，再在这里粘贴" maxlength="8192" autocomplete="off" style="width:min(70%,420px)">
+      <button class="btn">粘贴到窗口</button></form>`;
+  const display = $("clash-window"), status = $("clash-state"), paste = $("clash-paste"), retry = $("clash-retry");
+  let viewer, active = true;
+  closeClashWindow = () => {
+    active = false;
+    viewer?.disconnect();
+    paste.reset();
+    closeClashWindow = () => {};
+  };
+  function offline(message) {
+    if (!active) return;
+    status.textContent = message;
+    display.hidden = paste.hidden = true;
+    retry.hidden = false;
+  }
+  retry.onclick = () => openPage("clash-party", true);
+  paste.onsubmit = async e => {
+    e.preventDefault();
+    const input = paste.querySelector("input");
+    if (!input.value) return;
+    try {
+      await api("clash-party/paste", {text: input.value});
+      input.value = "";
+      if (active) viewer.focus();
+    } catch (err) { if (active) toast(err.message, true); }
+  };
+  try {
+    const state = await api("clash-party");
+    if (!active) return;
+    if (!state.ready) return offline(state.message);
+    const {default: RFB} = await import("/admin/clash-view/core/rfb.js");
+    if (!active) return;
+    display.hidden = false;
+    const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+    viewer = new RFB(display, scheme + "//" + location.host + "/admin/api/clash-party/display");
+    viewer.scaleViewport = true;
+    viewer.addEventListener("connect", () => {
+      if (active) { status.textContent = ""; paste.hidden = false; }
+    });
+    viewer.addEventListener("disconnect", () => offline("窗口连接已断开"));
+  } catch (err) { offline("无法连接窗口：" + err.message); }
+}
+
+const PAGES = { "clash-party": renderClashParty, status: renderStatus, how: renderHow, llm: renderLLM, calls: renderCallNames, grokbot: renderGrokBot, memory: renderMemory, asr: renderASR, tts: renderTTS, intent: renderIntent, update: renderUpdate };
 const page = { name: "", dirty: null, timer: null };
 function currentPage() { const p = location.hash.slice(1); return PAGES[p] ? p : "status"; }
 function confirmLeave() { return !(page.dirty && page.dirty()) || confirm("当前页面有修改还没保存，确定离开吗？"); }
@@ -438,6 +490,7 @@ function confirmLeave() { return !(page.dirty && page.dirty()) || confirm("当�
 async function openPage(name, force) {
   if (!force && name === page.name) return;
   if (!force && !confirmLeave()) { history.replaceState(null, "", "#" + page.name); return; }
+  closeClashWindow();
   clearInterval(page.timer); page.timer = null; page.dirty = null; page.name = name;
   if (audio) { audio.pause(); audio = null; }
   if (location.hash.slice(1) !== name) history.replaceState(null, "", "#" + name);

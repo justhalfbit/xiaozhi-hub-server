@@ -684,13 +684,20 @@ function bindCodexLogin(form, saved) {
     btn.onclick = () => busy(btn, async () => {
       message.textContent = "";
       try { await fn(); }
-      catch (error) { if (error.loginEnded) reset(); message.textContent = error.message; }
+      catch (error) {
+        if (error.loginEnded) {
+          reset();
+          form.querySelector("[data-install-state]").textContent = "授权未完成";
+        }
+        message.textContent = error.message;
+      }
     });
   };
   const request = (action, body) => api("llm/codex/login/" + action, body, true);
   run(start, async () => {
     const result = await request("start", {});
     if (result.logged_in) return loggedIn();
+    form.querySelector("[data-install-state]").textContent = "等待回填回调链接";
     loginId = result.login_id;
     url.value = link.href = result.url;
     start.classList.add("hidden");
@@ -707,7 +714,7 @@ function bindCodexLogin(form, saved) {
   });
   run(panel.querySelector("[data-cancel]"), async () => {
     try { await request("cancel", {login_id: loginId}); }
-    finally { reset(); }
+    finally { reset(); form.querySelector("[data-install-state]").textContent = "待登录"; }
   });
 }
 

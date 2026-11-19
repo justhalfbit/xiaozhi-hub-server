@@ -47,12 +47,16 @@ async def test_reuse_cancel_and_expiry():
         await flow.finish("admin", "one", cancel=True)
 
 
-@pytest.mark.parametrize("status", [302, 400])
-async def test_callback_finishes_once(status):
+@pytest.mark.parametrize(("status", "body", "error"), [
+    (302, "", None), (400, "", "授权失败"),
+    (200, "unsupported_country_region_territory", "设备所在地区"),
+    (200, "invalid_grant", "授权码已失效"),
+])
+async def test_callback_finishes_once(status, body, error):
     seen = []
     async def receive(request):
         seen.append(dict(request.query))
-        return web.Response(status=status, headers={"Location": "https://example.invalid/success"})
+        return web.Response(status=status, text=body, headers={"Location": "https://example.invalid/success"})
     app = web.Application()
     app.router.add_get("/auth/callback", receive)
     async with TestServer(app) as srv:
@@ -65,7 +69,7 @@ async def test_callback_finishes_once(status):
         if status == 302:
             await flow.finish("admin", "one", pasted)
         else:
-            with pytest.raises(LoginError):
+            with pytest.raises(LoginError, match=error):
                 await flow.finish("admin", "one", pasted)
         assert seen == [{"code": "a+b", "state": "match"}]
         with pytest.raises(LoginError):

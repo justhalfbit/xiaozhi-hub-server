@@ -126,6 +126,14 @@ class CodexLogin:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as client:
             async with client.get(url, allow_redirects=False) as resp:
                 if resp.status != 302:
+                    # CLI error pages may contain sensitive details. Surface only recognized causes.
+                    page = (await resp.content.read(65536)).lower()
+                    if b"unsupported_country_region_territory" in page or b"country, region, or territory not supported" in page:
+                        raise LoginError("OpenAI 拒绝了设备所在地区的登录请求（HTTP 403）")
+                    if b"invalid_grant" in page:
+                        raise LoginError("授权码已失效，请重新获取授权链接")
+                    if b"persist_failed" in page:
+                        raise LoginError("设备无法保存凭证，请检查 Codex 凭证目录的权限")
                     raise LoginError("Codex 授权失败，请检查链接有效期和设备到 OpenAI 的网络连接")
                 # Older CLIs finish the RPC only after the local success page is opened.
                 target = urlsplit(resp.headers.get("Location", ""))

@@ -657,6 +657,21 @@ LLM:
     type: codex_cli
     enabled: false
     model: ""
+    level: ""  # 旧配置已启用时沿用 Auto；首次配置默认只读
+    effort: ""
+    web: false
+    cli_path: ""
+    first_reply_filler: "好的，我看一下"
+    turn_timeout_seconds: 600
+    stall_timeout_seconds: 30
+    idle_timeout_seconds: 300
+    resume_window_minutes: 120
+    background_max_seconds: 7200
+    background_after_seconds: 30
+    filler_delay_seconds: 2
+    progress_interval_seconds: 30
+    progress_reply: ""
+    resume_keywords: ["接着上次聊", "继续上次的话题", "继续刚才的话题", "接着刚才聊"]
     workdir: "~/xiaozhi-workspace"
   # 所有openai类型均可以修改超参，以AliLLM为例
   # 当前支持的type为openai、dify、ollama，可自行适配

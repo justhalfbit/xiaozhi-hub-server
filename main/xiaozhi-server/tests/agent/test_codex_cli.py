@@ -81,8 +81,68 @@ time.sleep(20)
 @pytest.mark.asyncio
 async def test_saved_default_can_load_before_login(tmp_path, monkeypatch):
     monkeypatch.setattr(codex_cli.LLMProvider, "_start_loop", lambda self: None)
-    monkeypatch.setattr(codex_cli, "installation", lambda _: {"installed": True, "logged_in": False})
+    monkeypatch.setattr(codex_cli, "installation", lambda _, **kw: {"installed": True, "logged_in": False})
     provider = codex_cli.LLMProvider({"workdir": str(tmp_path)})
     with pytest.raises(AgentSessionError) as failure:
         await provider._ensure_agent(SimpleNamespace(agent=None), "你好", None, "")
     assert failure.value.kind == ErrorKind.AUTH
+
+
+@pytest.mark.parametrize("level", ["read", "edit"])
+def test_workspace_files_exclude_links_and_private_paths(tmp_path, level):
+    from core.agent.codex_files import Workspace
+    import os
+
+    project = tmp_path / "project"
+    project.mkdir()
+    outside = tmp_path / "outside"
+    outside.write_text("outside")
+    (project / "link").symlink_to(outside)
+    (project / "parent").symlink_to(tmp_path, target_is_directory=True)
+    os.link(outside, project / "hard")
+    workspace = Workspace(project)
+    try:
+        for path in ["../outside", str(outside), "link", "parent/outside", "hard", ".git/config"]:
+            with pytest.raises((OSError, ValueError)):
+                workspace.read_file(path)
+            if level == "edit":
+                with pytest.raises((OSError, ValueError)):
+                    workspace.write_file(path, "changed")
+        (project / "plain").write_text("one")
+        assert workspace.read_file("plain") == "one"
+        assert workspace.search_files("one") == ["plain:1: one"]
+        if level == "edit":
+            workspace.write_file("plain", "two")
+            assert (project / "plain").read_text() == "two"
+        assert outside.read_text() == "outside"
+    finally:
+        os.close(workspace.root)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("level", ["read", "edit", "auto"])
+async def test_each_invocation_enforces_selected_policy(tmp_path, level):
+    path = tmp_path / "args"
+    session = fake_cli(tmp_path, f"""
+import json, sys
+sys.stdin.read()
+with open({str(path)!r}, 'a') as f: print(json.dumps(sys.argv),file=f)
+print('{{"type":"thread.started","thread_id":"t"}}')
+print('{{"type":"turn.completed"}}')
+""")
+    session.level = level
+    session.web = level == "edit"
+    session.effort = "low"
+    for prompt in ("first", "followup"):
+        assert isinstance([ev async for ev in session.send(prompt)][-1], Done)
+    for line in path.read_text().splitlines():
+        argv = json.loads(line)
+        assert 'model_reasoning_effort="low"' in argv
+        assert ('web_search="live"' if session.web else 'web_search="disabled"') in argv
+        if level == "auto":
+            assert 'sandbox_mode="workspace-write"' in argv
+        else:
+            assert "shell_tool" in argv and "--ignore-user-config" in argv
+            assert 'default_permissions="hub_files"' in argv
+            args = next(arg for arg in argv if arg.startswith("mcp_servers.workspace.args="))
+            assert json.loads(args.split("=", 1)[1])[-2:] == [str(tmp_path), level]

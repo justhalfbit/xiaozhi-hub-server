@@ -161,7 +161,8 @@ def _convert(kind, raw, original):
     return "" if raw is None else str(raw).strip()
 
 
-def update_entry(section: str, name: str, payload: dict, merged: dict, path: Path = None) -> list:
+def update_entry(section: str, name: str, payload: dict, merged: dict, path: Path = None,
+                 *, literal_text: bool = False) -> list:
     """把字段写入 data/.config.yaml 的 <section>.<name>，返回实际修改的字段名。
 
     字段校验失败时抛出 ValueError（带字段名），整个请求不写入。
@@ -189,7 +190,7 @@ def update_entry(section: str, name: str, payload: dict, merged: dict, path: Pat
         if kind == "list":
             same = [str(v) for v in (original or [])] == list(value)
         elif kind == "text":
-            same = value == ("" if is_placeholder(original) else str(original))
+            same = value == ("" if original is None or (not literal_text and is_placeholder(original)) else str(original))
         else:
             same = value == original and field in entry
         if field not in entry and value in ({}, [], ""):

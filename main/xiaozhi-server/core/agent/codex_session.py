@@ -5,13 +5,24 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
 from core.agent.agent_session import Activity, AgentSession, AgentSessionError, Done, Error, ErrorKind, TextDelta
 
 
-def installation(workdir, *, check_login=True):
+def permission_level(entry):
+    level = entry.get("level") or ("auto" if entry.get("enabled") else "read")
+    if level not in ("read", "edit", "auto"):
+        raise ValueError("不支持的 Codex 权限级别")
+    return level
+
+
+def installation(workdir, *, check_login=True, cli_path="", level="auto"):
     cli = shutil.which("codex") or shutil.which("codex", path=str(Path.home() / ".local/bin"))
+    if cli_path:
+        cli = shutil.which(str(Path(cli_path).expanduser()))
     logged_in = False
     if cli and check_login:
         try:
@@ -20,7 +31,7 @@ def installation(workdir, *, check_login=True):
             pass
     directory = Path(workdir).expanduser()
     return {"path": cli, "installed": bool(cli), "logged_in": logged_in,
-            "workspace_ready": directory.is_dir() and os.access(directory, os.W_OK | os.X_OK)}
+            "workspace_ready": directory.is_dir() and os.access(directory, (os.R_OK if level == "read" else os.W_OK | os.R_OK) | os.X_OK)}
 
 
 def voice_error(kind):
@@ -28,7 +39,10 @@ def voice_error(kind):
 
 
 class CodexSession(AgentSession):
-    def __init__(self, cli, workdir, model, instructions, resume_id=None):
+    def __init__(self, cli, workdir, model, instructions, resume_id=None, *, level="auto", effort="", web=False):
+        self.level = level
+        self.effort = effort
+        self.web = web
         self.cli = cli
         self.workdir = workdir
         self.model = model
@@ -47,16 +61,50 @@ class CodexSession(AgentSession):
         self.alive = True
 
     async def send(self, text):
-        args = [self.cli, "exec", "--json", "--skip-git-repo-check", "-c", 'approval_policy="never"',
-                "-c", 'sandbox_mode="workspace-write"', "-c",
-                "developer_instructions=" + json.dumps(self.instructions, ensure_ascii=False)]
+        if self.level == "auto":
+            async for event in self._execute(text, self.workdir):
+                yield event
+        else:
+            # Keep project-local Codex config, hooks and skills out of restricted sessions.
+            with tempfile.TemporaryDirectory(prefix="hub-codex-") as neutral:
+                async for event in self._execute(text, neutral):
+                    yield event
+
+    async def _execute(self, text, cwd):
+        args = [self.cli, "exec", "--json", "--skip-git-repo-check"]
+        settings = {"approval_policy": "never", "web_search": "live" if self.web else "disabled",
+                    "developer_instructions": self.instructions}
+        if self.effort:
+            settings["model_reasoning_effort"] = self.effort
+        if self.level == "auto":
+            settings["sandbox_mode"] = "workspace-write"
+        elif self.level in ("read", "edit"):
+            args.extend(["--ignore-user-config", "--ignore-rules"])
+            for feature in ("shell_tool", "code_mode", "apps", "plugins", "hooks", "computer_use",
+                            "multi_agent", "multi_agent_v2", "image_generation"):
+                args.extend(["--disable", feature])
+            args.extend(["-c", 'permissions.hub_files.filesystem={ ":minimal" = "read" }'])
+            settings.update({
+                "default_permissions": "hub_files",
+                "permissions.hub_files.network.enabled": False,
+                "mcp_servers.workspace.command": sys.executable,
+                "mcp_servers.workspace.args": ["-I", str(Path(__file__).with_name("codex_files.py").resolve()),
+                                               str(self.workdir), self.level],
+                "mcp_servers.workspace.required": True,
+                "mcp_servers.workspace.default_tools_approval_mode": "approve",
+                "developer_instructions": self.instructions + "\n请使用 workspace 文件工具访问项目。",
+            })
+        else:
+            raise ValueError("不支持的 Codex 权限级别")
+        for key, value in settings.items():
+            args.extend(["-c", key + "=" + json.dumps(value, ensure_ascii=False)])
         if self.model:
             args.extend(["--model", self.model])
         if self._id:
             args.extend(["resume", self._id])
         args.append("-")
         proc = await asyncio.create_subprocess_exec(
-            *args, cwd=self.workdir, stdin=asyncio.subprocess.PIPE,
+            *args, cwd=cwd, stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
             start_new_session=os.name == "posix", limit=8 * 1024 * 1024)
         self.process = proc

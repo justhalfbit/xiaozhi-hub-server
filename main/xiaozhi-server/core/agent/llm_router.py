@@ -297,6 +297,14 @@ def on_conn_open(conn: "ConnectionHandler") -> None:
     call_names.schedule_warm_up(conn)  # 提前准备好只喊称呼时回的"我在"
 
 
+def refresh_codex(conn):
+    """Apply saved settings before the next turn, including an already connected device."""
+    instance = get_instance(conn, "CodexCLI")
+    if instance is not conn.llm:
+        _attach(conn, instance)
+        conn.llm = instance
+
+
 def switch(conn: "ConnectionHandler", name: str, remember: bool = True, live: bool = True) -> bool:
     """把这个连接切到指定模型，意图识别跟着改（live 见 _apply_intent）。模型没配置好时返回 False，不切换。"""
     if not model_ready(_server_config(conn), name):

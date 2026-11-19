@@ -965,7 +965,7 @@ async def test_codex_saved_and_selected_per_device(kiosk, tmp_path, monkeypatch)
     def installation(directory, *, check_login=True):
         return {"installed": True, "logged_in": check_login, "workspace_ready": True}
 
-    monkeypatch.setattr(ah, "codex_installation", installation)
+    monkeypatch.setattr(ah.codex_settings, "status", installation)
     result = await kiosk.post("/admin/api/llm/codex", json={"model": "", "workdir": str(tmp_path)})
     assert result.status == 200
     result = await kiosk.post("/kiosk/llm/use", json={"kind": "cli", "vendor": "codex", "device": "a"})
@@ -974,6 +974,21 @@ async def test_codex_saved_and_selected_per_device(kiosk, tmp_path, monkeypatch)
     assert any(o["entry"] == "CodexCLI" for o in data["options"])
     assert (await (await kiosk.get("/kiosk/llm?device=b")).json())["selected"] == "ClaudeCLI"
 
-    monkeypatch.setattr(ah, "codex_installation", lambda *a, **kw: {**installation(""), "logged_in": False})
+    monkeypatch.setattr(ah.codex_settings, "status", lambda *a, **kw: {**installation(""), "logged_in": False})
     assert (await kiosk.post("/kiosk/llm/use", json={"kind": "cli", "vendor": "codex", "device": "b"})).status == 400
     assert (await (await kiosk.get("/kiosk/llm?device=b")).json())["selected"] == "ClaudeCLI"
+
+
+async def test_codex_form_updates_only_supplied_fields(kiosk, cfg_path, tmp_path):
+    from core.admin.codex_settings import permission_level
+    assert permission_level({"enabled": True}) == "auto"
+    assert permission_level({"enabled": False}) == "read"
+    post = lambda body: kiosk.post("/admin/api/llm/codex", json=body)
+    assert (await post({"workdir": str(tmp_path), "model": "example"})).status == 200
+    assert (await post({"first_reply_filler": "我在帮你查"})).status == 200
+    assert (await post({"level": "edit", "effort": "high", "web": True, "first_reply_filler": ""})).status == 200
+    saved = merged(cfg_path)["LLM"]["CodexCLI"]
+    assert saved["model"] == "example" and saved["workdir"] == str(tmp_path)
+    assert saved["effort"] == "high" and saved["web"] and saved["first_reply_filler"] == ""
+    assert (await post({"web": False, "stall_timeout_seconds": -1})).status == 400
+    assert merged(cfg_path)["LLM"]["CodexCLI"] == saved

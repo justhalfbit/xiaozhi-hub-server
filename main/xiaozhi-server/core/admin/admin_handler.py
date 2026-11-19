@@ -27,7 +27,7 @@ from config.logger import setup_logging
 from core.admin import auth, catalog, config_store, connections, pages, pipeline, plugin_settings, updater
 from core.admin.grokbot import GrokBotAdmin
 from core.admin.status import _claude_version, collect_status
-from core.agent.codex_session import installation as codex_installation
+from core.admin import codex_settings
 from core.agent import chat_history, llm_router, reports
 from core.agent.agent_session import ErrorKind
 from core.agent.grokbot_client import GrokBotError
@@ -519,25 +519,18 @@ class AdminHandler:
         data = pages.describe_llm(merged)
         data["claude"]["install"] = await self._blocking(self._claude_install, merged)
         codex = merged.get("LLM", {}).get(pages.CODEX_ENTRY, {})
-        workdir = codex.get("workdir") or "~/xiaozhi-workspace"
-        data["codex"] = {"workdir": workdir, "model": codex.get("model", ""),
-                         **await self._blocking(codex_installation, workdir)}
+        data["codex"] = await self._blocking(codex_settings.describe, codex)
         data["running"] = self._running("LLM")
         return self._json({"ok": True, **data})
 
     async def handle_llm_codex(self, request: web.Request):
         self._require_login(request)
         body = await self._read_json(request)
-        try:
-            workdir = Path(str(body.get("workdir") or "")).expanduser()
-        except RuntimeError:
-            return self._error("无法解析工作目录", 400)
-        if not workdir.is_absolute() or not workdir.is_dir():
-            return self._error("请输入已存在的绝对工作目录", 400)
         merged = await self._blocking(self._merged)
-        values = {"enabled": True, "model": str(body.get("model") or "").strip(), "workdir": str(workdir)}
-        changed = await self._blocking(config_store.update_entry, "LLM", pages.CODEX_ENTRY,
-                                       values, merged, self.config_path)
+        try:
+            changed = await self._blocking(codex_settings.save, body, merged, self.config_path)
+        except ValueError as exc:
+            return self._error(str(exc), 400)
         return self._json({"ok": True, "changed": changed,
                            **await self._apply_if_selected("LLM", pages.CODEX_ENTRY, changed)})
 
@@ -644,7 +637,7 @@ class AdminHandler:
             raise ValueError("未知或不匹配的 CLI 模型")
         if name == pages.CODEX_ENTRY:
             config = merged.get("LLM", {}).get(name, {})
-            status = await self._blocking(codex_installation, config.get("workdir") or "~/xiaozhi-workspace")
+            status = await self._blocking(codex_settings.status, config)
             if not config.get("enabled") or not status["logged_in"] or not status["workspace_ready"]:
                 raise ValueError("请先配置 Codex 工作目录并登录")
         return name
@@ -719,7 +712,7 @@ class AdminHandler:
                                "entry": pages.CLAUDE_CLI_ENTRY, "model": data["claude"]["values"].get("model", "")})
         codex = merged.get("LLM", {}).get(pages.CODEX_ENTRY, {})
         if codex.get("enabled"):
-            status = await self._blocking(codex_installation, codex["workdir"], check_login=False)
+            status = await self._blocking(codex_settings.status, codex, check_login=False)
             if status["installed"] and status["workspace_ready"]:
                 options.append({"kind": "cli", "vendor": "codex", "entry": pages.CODEX_ENTRY,
                                 "label": "Codex CLI", "model": codex.get("model", "")})

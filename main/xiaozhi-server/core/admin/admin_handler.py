@@ -21,10 +21,12 @@ import wave
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import aiohttp
 from aiohttp import web
 
 from config.logger import setup_logging
 from core.admin import auth, catalog, config_store, connections, pages, pipeline, plugin_settings, updater
+from core.admin.codex_login import CodexLogin, LoginEnded, LoginError
 from core.admin.grokbot import GrokBotAdmin
 from core.admin.status import _claude_version, collect_status
 from core.admin import codex_settings
@@ -78,6 +80,7 @@ class AdminHandler:
         self.ws_server = ws_server
         self.config_path = config_path
         self.sessions = auth.SessionStore()
+        self.codex_login = CodexLogin()
         # 后台点了更新网关、网关重启后，接着用重启前的登录（文件在 data/ 下，和配置放在一起）
         data_dir = Path(config_path).parent if config_path else updater.SERVER_DIR / "data"
         self.sessions_handover = data_dir / ".admin-sessions.json"
@@ -90,6 +93,7 @@ class AdminHandler:
         self.grokbot = GrokBotAdmin(grokbot_credentials, logger=logger.bind(tag=TAG))
 
     def register(self, app: web.Application) -> None:
+        app.on_cleanup.append(self.codex_login.close)
         app.add_routes(
             [
                 web.get("/admin", self.handle_index),
@@ -110,6 +114,7 @@ class AdminHandler:
                 web.post("/admin/api/devices/{session_id}/emotion-test/stop", self.handle_emotion_stop),
                 web.get("/admin/api/llm", self.handle_llm),
                 web.post("/admin/api/llm/codex", self.handle_llm_codex),
+                web.post("/admin/api/llm/codex/login/{action:start|complete|cancel}", self.handle_codex_login),
                 web.post("/admin/api/llm/claude", self.handle_llm_claude),
                 web.post("/admin/api/llm/vendors/{vendor}", self.handle_llm_vendor),
                 web.post("/admin/api/llm/vendors/{vendor}/test", self.handle_llm_vendor_test),
@@ -522,6 +527,34 @@ class AdminHandler:
         data["codex"] = await self._blocking(codex_settings.describe, codex)
         data["running"] = self._running("LLM")
         return self._json({"ok": True, **data})
+
+    async def handle_codex_login(self, request: web.Request):
+        self._require_login(request)
+        body = await self._read_json(request)
+        owner = request.cookies[COOKIE_NAME]
+        action = request.match_info["action"]
+        try:
+            if action == "cancel":
+                await self.codex_login.finish(owner, body.get("login_id"), cancel=True)
+                return self._json({"ok": True})
+            entry = (await self._blocking(self._merged)).get("LLM", {}).get(pages.CODEX_ENTRY, {})
+            if action == "start":
+                info = await self._blocking(codex_settings.status, entry)
+                if not info["installed"]:
+                    return self._error("请先安装 Codex CLI", 400)
+                if info["logged_in"]:
+                    return self._json({"ok": True, "logged_in": True})
+                return self._json({"ok": True, **await self.codex_login.start(owner, info["path"])})
+            await self.codex_login.finish(owner, body.get("login_id"), body.get("callback"))
+            if not (await self._blocking(codex_settings.status, entry))["logged_in"]:
+                return self._error("设备未检测到 Codex 登录，请重新授权", 409)
+            return self._json({"ok": True, "logged_in": True})
+        except LoginEnded as exc:
+            return self._json({"ok": False, "error": str(exc), "login_ended": True}, 409)
+        except LoginError as exc:
+            return self._error(str(exc), 400)
+        except (asyncio.TimeoutError, OSError, ValueError, KeyError, aiohttp.ClientError):
+            return self._error("Codex 登录失败，请检查 CLI、授权地址和设备网络后重试", 400)
 
     async def handle_llm_codex(self, request: web.Request):
         self._require_login(request)

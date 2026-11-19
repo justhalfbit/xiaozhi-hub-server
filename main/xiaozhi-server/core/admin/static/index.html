@@ -353,7 +353,11 @@ async function api(path, body, quiet) {
     if (quiet && page.dirty && page.dirty()) { const e = new Error(EXPIRED); e.expired = true; throw e; }
     page.dirty = null; await route(); throw new Error(EXPIRED + "，请重新登录");
   }
-  if (!res.ok || data.ok === false) throw new Error(data.error || ("请求失败：" + res.status));
+  if (!res.ok || data.ok === false) {
+    const error = new Error(data.error || ("请求失败：" + res.status));
+    if (data.login_ended) error.loginEnded = true;
+    throw error;
+  }
   return data;
 }
 
@@ -651,6 +655,62 @@ async function renderHow(root) {
 
 // ---------- 大模型 ----------
 
+function bindCodexLogin(form, saved) {
+  const box = form.querySelector("[data-login-box]");
+  if (!box) return;
+  const panel = box.querySelector("[data-login-panel]");
+  const start = box.querySelector("[data-login-start]");
+  const link = panel.querySelector("a");
+  const url = panel.querySelector("[readonly]");
+  const callback = panel.querySelector("[data-callback]");
+  const message = box.querySelector("[role=status]");
+  let loginId;
+  function reset() {
+    loginId = null;
+    panel.classList.add("hidden");
+    start.classList.remove("hidden");
+    link.removeAttribute("href");
+    url.value = callback.value = "";
+  }
+  function loggedIn() {
+    reset();
+    box.remove();
+    form.querySelector("[data-install-state]").textContent = "已登录";
+    $("codex-choice").querySelector("small").textContent = "已登录";
+    const use = form.querySelector("#codex-use");
+    if (use) use.disabled = !saved.workspace_ready;
+  }
+  const run = (btn, fn) => {
+    btn.onclick = () => busy(btn, async () => {
+      message.textContent = "";
+      try { await fn(); }
+      catch (error) { if (error.loginEnded) reset(); message.textContent = error.message; }
+    });
+  };
+  const request = (action, body) => api("llm/codex/login/" + action, body, true);
+  run(start, async () => {
+    const result = await request("start", {});
+    if (result.logged_in) return loggedIn();
+    loginId = result.login_id;
+    url.value = link.href = result.url;
+    start.classList.add("hidden");
+    panel.classList.remove("hidden");
+  });
+  run(panel.querySelector("[data-copy]"), async () => {
+    try { await navigator.clipboard.writeText(url.value); toast("已复制"); }
+    catch { url.focus(); url.select(); message.textContent = "已选中授权地址，请复制。"; }
+  });
+  run(panel.querySelector("[data-submit]"), async () => {
+    if (!callback.reportValidity()) return;
+    await request("complete", {login_id: loginId, callback: callback.value.trim()});
+    loggedIn();
+  });
+  run(panel.querySelector("[data-cancel]"), async () => {
+    try { await request("cancel", {login_id: loginId}); }
+    finally { reset(); }
+  });
+}
+
 function renderCodexForm(form, data, current, reload, draft) {
   const saved = data.codex,
     models = saved.models || [],
@@ -683,7 +743,18 @@ function renderCodexForm(form, data, current, reload, draft) {
     `<button type="button" data-val="${esc(key)}" class="${active ? "on" : ""}" aria-pressed="${active}">${esc(label)}${hint ? `<small>${esc(hint)}</small>` : ""}</button>`;
   const aliases = data.call_names_enabled && data.callable.CodexCLI;
   const installed = saved.installed ? (saved.logged_in ? "已登录" : "待登录") : "未安装";
-  form.innerHTML = `<h3>Codex CLI</h3><div class="banner info">${installed} · ${currentDefault ? "当前默认模型" : `默认模型为 ${esc(current)}`}${aliases?.length ? `。说“嗨 ${esc(aliases[0])}”可切换到 Codex` : ""}。</div>
+  form.innerHTML = `<h3>Codex CLI</h3><div class="banner info"><span data-install-state>${installed}</span> · ${currentDefault ? "当前默认模型" : `默认模型为 ${esc(current)}`}${aliases?.length ? `。说“嗨 ${esc(aliases[0])}”可切换到 Codex` : ""}。</div>
+    ${saved.installed && !saved.logged_in ? `<div class="cli-row" data-login-box><div class="cli-k">账号登录</div><div>
+      <button type="button" class="btn" data-login-start>使用 ChatGPT 登录</button>
+      <div class="hidden" data-login-panel>
+        <a class="btn primary" target="_blank" rel="noopener noreferrer">打开 OpenAI 授权页</a>
+        <button type="button" class="btn" data-copy>复制授权地址</button>
+        <input class="in mono" aria-label="授权地址" readonly>
+        <label class="f">回调链接<small class="hint">请在 10 分钟内完成授权，复制浏览器地址栏中的完整回调链接并粘贴到这里。即使页面提示无法连接，也可以复制地址。</small>
+        <input class="in" data-callback type="url" required autocomplete="off" spellcheck="false"></label>
+        <button type="button" class="btn primary" data-submit>完成登录</button>
+        <button type="button" class="btn" data-cancel>取消并返回</button>
+      </div><span class="small" role="status"></span></div></div>` : ""}
     <div class="cli-row"><div class="cli-k">模型</div><div><div class="seg" data-models></div>
       <select class="in" data-other-model aria-label="更多 Codex 模型"><option value="">更多模型…</option></select>
       <input class="in mono" data-custom placeholder="输入完整模型名" aria-label="自定义 Codex 模型"></div></div>
@@ -702,6 +773,7 @@ function renderCodexForm(form, data, current, reload, draft) {
       <div class="full"><label class="f">当前开放的工具</label><div class="chips" data-tools></div></div></div></details>
     <div class="actions"><span class="result"></span><button class="btn" id="codex-reset">撤销修改</button><button class="btn" id="codex-save">保存</button>
       ${currentDefault ? "" : `<button class="btn primary" id="codex-use" ${saved.logged_in && saved.workspace_ready ? "" : "disabled"}>保存并设为默认</button>`}</div>`;
+  bindCodexLogin(form, saved);
   const find = (sel) => form.querySelector(sel),
     custom = find("[data-custom]");
   let level = v.level,

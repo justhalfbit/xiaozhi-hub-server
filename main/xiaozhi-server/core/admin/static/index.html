@@ -655,12 +655,12 @@ let llmVendor = null;  // 正在查看的 API 厂商
 async function renderLLM(root) {
   const d = await api("llm");
   const c = d.claude, v = c.values, inst = c.install;
-  const usingCli = d.kind === "cli";
+  const usingCli = d.selected === "ClaudeCLI", usingCodex = d.selected === "CodexCLI";
   const active = d.vendors.find((x) => x.id === d.vendor);
   if (!llmVendor || !d.vendors.find((x) => x.id === llmVendor)) {
     llmVendor = d.vendor || (d.vendors.find((x) => x.configured) || d.vendors[0]).id;
   }
-  const current = usingCli ? `Claude Code · ${v.model || "默认模型"}` : d.kind === "grok" && d.grok.selected ? `Grok Bot · ${d.grok.selected.bot_name}` : active ? `${active.label} · ${active.model}` : d.selected;
+  const current = usingCodex ? `Codex CLI · ${d.codex.model || "默认模型"}` : usingCli ? `Claude Code · ${v.model || "默认模型"}` : d.kind === "grok" && d.grok.selected ? `Grok Bot · ${d.grok.selected.bot_name}` : active ? `${active.label} · ${active.model}` : d.selected;
   const customModel = !!v.model && !c.options.model.find((o) => o.value === v.model);
   const num = (name, label, hint) => `<label class="f">${label}${hint ? `<span class="hint">${hint}</span>` : ""}
     <input class="in" data-k="${name}" value="${esc(v[name] ?? "")}" inputmode="decimal"></label>`;
@@ -682,10 +682,10 @@ async function renderLLM(root) {
         <div><b>Claude Code CLI</b> ${defaultPill(usingCli)} ${callPill("ClaudeCLI")}
           <small>${inst.installed ? esc(`${inst.version} · ${inst.path}`) : '<span style="color:var(--err)">没有找到 Claude Code，请先安装并登录</span>'}</small></div>
       </div>
-      <div class="choice off" title="即将支持">
+      <a class="choice ${usingCodex ? "on" : ""}" href="#codex-form" id="codex-choice">
         <div class="mark" style="background:var(--soft);color:var(--muted)">X</div>
-        <div><b>Codex CLI</b> <span class="pill">即将支持</span><small>OpenAI 的本地编程助手</small></div>
-      </div>
+        <div><b>Codex CLI</b> ${defaultPill(usingCodex)} ${callPill("CodexCLI")}<small>${!d.codex.installed ? "未安装" : d.codex.logged_in ? "已登录" : "待登录"}</small></div>
+      </a>
       <div class="choice ${d.kind === "grok" ? "on" : ""}" id="grok-choice" style="cursor:pointer" title="打开 Grok Bot 页">
         <div class="mark" style="background:#e0f2fe;color:#0369a1">G</div>
         <div><b>Grok Bot</b> ${defaultPill(d.kind === "grok")} ${grokAliases.length ? `<span class="pill">称呼：${esc(grokAliases.slice(0, 3).join("、"))}${grokAliases.length > 3 ? "…" : ""}</span>` : ""}
@@ -742,12 +742,32 @@ async function renderLLM(root) {
       </div>` : '<div class="muted">配置文件里没有 ClaudeCLI 条目，请重新运行安装脚本生成配置。</div>'}
     </div>
 
+    <div class="card panel" id="codex-form">
+      <h3>Codex CLI</h3><div class="grid2">
+        <label class="f">模型<input class="in" id="codex-model" placeholder="使用 CLI 默认模型" value="${esc(d.codex.model)}"></label>
+        <label class="f">项目工作目录<input class="in" id="codex-dir" value="${esc(d.codex.workdir)}"></label>
+      </div><small>${d.codex.workspace_ready ? "工作目录可用" : "请先准备可写的项目目录"}。Codex 可以在此项目中修改文件并执行命令。</small>
+      <div class="actions"><button class="btn" id="codex-save">保存 Codex 设置</button>
+        <button class="btn primary" id="codex-use" ${d.codex.logged_in ? "" : "disabled"}>保存并设为默认</button></div>
+    </div>
     <div class="section-title">API Key · 云端模型，统一走 OpenAI 协议</div>
     <div class="vendors">${d.vendors.map((x) => `<button class="vendor ${x.id === llmVendor ? "on" : ""} ${d.vendor === x.id ? "using" : ""}" data-vendor="${x.id}">
       <i class="${x.configured ? "set" : ""}"></i><b>${esc(x.label)}</b>
       <small>${d.vendor === x.id ? "✓ 默认" : x.configured ? (d.callable[x.entry] ? `称呼：${esc(d.callable[x.entry][0])}` : "已配置") : "未配置"}</small></button>`).join("")}</div>
     <div class="card panel" id="api-form"></div>`;
 
+  $("codex-choice").onclick = e => { e.preventDefault(); $("codex-model").focus(); };
+  const codexValues = () => ({model: $("codex-model").value.trim(), workdir: $("codex-dir").value.trim()});
+  const codexDirty = snapshot(codexValues);
+  for (const id of ["codex-save", "codex-use"]) {
+    $(id).onclick = e => busy(e.target, async () => {
+      try {
+        const saved = await api("llm/codex", codexValues());
+        const result = id === "codex-use" ? await api("llm/use", {kind: "cli", vendor: "codex"}) : saved;
+        toast(result.note, result.failed); page.dirty = null; await openPage("llm", true);
+      } catch (err) { toast(err.message, true); }
+    });
+  }
   $("grok-choice").onclick = () => openPage("grokbot");
 
   // ----- 本地 CLI -----
@@ -851,7 +871,7 @@ async function renderLLM(root) {
     renderApi();
   }));
   renderApi();
-  page.dirty = () => cliDirty() || apiDirty();
+  page.dirty = () => cliDirty() || codexDirty() || apiDirty();
 }
 
 // ---------- 语音识别 ----------

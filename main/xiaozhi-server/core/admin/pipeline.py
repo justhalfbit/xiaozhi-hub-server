@@ -83,6 +83,8 @@ def _voice_name(voice: str) -> str:
 
 
 def _llm_label(name: str, entry: dict) -> str:
+    if entry.get("type") == "codex_cli":
+        return "Codex CLI"
     if entry.get("type") == "claude_cli":
         return "Claude Code"
     vendor = catalog.VENDOR_BY_ENTRY.get(name)

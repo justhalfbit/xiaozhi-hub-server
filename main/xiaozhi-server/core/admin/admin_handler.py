@@ -27,6 +27,7 @@ from config.logger import setup_logging
 from core.admin import auth, catalog, config_store, connections, pages, pipeline, plugin_settings, updater
 from core.admin.grokbot import GrokBotAdmin
 from core.admin.status import _claude_version, collect_status
+from core.agent.codex_session import installation as codex_installation
 from core.agent import chat_history, llm_router, reports
 from core.agent.agent_session import ErrorKind
 from core.agent.grokbot_client import GrokBotError
@@ -108,6 +109,7 @@ class AdminHandler:
                 web.post("/admin/api/devices/{session_id}/emotion-test", self.handle_emotion_test),
                 web.post("/admin/api/devices/{session_id}/emotion-test/stop", self.handle_emotion_stop),
                 web.get("/admin/api/llm", self.handle_llm),
+                web.post("/admin/api/llm/codex", self.handle_llm_codex),
                 web.post("/admin/api/llm/claude", self.handle_llm_claude),
                 web.post("/admin/api/llm/vendors/{vendor}", self.handle_llm_vendor),
                 web.post("/admin/api/llm/vendors/{vendor}/test", self.handle_llm_vendor_test),
@@ -516,8 +518,28 @@ class AdminHandler:
         merged = await self._blocking(self._merged)
         data = pages.describe_llm(merged)
         data["claude"]["install"] = await self._blocking(self._claude_install, merged)
+        codex = merged.get("LLM", {}).get(pages.CODEX_ENTRY, {})
+        workdir = codex.get("workdir") or "~/xiaozhi-workspace"
+        data["codex"] = {"workdir": workdir, "model": codex.get("model", ""),
+                         **await self._blocking(codex_installation, workdir)}
         data["running"] = self._running("LLM")
         return self._json({"ok": True, **data})
+
+    async def handle_llm_codex(self, request: web.Request):
+        self._require_login(request)
+        body = await self._read_json(request)
+        try:
+            workdir = Path(str(body.get("workdir") or "")).expanduser()
+        except RuntimeError:
+            return self._error("无法解析工作目录", 400)
+        if not workdir.is_absolute() or not workdir.is_dir():
+            return self._error("请输入已存在的绝对工作目录", 400)
+        merged = await self._blocking(self._merged)
+        values = {"enabled": True, "model": str(body.get("model") or "").strip(), "workdir": str(workdir)}
+        changed = await self._blocking(config_store.update_entry, "LLM", pages.CODEX_ENTRY,
+                                       values, merged, self.config_path)
+        return self._json({"ok": True, "changed": changed,
+                           **await self._apply_if_selected("LLM", pages.CODEX_ENTRY, changed)})
 
     async def handle_llm_claude(self, request: web.Request):
         self._require_login(request)
@@ -613,6 +635,20 @@ class AdminHandler:
             return result
         return self._json(result)
 
+    async def _cli_selection(self, merged, body):
+        entry = body.get("entry")
+        vendor = body.get("vendor")
+        choices = {"codex": pages.CODEX_ENTRY, "claude-code": pages.CLAUDE_CLI_ENTRY}
+        name = entry or choices.get(vendor, pages.CLAUDE_CLI_ENTRY)
+        if name not in choices.values() or (vendor and choices.get(vendor) != name):
+            raise ValueError("未知或不匹配的 CLI 模型")
+        if name == pages.CODEX_ENTRY:
+            config = merged.get("LLM", {}).get(name, {})
+            status = await self._blocking(codex_installation, config.get("workdir") or "~/xiaozhi-workspace")
+            if not config.get("enabled") or not status["logged_in"] or not status["workspace_ready"]:
+                raise ValueError("请先配置 Codex 工作目录并登录")
+        return name
+
     async def _use_llm(self, body: dict):
         """把默认模型切到 body 指定的（{"kind": "cli"} 或 {"kind": "api", "vendor": ...}）。
 
@@ -620,7 +656,10 @@ class AdminHandler:
         """
         merged = await self._blocking(self._merged)
         if body.get("kind") == "cli":
-            name = pages.CLAUDE_CLI_ENTRY
+            try:
+                name = await self._cli_selection(merged, body)
+            except ValueError as exc:
+                return None, self._error(str(exc), 400)
         else:
             vendor = catalog.VENDOR_BY_ID.get(str(body.get("vendor") or ""))
             if vendor is None:
@@ -678,6 +717,12 @@ class AdminHandler:
         if install.get("installed"):
             options.insert(0, {"kind": "cli", "vendor": "claude-code", "label": "Claude Code",
                                "entry": pages.CLAUDE_CLI_ENTRY, "model": data["claude"]["values"].get("model", "")})
+        codex = merged.get("LLM", {}).get(pages.CODEX_ENTRY, {})
+        if codex.get("enabled"):
+            status = await self._blocking(codex_installation, codex["workdir"], check_login=False)
+            if status["installed"] and status["workspace_ready"]:
+                options.append({"kind": "cli", "vendor": "codex", "entry": pages.CODEX_ENTRY,
+                                "label": "Codex CLI", "model": codex.get("model", "")})
         options += [{"kind": "grok", "vendor": "grok_bot", "label": b["bot_name"], "entry": b["entry"], "model": "Grok Bot"}
                     for b in data["grok"]["bots"] if llm_router.model_ready(merged, b["entry"])]
         selected = data["selected"]
@@ -709,7 +754,10 @@ class AdminHandler:
             if name not in {b["entry"] for b in pages.grok_entries(merged)} or not llm_router.model_ready(merged, name):
                 return self._error("没有这个 Grok Bot，请先在管理后台的 Grok Bot 页勾选", 404)
         elif kind == "cli":
-            name = pages.CLAUDE_CLI_ENTRY
+            try:
+                name = await self._cli_selection(merged, body)
+            except ValueError as exc:
+                return self._error(str(exc), 400)
             if name not in (merged.get("LLM") or {}):
                 return self._error(f"配置里没有 {name}", 404)
         else:

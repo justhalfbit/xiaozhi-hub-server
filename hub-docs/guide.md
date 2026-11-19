@@ -96,6 +96,14 @@ Linux 服务器的安装方法和上面一样。云服务器上一般没有 Clau
 
 所有设置都保存在 `main/xiaozhi-server/data/.config.yaml`，这个文件不会提交到 Git。API Key 在里面是明文，管理密码只保存哈希值。
 
+### Codex CLI
+
+在运行 Hub 的账户下安装 Codex CLI，并用 `codex login status` 检查登录。ThinkSmart 的 Hub 以普通用户 `ubuntu` 运行。服务需要能访问该账户的 Codex 安装和登录目录，以及 OpenAI 服务。已验证的 CLI 版本为 0.170.0。
+
+1. 准备一个可写的项目副本。在管理后台「大模型 → Codex CLI」填写工作目录，模型可留空，点击「保存 Codex 设置」。
+2. 在「呼名」添加 Codex CLI 和称呼 `codex`，或在设备的模型菜单直接选 Codex CLI。单台设备切换使用 `POST /kiosk/llm/use`，传入 `kind=cli`、`vendor=codex` 和设备 ID。
+3. 说“嗨 Codex，看看这个项目”。Codex 使用工作区写入沙箱，可以修改文件并执行项目命令。会话按设备和工作目录保存，长任务的打断、后台补报和“停下”沿用 Claude Code 的行为。
+
 ## 3. 连接设备
 
 设备配网时，在配网页的"高级选项"里填写 OTA 地址：

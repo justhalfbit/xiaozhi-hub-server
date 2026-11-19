@@ -653,6 +653,11 @@ VAD:
     min_silence_duration_ms: 800  # 如果说话停顿比较长，可以把这个值设置大一些
 
 LLM:
+  CodexCLI:
+    type: codex_cli
+    enabled: false
+    model: ""
+    workdir: "~/xiaozhi-workspace"
   # 所有openai类型均可以修改超参，以AliLLM为例
   # 当前支持的type为openai、dify、ollama，可自行适配
   AliLLM:

@@ -959,3 +959,21 @@ async def test_kiosk_tts(kiosk, monkeypatch):
     assert (await kiosk.post("/kiosk/tts", json={"text": "该晾衣服了"})).status == 502
     FakeTTS.interface_type = InterfaceType.DUAL_STREAM   # 流式合成
     assert (await kiosk.post("/kiosk/tts", json={"text": "该晾衣服了"})).status == 501
+
+
+async def test_codex_saved_and_selected_per_device(kiosk, tmp_path, monkeypatch):
+    def installation(directory, *, check_login=True):
+        return {"installed": True, "logged_in": check_login, "workspace_ready": True}
+
+    monkeypatch.setattr(ah, "codex_installation", installation)
+    result = await kiosk.post("/admin/api/llm/codex", json={"model": "", "workdir": str(tmp_path)})
+    assert result.status == 200
+    result = await kiosk.post("/kiosk/llm/use", json={"kind": "cli", "vendor": "codex", "device": "a"})
+    data = await result.json()
+    assert data["selected"] == "CodexCLI" and data["default"] == "ClaudeCLI"
+    assert any(o["entry"] == "CodexCLI" for o in data["options"])
+    assert (await (await kiosk.get("/kiosk/llm?device=b")).json())["selected"] == "ClaudeCLI"
+
+    monkeypatch.setattr(ah, "codex_installation", lambda *a, **kw: {**installation(""), "logged_in": False})
+    assert (await kiosk.post("/kiosk/llm/use", json={"kind": "cli", "vendor": "codex", "device": "b"})).status == 400
+    assert (await (await kiosk.get("/kiosk/llm?device=b")).json())["selected"] == "ClaudeCLI"

@@ -207,6 +207,7 @@ class Turn:
 class LLMProvider(LLMProviderBase):
     # 日志和提示里对这个 Agent 的称呼。其他 Agent 的 provider（grok_bot）继承本类，改掉它和 _ensure_agent 即可
     AGENT_LABEL = "Claude Code"
+    SPOKEN_NAME = "Claude"
     # 设备这边结束一轮时，在干正经活的转到后台接着做（见模块说明）。grok_bot 的会话自己有后台盯着的机制，关掉
     BACKGROUND_TURNS = True
     REPORT_ID = "claude_cli"  # 待汇报箱里标记是谁的话
@@ -407,13 +408,13 @@ class LLMProvider(LLMProviderBase):
         if turn.cancelled:
             return ""
         if turn.stop_kind == ErrorKind.STALLED:
-            return "Claude 刚才那件事一直没有回应，我让它停下了。想接着做，跟我说继续就行。"
+            return f"{self.SPOKEN_NAME} 刚才那件事一直没有回应，我让它停下了。想接着做，跟我说继续就行。"
         if turn.stop_kind == ErrorKind.TIMEOUT:
-            return "Claude 刚才那件事做了太久，我让它停下了。想接着做，跟我说继续就行。"
+            return f"{self.SPOKEN_NAME} 刚才那件事做了太久，我让它停下了。想接着做，跟我说继续就行。"
         body = textUtils.check_emoji("".join(turn.texts)).strip().lstrip("。")  # 汇报时不需要换表情
         if turn.error is not None and not body:
-            return f"Claude 刚才那件事没做完：{turn.error.voice_message}"
-        return f"Claude 做完了：{body}" if body else "Claude 做完了。"
+            return f"{self.SPOKEN_NAME} 刚才那件事没做完：{turn.error.voice_message}"
+        return f"{self.SPOKEN_NAME} 做完了：{body}" if body else f"{self.SPOKEN_NAME} 做完了。"
 
     async def _finish_background(self, st: ConnState, turn: Turn) -> None:
         with self._states_lock:
@@ -440,10 +441,10 @@ class LLMProvider(LLMProviderBase):
             if bg.agent is not None:
                 await bg.agent.interrupt()
             asyncio.ensure_future(self._abandon_if_stuck(bg.st, bg.gen))
-            out.put(TextDelta(STOPPED_NOTICE))
+            out.put(TextDelta(STOPPED_NOTICE.replace("Claude", self.SPOKEN_NAME)))
         else:
             logger.bind(tag=TAG).info(f"{self.AGENT_LABEL} 还在后台做上一件事，这句话不发：{text[:40]}")
-            out.put(TextDelta(BUSY_NOTICE))
+            out.put(TextDelta(BUSY_NOTICE.replace("Claude", self.SPOKEN_NAME)))
         out.put(Done())
         return True
 
@@ -488,6 +489,11 @@ class LLMProvider(LLMProviderBase):
             if task is not None and not task.done() and st.turn_gen == gen:
                 task.cancel()
 
+    def _make_session(self, system_prompt, resume_id=None):
+        cfg = ClaudeSessionConfig(**{**self.session_config.__dict__,
+                                     "system_prompt_append": (system_prompt or "") + "\n" + VOICE_RULES})
+        return ClaudeSession(cfg, resume_id=resume_id, logger=logger.bind(tag=TAG))
+
     async def _ensure_agent(self, st: ConnState, text: str, out: queue.Queue, system_prompt: str) -> bool:
         """确保有可用的进程。返回 True 表示这句话已经作为"接续指令"处理完，不必再发给 Claude。
 
@@ -499,9 +505,7 @@ class LLMProvider(LLMProviderBase):
         remainder = match_resume(text, self.resume_keywords)
         keyword = remainder is not None
         resume_id, reason = choose_resume(self.store.get(st.key), keyword, self.resume_window)
-        cfg = ClaudeSessionConfig(**{**self.session_config.__dict__,
-                                     "system_prompt_append": (system_prompt or "") + "\n" + VOICE_RULES})
-        agent = ClaudeSession(cfg, resume_id=resume_id, logger=logger.bind(tag=TAG))
+        agent = self._make_session(system_prompt, resume_id)
         t0 = time.time()
         try:
             await agent.start()
@@ -509,7 +513,7 @@ class LLMProvider(LLMProviderBase):
             if e.kind != ErrorKind.SESSION_MISSING:
                 raise
             logger.bind(tag=TAG).warning(f"接续会话 {resume_id} 失败，改为新开会话")
-            agent = ClaudeSession(cfg, logger=logger.bind(tag=TAG))
+            agent = self._make_session(system_prompt)
             await agent.start()  # 新会话也启动失败时（如未登录、网络问题）保留旧记录，下次还能接续
             self.store.forget(st.key)
             if keyword:
@@ -520,8 +524,8 @@ class LLMProvider(LLMProviderBase):
             raise AgentSessionError(ErrorKind.PROCESS_EXITED, "连接已关闭")
         st.agent = agent
         logger.bind(tag=TAG).info(
-            f"Claude Code 进程已启动（{time.time() - t0:.1f}s），设备 {st.key}，"
-            f"{'接续会话 ' + resume_id if resume_id else '新会话 ' + agent.session_id}（{reason}）"
+            f"{self.AGENT_LABEL} 会话已启动（{time.time() - t0:.1f}s），设备 {st.key}，"
+            f"{'接续会话 ' + resume_id if resume_id else '新会话 ' + (agent.session_id or '')}（{reason}）"
         )
         if keyword and not remainder:
             if resume_id:
@@ -552,7 +556,7 @@ class LLMProvider(LLMProviderBase):
                     if pending:
                         out.put(TextDelta(pending))
                 if await self._ensure_agent(st, text, out, system_prompt):
-                    if st.agent:  # grok_bot 在连接已关闭时把话交出去后也返回 True，那时没有会话
+                    if st.agent and st.agent.session_id:  # grok_bot 在连接已关闭时把话交出去后也返回 True，那时没有会话
                         self.store.touch(st.key, st.agent.session_id)
                     return
                 agent, recorded, working, failed, previous = st.agent, False, False, False, None
@@ -561,7 +565,7 @@ class LLMProvider(LLMProviderBase):
                     if isinstance(ev, Error) and not working and ev.kind != ErrorKind.PROCESS_EXITED:
                         failed = True  # 还没开始干活就出错：没登录、额度用完、限流或过载重试用完等
                     elif not failed and isinstance(ev, (TextDelta, Activity)):
-                        if not recorded:
+                        if not recorded and agent.session_id:
                             # 会话已存在于本机（init 时用户的话就已存进去）。马上记下来：这一轮如果卡死（例如和 Anthropic 的
                             # 网络卡住，只收到 init）、进程被强制关闭，下一句话启动新进程时也能接回这个会话
                             previous = self.store.get(st.key)

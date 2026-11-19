@@ -91,7 +91,13 @@ def collect_status(config: dict, merged: dict) -> dict:
     # 大模型
     llm_type = config_store.entry_type(merged, "LLM")
     llm_entry = (merged.get("LLM") or {}).get(selected.get("LLM"), {})
-    if llm_type == "claude_cli":
+    if llm_type == "codex_cli":
+        from core.agent.codex_session import installation
+
+        status = installation(llm_entry.get("workdir") or "~/xiaozhi-workspace")
+        ready = status["logged_in"] and status["workspace_ready"]
+        checks.append(_check("Codex CLI", ready, "已登录，工作目录可用" if ready else "请检查安装、登录和工作目录"))
+    elif llm_type == "claude_cli":
         from core.providers.llm.claude_cli.claude_cli import find_claude_cli
 
         cli = find_claude_cli(llm_entry.get("cli_path") or None)

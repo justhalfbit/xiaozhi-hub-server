@@ -14,6 +14,7 @@ from config.config_loader import get_project_dir
 from core.admin import catalog, config_store, plugin_settings
 from core.agent import asr_text
 
+CODEX_ENTRY = "CodexCLI"
 CLAUDE_CLI_ENTRY = "ClaudeCLI"
 CLAUDE_EFFORT_VALUES = {"", "low", "medium", "high", "xhigh", "max"}
 CLAUDE_PERMISSION_VALUES = {"default", "acceptEdits", "plan", "auto"}
@@ -66,7 +67,7 @@ def describe_vendor(vendor: dict, merged: dict) -> dict:
 
 def llm_kind(merged: dict, name: str = None) -> str:
     name = name or _selected(merged, "LLM")
-    if config_store.entry_type(merged, "LLM", name) == "claude_cli":
+    if config_store.entry_type(merged, "LLM", name) in ("claude_cli", "codex_cli"):
         return "cli"
     if config_store.entry_type(merged, "LLM", name) == "grok_bot":
         return "grok"
@@ -383,7 +384,7 @@ def vendor_test_config(vendor_id: str, payload: dict, merged: dict) -> dict:
 def desired_intent(merged: dict, llm_name: str, path: Path = None):
     """切换大模型后意图识别应该是什么：Claude CLI 只能用 nointent；
     API 模型恢复用户上次在 API 模式下的选择，没有选过时用 function_call。"""
-    if config_store.entry_type(merged, "LLM", llm_name) == "claude_cli":
+    if config_store.entry_type(merged, "LLM", llm_name) in ("claude_cli", "codex_cli"):
         return "nointent"
     pref = (config_store.load_custom(path).get("admin") or {}).get("api_intent")
     if pref in catalog.INTENT_MODES:
@@ -811,6 +812,8 @@ def call_targets(merged: dict) -> list:
     if config_store.entry_type(merged, "LLM", CLAUDE_CLI_ENTRY) == "claude_cli":
         result.append({"entry": CLAUDE_CLI_ENTRY, "label": "Claude（本机 Claude Code）",
                        "defaults": list(call_names.DEFAULT_MODELS[CLAUDE_CLI_ENTRY])})
+    if _entry(merged, "LLM", CODEX_ENTRY).get("enabled"):
+        result.append({"entry": CODEX_ENTRY, "label": "Codex CLI", "defaults": ["codex"]})
     for g in grok_entries(merged):
         if g["bot_id"]:
             result.append({"entry": g["entry"], "label": f"{g['bot_name']}（Grok Bot）",

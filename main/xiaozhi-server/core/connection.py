@@ -1100,6 +1100,8 @@ class ConnectionHandler:
             current_sentence_id = sentence_id or str(uuid.uuid4().hex)
             self.sentence_id = current_sentence_id  # 更新共享属性
             # [xiaozhi-hub] 模型还没配置好：马上告诉用户，不去请求、也不写进对话
+            if (getattr(self, "hub_route", None) or {}).get("current") == "CodexCLI":
+                llm_router.refresh_codex(self)
             not_ready = llm_router.not_ready_reply(self)
             if not_ready:
                 self.logger.bind(tag=TAG).warning(f"模型还没配置好，不请求: {query}")

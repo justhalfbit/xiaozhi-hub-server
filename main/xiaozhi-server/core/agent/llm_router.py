@@ -70,6 +70,8 @@ def model_ready(config: dict, name: str) -> bool:
     if not isinstance(entry, dict):
         return False
     kind = entry.get("type", name)
+    if kind == "codex_cli" and not entry.get("enabled"):
+        return False
     if kind == "openai":
         if _placeholder(entry.get("model_name")) or _placeholder(entry.get("base_url") or entry.get("url")):
             return False
@@ -118,7 +120,7 @@ def not_ready_reply(conn: "ConnectionHandler") -> Optional[str]:
 
 
 INTENT_MODES = ("nointent", "function_call")
-AGENT_TYPES = ("claude_cli", "grok_bot")  # 自己处理工具和对话的 Agent：不走 function_call
+AGENT_TYPES = ("claude_cli", "codex_cli", "grok_bot")  # 自己处理工具和对话的 Agent：不走 function_call
 
 
 def _entry_type(config: dict, section: str, name: Optional[str]) -> Optional[str]:
@@ -186,6 +188,8 @@ def _apply_intent(conn: "ConnectionHandler", name: str, live: bool = True) -> No
 def model_label(name: str) -> str:
     from core.admin import catalog
 
+    if name == "CodexCLI":
+        return "Codex"
     if name == CLAUDE_CLI_ENTRY:
         return "Claude"
     if name.startswith(GROK_BOT_PREFIX):
@@ -291,6 +295,14 @@ def on_conn_open(conn: "ConnectionHandler") -> None:
 
     reports.on_conn_open(conn)
     call_names.schedule_warm_up(conn)  # 提前准备好只喊称呼时回的"我在"
+
+
+def refresh_codex(conn):
+    """Apply saved settings before the next turn, including an already connected device."""
+    instance = get_instance(conn, "CodexCLI")
+    if instance is not conn.llm:
+        _attach(conn, instance)
+        conn.llm = instance
 
 
 def switch(conn: "ConnectionHandler", name: str, remember: bool = True, live: bool = True) -> bool:

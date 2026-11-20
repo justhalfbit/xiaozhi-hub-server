@@ -44,7 +44,7 @@ DEFAULTS = {
     "display_limit": 100,   # 给屏幕显示时每个模型最多返回多少条
 }
 # 上下文在自己会话里的类型：只存记录给屏幕显示
-AGENT_KINDS = {"claude_cli", "grok_bot"}
+AGENT_KINDS = {"claude_cli", "codex_cli", "grok_bot"}
 HINT_PREFIX = "[系统提示]"
 CUT_MARK = "……"  # reply_progress 给被打断的回复加的结尾
 SUMMARY_BATCH = 200  # 一次最多总结这么多条（第一次上线时库里可能已经有很长的记录）

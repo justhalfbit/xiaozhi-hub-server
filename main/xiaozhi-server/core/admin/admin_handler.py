@@ -21,12 +21,17 @@ import wave
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import aiohttp
 from aiohttp import web
 
 from config.logger import setup_logging
 from core.admin import auth, catalog, config_store, connections, pages, pipeline, plugin_settings, updater
+from core.admin.clash_window import ClashWindow
+from core.admin.codex_login import CodexLogin, LoginEnded, LoginError
 from core.admin.grokbot import GrokBotAdmin
 from core.admin.status import _claude_version, collect_status
+from core.agent import cli_proxy
+from core.admin import codex_settings
 from core.agent import chat_history, llm_router, reports
 from core.agent.agent_session import ErrorKind
 from core.agent.grokbot_client import GrokBotError
@@ -77,6 +82,7 @@ class AdminHandler:
         self.ws_server = ws_server
         self.config_path = config_path
         self.sessions = auth.SessionStore()
+        self.codex_login = CodexLogin()
         # 后台点了更新网关、网关重启后，接着用重启前的登录（文件在 data/ 下，和配置放在一起）
         data_dir = Path(config_path).parent if config_path else updater.SERVER_DIR / "data"
         self.sessions_handover = data_dir / ".admin-sessions.json"
@@ -89,6 +95,8 @@ class AdminHandler:
         self.grokbot = GrokBotAdmin(grokbot_credentials, logger=logger.bind(tag=TAG))
 
     def register(self, app: web.Application) -> None:
+        ClashWindow(self._require_login, self._logged_in, self._read_json).register(app)
+        app.on_cleanup.append(self.codex_login.close)
         app.add_routes(
             [
                 web.get("/admin", self.handle_index),
@@ -108,6 +116,9 @@ class AdminHandler:
                 web.post("/admin/api/devices/{session_id}/emotion-test", self.handle_emotion_test),
                 web.post("/admin/api/devices/{session_id}/emotion-test/stop", self.handle_emotion_stop),
                 web.get("/admin/api/llm", self.handle_llm),
+                web.post("/admin/api/llm/cli-proxy", self.handle_cli_proxy),
+                web.post("/admin/api/llm/codex", self.handle_llm_codex),
+                web.post("/admin/api/llm/codex/login/{action:start|complete|cancel}", self.handle_codex_login),
                 web.post("/admin/api/llm/claude", self.handle_llm_claude),
                 web.post("/admin/api/llm/vendors/{vendor}", self.handle_llm_vendor),
                 web.post("/admin/api/llm/vendors/{vendor}/test", self.handle_llm_vendor_test),
@@ -515,9 +526,61 @@ class AdminHandler:
         self._require_login(request)
         merged = await self._blocking(self._merged)
         data = pages.describe_llm(merged)
+        data["cli_proxy"] = cli_proxy.settings(merged)
+        data["cli_proxy_warning"] = await self._blocking(cli_proxy.connection_warning, data["cli_proxy"])
         data["claude"]["install"] = await self._blocking(self._claude_install, merged)
+        codex = merged.get("LLM", {}).get(pages.CODEX_ENTRY, {})
+        data["codex"] = await self._blocking(codex_settings.describe, codex)
         data["running"] = self._running("LLM")
         return self._json({"ok": True, **data})
+
+    async def handle_cli_proxy(self, request):
+        self._require_login(request)
+        body = await self._read_json(request)
+        try:
+            value, warning = await self._blocking(cli_proxy.save, body, self.config_path)
+        except ValueError as exc:
+            return self._error(str(exc), 400)
+        return self._json({"ok": True, "cli_proxy": value, "warning": warning})
+
+    async def handle_codex_login(self, request: web.Request):
+        self._require_login(request)
+        body = await self._read_json(request)
+        owner = request.cookies[COOKIE_NAME]
+        action = request.match_info["action"]
+        try:
+            if action == "cancel":
+                await self.codex_login.finish(owner, body.get("login_id"), cancel=True)
+                return self._json({"ok": True})
+            entry = (await self._blocking(self._merged)).get("LLM", {}).get(pages.CODEX_ENTRY, {})
+            if action == "start":
+                info = await self._blocking(codex_settings.status, entry)
+                if not info["installed"]:
+                    return self._error("请先安装 Codex CLI", 400)
+                if info["logged_in"]:
+                    return self._json({"ok": True, "logged_in": True})
+                return self._json({"ok": True, **await self.codex_login.start(owner, info["path"])})
+            await self.codex_login.finish(owner, body.get("login_id"), body.get("callback"))
+            if not (await self._blocking(codex_settings.status, entry))["logged_in"]:
+                return self._error("设备未检测到 Codex 登录，请重新授权", 409)
+            return self._json({"ok": True, "logged_in": True})
+        except LoginEnded as exc:
+            return self._json({"ok": False, "error": str(exc), "login_ended": True}, 409)
+        except LoginError as exc:
+            return self._error(str(exc), 400)
+        except (asyncio.TimeoutError, OSError, ValueError, KeyError, aiohttp.ClientError):
+            return self._error("Codex 登录失败，请检查 CLI、授权地址和设备网络后重试", 400)
+
+    async def handle_llm_codex(self, request: web.Request):
+        self._require_login(request)
+        body = await self._read_json(request)
+        merged = await self._blocking(self._merged)
+        try:
+            changed = await self._blocking(codex_settings.save, body, merged, self.config_path)
+        except ValueError as exc:
+            return self._error(str(exc), 400)
+        return self._json({"ok": True, "changed": changed,
+                           **await self._apply_if_selected("LLM", pages.CODEX_ENTRY, changed)})
 
     async def handle_llm_claude(self, request: web.Request):
         self._require_login(request)
@@ -613,6 +676,20 @@ class AdminHandler:
             return result
         return self._json(result)
 
+    async def _cli_selection(self, merged, body):
+        entry = body.get("entry")
+        vendor = body.get("vendor")
+        choices = {"codex": pages.CODEX_ENTRY, "claude-code": pages.CLAUDE_CLI_ENTRY}
+        name = entry or choices.get(vendor, pages.CLAUDE_CLI_ENTRY)
+        if name not in choices.values() or (vendor and choices.get(vendor) != name):
+            raise ValueError("未知或不匹配的 CLI 模型")
+        if name == pages.CODEX_ENTRY:
+            config = merged.get("LLM", {}).get(name, {})
+            status = await self._blocking(codex_settings.status, config)
+            if not config.get("enabled") or not status["logged_in"] or not status["workspace_ready"]:
+                raise ValueError("请先配置 Codex 工作目录并登录")
+        return name
+
     async def _use_llm(self, body: dict):
         """把默认模型切到 body 指定的（{"kind": "cli"} 或 {"kind": "api", "vendor": ...}）。
 
@@ -620,7 +697,10 @@ class AdminHandler:
         """
         merged = await self._blocking(self._merged)
         if body.get("kind") == "cli":
-            name = pages.CLAUDE_CLI_ENTRY
+            try:
+                name = await self._cli_selection(merged, body)
+            except ValueError as exc:
+                return None, self._error(str(exc), 400)
         else:
             vendor = catalog.VENDOR_BY_ID.get(str(body.get("vendor") or ""))
             if vendor is None:
@@ -678,6 +758,12 @@ class AdminHandler:
         if install.get("installed"):
             options.insert(0, {"kind": "cli", "vendor": "claude-code", "label": "Claude Code",
                                "entry": pages.CLAUDE_CLI_ENTRY, "model": data["claude"]["values"].get("model", "")})
+        codex = merged.get("LLM", {}).get(pages.CODEX_ENTRY, {})
+        if codex.get("enabled"):
+            status = await self._blocking(codex_settings.status, codex, check_login=False)
+            if status["installed"] and status["workspace_ready"]:
+                options.append({"kind": "cli", "vendor": "codex", "entry": pages.CODEX_ENTRY,
+                                "label": "Codex CLI", "model": codex.get("model", "")})
         options += [{"kind": "grok", "vendor": "grok_bot", "label": b["bot_name"], "entry": b["entry"], "model": "Grok Bot"}
                     for b in data["grok"]["bots"] if llm_router.model_ready(merged, b["entry"])]
         selected = data["selected"]
@@ -709,7 +795,10 @@ class AdminHandler:
             if name not in {b["entry"] for b in pages.grok_entries(merged)} or not llm_router.model_ready(merged, name):
                 return self._error("没有这个 Grok Bot，请先在管理后台的 Grok Bot 页勾选", 404)
         elif kind == "cli":
-            name = pages.CLAUDE_CLI_ENTRY
+            try:
+                name = await self._cli_selection(merged, body)
+            except ValueError as exc:
+                return self._error(str(exc), 400)
             if name not in (merged.get("LLM") or {}):
                 return self._error(f"配置里没有 {name}", 404)
         else:

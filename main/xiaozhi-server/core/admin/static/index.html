@@ -311,6 +311,7 @@
     <nav class="nav" id="nav">
       <button data-page="status"><span class="ico">◎</span>状态</button>
       <button data-page="how"><span class="ico">⇄</span>工作原理</button>
+      <button data-page="clash-party"><span class="ico">⇄</span>Clash Party</button>
       <button data-page="llm"><span class="ico">✦</span>大模型</button>
       <button data-page="calls"><span class="ico">☎</span>呼名</button>
       <button data-page="grokbot"><span class="ico">☁</span>Grok Bot</button>
@@ -353,7 +354,11 @@ async function api(path, body, quiet) {
     if (quiet && page.dirty && page.dirty()) { const e = new Error(EXPIRED); e.expired = true; throw e; }
     page.dirty = null; await route(); throw new Error(EXPIRED + "，请重新登录");
   }
-  if (!res.ok || data.ok === false) throw new Error(data.error || ("请求失败：" + res.status));
+  if (!res.ok || data.ok === false) {
+    const error = new Error(data.error || ("请求失败：" + res.status));
+    if (data.login_ended) error.loginEnded = true;
+    throw error;
+  }
   return data;
 }
 
@@ -391,6 +396,7 @@ async function route() {
   try { st = await (await fetch("/admin/api/state")).json(); } catch (e) { return; }
   if (st.needs_setup || !st.logged_in) {
     authMode = st.needs_setup ? "setup" : "login";
+    closeClashWindow();
     clearInterval(page.timer); page.name = "";
     clearInterval(onlineTimer); onlineTimer = null;
     $("app").classList.add("hidden"); $("auth").classList.remove("hidden");
@@ -426,7 +432,108 @@ $("auth-form").addEventListener("submit", async (ev) => {
 });
 $("logout").onclick = async () => { if (!confirmLeave()) return; page.dirty = null; await api("logout", {}); await route(); };
 
-const PAGES = { status: renderStatus, how: renderHow, llm: renderLLM, calls: renderCallNames, grokbot: renderGrokBot, memory: renderMemory, asr: renderASR, tts: renderTTS, intent: renderIntent, update: renderUpdate };
+let closeClashWindow = () => {};
+async function renderClashParty(root) {
+  root.innerHTML = `<h1>Clash Party</h1>
+    <div class="row"><span id="clash-version" role="status"></span>
+      <button class="btn" id="clash-check">检查更新</button>
+      <button class="btn primary" id="clash-upgrade" disabled>更新</button></div>
+    <div class="row"><span id="clash-state" role="status">正在连接设备窗口…</span>
+      <button class="btn" id="clash-retry" hidden>重新连接</button></div>
+    <div id="clash-window" style="width:100%;aspect-ratio:1200 / 680;max-height:70vh;background:#181818" hidden></div>
+    <form id="clash-paste" hidden><input aria-label="粘贴内容" placeholder="先选中窗口中的输入框，再在这里粘贴" maxlength="8192" autocomplete="off" style="width:min(70%,420px)">
+      <button class="btn">粘贴到窗口</button></form>`;
+  const display = $("clash-window"), status = $("clash-state"), paste = $("clash-paste"), retry = $("clash-retry");
+  const versionLabel = $("clash-version"), check = $("clash-check"), upgrade = $("clash-upgrade");
+  let viewer, active = true, updateTimer, sawJob = false, targetVersion = "";
+  async function refreshUpdate(checkLatest, submit = false) {
+    clearTimeout(updateTimer);
+    check.disabled = upgrade.disabled = true;
+    let current = "";
+    try {
+      let info = await api("clash-party/update", submit ? {version:targetVersion} : undefined);
+      if (!active) return;
+      current = info.current;
+      const prefix = current ? "当前版本 " + current + " · " : "";
+      if (checkLatest && !info.busy && !info.retry && current) {
+        versionLabel.textContent = prefix + "正在检查…";
+        info = await api("clash-party/update?check=1");
+        if (!active) return;
+      }
+      const repair = info.retry;
+      targetVersion = repair ? info.target : info.latest || "";
+      upgrade.textContent = repair ? repair : info.available ? "更新到 " + info.latest : "更新";
+      if (info.busy) {
+        sawJob = true;
+        versionLabel.textContent = prefix + (info.phase || "安装任务进行中");
+        updateTimer = setTimeout(() => refreshUpdate(false), 1500);
+        return;
+      }
+      if (sawJob && info.phase === "更新成功") {
+        sawJob = false;
+        return openPage("clash-party", true);
+      }
+      if (sawJob && !checkLatest) {
+        sawJob = false;
+        return refreshUpdate(true);
+      }
+      const completed = info.target === current && info.phase === "更新成功";
+      const result = completed || (info.phase || "").startsWith("失败") ? info.phase + " · " : "";
+      versionLabel.textContent = repair ? prefix + info.phase : !current ? "尚未安装 Clash Party" : prefix + result +
+        (info.available ? "有新版本" : info.latest ? "已是最新版" : info.phase || "请检查更新");
+      upgrade.disabled = !(repair || info.available);
+    } catch (err) {
+      if (!active) return;
+      versionLabel.textContent = (current ? "当前版本 " + current + " · " : "") + (checkLatest ? "检查失败：" : "") + err.message;
+      if (sawJob) updateTimer = setTimeout(() => refreshUpdate(false), 3000);
+    }
+    if (active) check.disabled = false;
+  }
+  check.onclick = () => refreshUpdate(true);
+  upgrade.onclick = () => { sawJob = true; refreshUpdate(false, true); };
+  refreshUpdate(true);
+  closeClashWindow = () => {
+    active = false;
+    clearTimeout(updateTimer);
+    viewer?.disconnect();
+    paste.reset();
+    closeClashWindow = () => {};
+  };
+  function offline(message) {
+    if (!active) return;
+    status.textContent = message;
+    display.hidden = paste.hidden = true;
+    retry.hidden = false;
+  }
+  retry.onclick = () => openPage("clash-party", true);
+  paste.onsubmit = async e => {
+    e.preventDefault();
+    const input = paste.querySelector("input");
+    if (!input.value) return;
+    try {
+      await api("clash-party/paste", {text: input.value});
+      input.value = "";
+      if (active) viewer.focus();
+    } catch (err) { if (active) toast(err.message, true); }
+  };
+  try {
+    const state = await api("clash-party");
+    if (!active) return;
+    if (!state.ready) return offline(state.message);
+    const {default: RFB} = await import("/admin/clash-view/core/rfb.js");
+    if (!active) return;
+    display.hidden = false;
+    const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+    viewer = new RFB(display, scheme + "//" + location.host + "/admin/api/clash-party/display");
+    viewer.scaleViewport = true;
+    viewer.addEventListener("connect", () => {
+      if (active) { status.textContent = ""; paste.hidden = false; }
+    });
+    viewer.addEventListener("disconnect", () => offline("窗口连接已断开"));
+  } catch (err) { offline("无法连接窗口：" + err.message); }
+}
+
+const PAGES = { "clash-party": renderClashParty, status: renderStatus, how: renderHow, llm: renderLLM, calls: renderCallNames, grokbot: renderGrokBot, memory: renderMemory, asr: renderASR, tts: renderTTS, intent: renderIntent, update: renderUpdate };
 const page = { name: "", dirty: null, timer: null };
 function currentPage() { const p = location.hash.slice(1); return PAGES[p] ? p : "status"; }
 function confirmLeave() { return !(page.dirty && page.dirty()) || confirm("当前页面有修改还没保存，确定离开吗？"); }
@@ -434,6 +541,7 @@ function confirmLeave() { return !(page.dirty && page.dirty()) || confirm("当�
 async function openPage(name, force) {
   if (!force && name === page.name) return;
   if (!force && !confirmLeave()) { history.replaceState(null, "", "#" + page.name); return; }
+  closeClashWindow();
   clearInterval(page.timer); page.timer = null; page.dirty = null; page.name = name;
   if (audio) { audio.pause(); audio = null; }
   if (location.hash.slice(1) !== name) history.replaceState(null, "", "#" + name);
@@ -651,16 +759,277 @@ async function renderHow(root) {
 
 // ---------- 大模型 ----------
 
+function bindCodexLogin(form, saved) {
+  const box = form.querySelector("[data-login-box]");
+  if (!box) return;
+  const panel = box.querySelector("[data-login-panel]");
+  const start = box.querySelector("[data-login-start]");
+  const link = panel.querySelector("a");
+  const url = panel.querySelector("[readonly]");
+  const callback = panel.querySelector("[data-callback]");
+  const message = box.querySelector("[role=status]");
+  let loginId;
+  function reset() {
+    loginId = null;
+    panel.classList.add("hidden");
+    start.classList.remove("hidden");
+    link.removeAttribute("href");
+    url.value = callback.value = "";
+  }
+  function loggedIn() {
+    reset();
+    box.remove();
+    form.querySelector("[data-install-state]").textContent = "已登录";
+    $("codex-choice").querySelector("small").textContent = "已登录";
+    const use = form.querySelector("#codex-use");
+    if (use) use.disabled = !saved.workspace_ready;
+  }
+  const run = (btn, fn) => {
+    btn.onclick = () => busy(btn, async () => {
+      message.textContent = "";
+      try { await fn(); }
+      catch (error) {
+        if (error.loginEnded) {
+          reset();
+          form.querySelector("[data-install-state]").textContent = "授权未完成";
+        }
+        message.textContent = error.message;
+      }
+    });
+  };
+  const request = (action, body) => api("llm/codex/login/" + action, body, true);
+  run(start, async () => {
+    const result = await request("start", {});
+    if (result.logged_in) return loggedIn();
+    form.querySelector("[data-install-state]").textContent = "等待回填回调链接";
+    loginId = result.login_id;
+    url.value = link.href = result.url;
+    start.classList.add("hidden");
+    panel.classList.remove("hidden");
+  });
+  run(panel.querySelector("[data-copy]"), async () => {
+    try { await navigator.clipboard.writeText(url.value); toast("已复制"); }
+    catch { url.focus(); url.select(); message.textContent = "已选中授权地址，请复制。"; }
+  });
+  run(panel.querySelector("[data-submit]"), async () => {
+    if (!callback.reportValidity()) return;
+    await request("complete", {login_id: loginId, callback: callback.value.trim()});
+    loggedIn();
+  });
+  run(panel.querySelector("[data-cancel]"), async () => {
+    try { await request("cancel", {login_id: loginId}); }
+    finally { reset(); form.querySelector("[data-install-state]").textContent = "待登录"; }
+  });
+}
+
+function renderCodexForm(form, data, current, reload, draft) {
+  const saved = data.codex,
+    models = saved.models || [],
+    currentDefault = data.selected === "CodexCLI";
+  const v = { ...saved, ...draft };
+  const levels = [
+    ["read", "只读", "列举、读取、搜索项目文件。"],
+    ["edit", "可编辑", "可读取项目，并在工作目录内新建、修改文件。"],
+    ["auto", "Auto", "可编辑项目并在工作区沙箱内运行命令。需要提升权限的操作会被拒绝。"]
+  ];
+  const nums = [
+    ["turn_timeout_seconds", "单轮超时（秒）", "0 表示不限制"],
+    ["stall_timeout_seconds", "无响应超时（秒）", "0 表示关闭"],
+    ["idle_timeout_seconds", "空闲释放会话（秒）", "0 表示每轮结束后释放"],
+    ["background_max_seconds", "后台最长（秒）", "0 表示打断后停止"],
+    ["background_after_seconds", "算作长任务（秒）", "使用工具或达到此时长后可转后台"],
+    ["resume_window_minutes", "自动接续（分钟）", "0 表示仅按接续关键字恢复"],
+    ["filler_delay_seconds", "填充语等待（秒）", ""],
+    ["progress_interval_seconds", "进度提示间隔（秒）", "0 表示关闭"]
+  ];
+  const field = (
+    k,
+    label,
+    hint = "",
+    type = "text"
+  ) => `<label class="f">${label}<small class="hint">${hint}</small>
+    <input class="in" data-field="${k}" type="${type}" ${type === "number" ? 'min="0" step="any" required' : ""} value="${esc(k === "resume_keywords" ? (v[k] || []).join("，") : String(v[k] ?? ""))}"></label>`;
+  const lookup = (k) => form.querySelector(`[data-field="${k}"]`);
+  const button = (key, label, active, hint = "") =>
+    `<button type="button" data-val="${esc(key)}" class="${active ? "on" : ""}" aria-pressed="${active}">${esc(label)}${hint ? `<small>${esc(hint)}</small>` : ""}</button>`;
+  const aliases = data.call_names_enabled && data.callable.CodexCLI;
+  const installed = saved.installed ? (saved.logged_in ? "已登录" : "待登录") : "未安装";
+  form.innerHTML = `<h3>Codex CLI</h3><div class="banner info"><span data-install-state>${installed}</span> · ${currentDefault ? "当前默认模型" : `默认模型为 ${esc(current)}`}${aliases?.length ? `。说“嗨 ${esc(aliases[0])}”可切换到 Codex` : ""}。</div>
+    ${saved.installed && !saved.logged_in ? `<div class="cli-row" data-login-box><div class="cli-k">账号登录</div><div>
+      <button type="button" class="btn" data-login-start>使用 ChatGPT 登录</button>
+      <div class="hidden" data-login-panel>
+        <a class="btn primary" target="_blank" rel="noopener noreferrer">打开 OpenAI 授权页</a>
+        <button type="button" class="btn" data-copy>复制授权地址</button>
+        <input class="in mono" aria-label="授权地址" readonly>
+        <label class="f">回调链接<small class="hint">请在 10 分钟内完成授权，复制浏览器地址栏中的完整回调链接并粘贴到这里。即使页面提示无法连接，也可以复制地址。</small>
+        <input class="in" data-callback type="url" required autocomplete="off" spellcheck="false"></label>
+        <button type="button" class="btn primary" data-submit>完成登录</button>
+        <button type="button" class="btn" data-cancel>取消并返回</button>
+      </div><span class="small" role="status"></span></div></div>` : ""}
+    <div class="cli-row"><div class="cli-k">模型</div><div><div class="seg" data-models></div>
+      <select class="in" data-other-model aria-label="更多 Codex 模型"><option value="">更多模型…</option></select>
+      <input class="in mono" data-custom placeholder="输入完整模型名" aria-label="自定义 Codex 模型"></div></div>
+    <div class="cli-row"><div class="cli-k">思考级别</div><div><div class="seg" data-efforts></div><div class="small muted">级别越高，回复通常越慢。</div></div></div>
+    <div class="cli-row"><div class="cli-k">权限级别</div><div><div class="levels">${levels
+      .map(
+        ([key, label, desc]) =>
+          `<button type="button" class="level ${key}" data-permission="${key}"><b>${label}</b><small>${desc}</small></button>`
+      )
+      .join("")}</div>
+      <label class="switch"><input data-field="web" type="checkbox" ${v.web ? "checked" : ""}><span>允许联网搜索</span><small>允许 Codex 调用网页搜索工具</small></label></div></div>
+    <div class="grid2">${field("workdir", "工作目录", "项目的绝对路径")}${field("first_reply_filler", "填充语", "回复慢时先说这句，留空关闭")}</div>
+    <details class="adv"><summary>高级设置（超时、自动接续、当前开放的工具）</summary><div class="grid3">
+      ${nums.map(([k, l, h]) => field(k, l, h, "number")).join("")}${field("progress_reply", "进度提示", "留空使用默认提示")}
+      ${field("resume_keywords", "接续关键字", "用逗号分隔")}${field("cli_path", "CLI 路径", "留空自动查找")}
+      <div class="full"><label class="f">当前开放的工具</label><div class="chips" data-tools></div></div></div></details>
+    <div class="actions"><span class="result"></span><button class="btn" id="codex-reset">撤销修改</button><button class="btn" id="codex-save">保存</button>
+      ${currentDefault ? "" : `<button class="btn primary" id="codex-use" ${saved.logged_in && saved.workspace_ready ? "" : "disabled"}>保存并设为默认</button>`}</div>`;
+  bindCodexLogin(form, saved);
+  const find = (sel) => form.querySelector(sel),
+    custom = find("[data-custom]");
+  let level = v.level,
+    effort = v.effort || "",
+    model = v.model || "";
+  const presets = models.slice(0, 3);
+  if (models.some((m) => m.id === model) && !presets.some((m) => m.id === model))
+    presets.push(models.find((m) => m.id === model));
+  const others = find("[data-other-model]");
+  models.filter((m) => !presets.some((p) => p.id === m.id)).forEach((m) => others.add(new Option(m.label, m.id)));
+  others.classList.toggle("hidden", others.options.length === 1);
+  others.onchange = () => {
+    if (!others.value) return;
+    model = others.value;
+    customMode = false;
+    if (!presets.some((p) => p.id === model)) presets.push(models.find((m) => m.id === model));
+    others.value = "";
+    drawModels();
+  };
+  let customMode = !!model && !presets.some((m) => m.id === model);
+  const effortLabels = {
+    minimal: "最小",
+    low: "低",
+    medium: "中",
+    high: "高",
+    xhigh: "超高",
+    max: "最高",
+    ultra: "极高"
+  };
+  function drawEfforts() {
+    const allowed = models.find((m) => m.id === model)?.efforts || saved.efforts;
+    if (effort && !allowed.includes(effort)) effort = "";
+    find("[data-efforts]").innerHTML =
+      button("", "模型默认", !effort) + allowed.map((e) => button(e, effortLabels[e] || e, e === effort)).join("");
+  }
+  function drawModels() {
+    find("[data-models]").innerHTML =
+      button("", "CLI 默认", !customMode && !model) +
+      presets.map((m) => button(m.id, m.label, !customMode && model === m.id)).join("") +
+      button("__custom", "自定义", customMode, "填完整模型名");
+    custom.classList.toggle("hidden", !customMode);
+    drawEfforts();
+  }
+  custom.value = customMode ? model : "";
+  find("[data-models]").onclick = (e) => {
+    const b = e.target.closest("button");
+    if (!b) return;
+    customMode = b.dataset.val === "__custom";
+    model = customMode ? custom.value.trim() : b.dataset.val;
+    drawModels();
+    if (customMode) custom.focus();
+  };
+  custom.oninput = () => {
+    model = custom.value.trim();
+    drawEfforts();
+  };
+  find("[data-efforts]").onclick = (e) => {
+    const b = e.target.closest("button");
+    if (b) {
+      effort = b.dataset.val;
+      drawEfforts();
+    }
+  };
+  function drawTools() {
+    form.querySelectorAll("[data-permission]").forEach((b) => {
+      const on = b.dataset.permission === level;
+      b.classList.toggle("on", on);
+      b.setAttribute("aria-pressed", on);
+    });
+    const tools = ["列举", "读取", "搜索文件"];
+    if (level !== "read") tools.push("编辑文件");
+    if (level === "auto") tools.push("执行命令");
+    if (lookup("web").checked) tools.push("联网搜索");
+    find("[data-tools]").innerHTML = tools.map((t) => `<span class="chip on">${t}</span>`).join("");
+  }
+  find(".levels").onclick = (e) => {
+    const b = e.target.closest("[data-permission]");
+    if (!b) return;
+    const next = b.dataset.permission,
+      rank = (k) => levels.findIndex(([key]) => key === k);
+    if (rank(next) > rank(level) && !confirm(`开启${levels[rank(next)][1]}？${levels[rank(next)][2]}`)) return;
+    level = next;
+    drawTools();
+  };
+  lookup("web").onchange = drawTools;
+  drawModels();
+  drawTools();
+  const values = () => {
+    const out = { model, effort, level };
+    form.querySelectorAll("[data-field]").forEach((el) => {
+      const k = el.dataset.field;
+      out[k] =
+        el.type === "checkbox"
+          ? el.checked
+          : k === "resume_keywords"
+            ? el.value
+                .split(/[,，]/)
+                .map((s) => s.trim())
+                .filter(Boolean)
+            : el.type === "number"
+              ? el.valueAsNumber
+              : el.value.trim();
+    });
+    return out;
+  };
+  const dirty = () => {
+    const now = values();
+    return Object.keys(now).some((k) => JSON.stringify(now[k]) !== JSON.stringify(saved[k]));
+  };
+  find("#codex-reset").onclick = () => reload("codex");
+  form.querySelectorAll("#codex-save,#codex-use").forEach(
+    (b) =>
+      (b.onclick = () =>
+        busy(b, async () => {
+          for (const el of form.querySelectorAll("input[type=number]")) if (!el.reportValidity()) return;
+          try {
+            const r = await api("llm/codex", values());
+            const result = b.id === "codex-use" ? await api("llm/use", { kind: "cli", vendor: "codex" }) : r;
+            toast(result.note, result.failed);
+            await reload("codex");
+          } catch (err) {
+            find(".result").textContent = err.message;
+          }
+        }))
+  );
+  return { values, dirty };
+}
+
+let selectedCli = null, cliDrafts = {};
 let llmVendor = null;  // 正在查看的 API 厂商
 async function renderLLM(root) {
   const d = await api("llm");
   const c = d.claude, v = c.values, inst = c.install;
-  const usingCli = d.kind === "cli";
+  const drafts = cliDrafts; cliDrafts = {};
+  if (drafts.claude) {
+    Object.assign(v, drafts.claude);
+    c.level = drafts.claude.level;
+    c.web = drafts.claude.web;
+  }
+  const usingCli = d.selected === "ClaudeCLI", usingCodex = d.selected === "CodexCLI";
   const active = d.vendors.find((x) => x.id === d.vendor);
   if (!llmVendor || !d.vendors.find((x) => x.id === llmVendor)) {
     llmVendor = d.vendor || (d.vendors.find((x) => x.configured) || d.vendors[0]).id;
   }
-  const current = usingCli ? `Claude Code · ${v.model || "默认模型"}` : d.kind === "grok" && d.grok.selected ? `Grok Bot · ${d.grok.selected.bot_name}` : active ? `${active.label} · ${active.model}` : d.selected;
+  const current = usingCodex ? `Codex CLI · ${d.codex.model || "默认模型"}` : usingCli ? `Claude Code · ${v.model || "默认模型"}` : d.kind === "grok" && d.grok.selected ? `Grok Bot · ${d.grok.selected.bot_name}` : active ? `${active.label} · ${active.model}` : d.selected;
   const customModel = !!v.model && !c.options.model.find((o) => o.value === v.model);
   const num = (name, label, hint) => `<label class="f">${label}${hint ? `<span class="hint">${hint}</span>` : ""}
     <input class="in" data-k="${name}" value="${esc(v[name] ?? "")}" inputmode="decimal"></label>`;
@@ -676,25 +1045,30 @@ async function renderLLM(root) {
     ${d.running && d.running !== d.selected ? `<div class="banner warn">配置里的默认模型是 ${esc(d.selected)}，但服务仍在用 ${esc(d.running)}。</div>` : ""}
 
     <div class="section-title">本地 CLI 与智能体 · 用你自己的账号，不走下面的 API Key</div>
+    <div class="card panel">
+      <h3>全局 CLI 代理</h3><label><input type="checkbox" id="proxy-enabled"> 为 Claude Code 和 Codex CLI 启用代理</label>
+      <label class="f">代理地址<input class="in mono" id="proxy-url" placeholder="127.0.0.1:7890"></label>
+      <div class="actions"><span class="result" id="proxy-result"></span><button class="btn" id="proxy-save">保存代理设置</button></div>
+    </div>
     <div class="choices three">
-      <div class="choice ${usingCli ? "on" : ""}">
+      <button type="button" class="choice" id="claude-choice">
         <div class="mark" style="background:#fef3c7;color:#b45309">C</div>
         <div><b>Claude Code CLI</b> ${defaultPill(usingCli)} ${callPill("ClaudeCLI")}
           <small>${inst.installed ? esc(`${inst.version} · ${inst.path}`) : '<span style="color:var(--err)">没有找到 Claude Code，请先安装并登录</span>'}</small></div>
-      </div>
-      <div class="choice off" title="即将支持">
+      </button>
+      <button type="button" class="choice" id="codex-choice">
         <div class="mark" style="background:var(--soft);color:var(--muted)">X</div>
-        <div><b>Codex CLI</b> <span class="pill">即将支持</span><small>OpenAI 的本地编程助手</small></div>
-      </div>
+        <div><b>Codex CLI</b> ${defaultPill(usingCodex)} ${callPill("CodexCLI")}<small>${!d.codex.installed ? "未安装" : d.codex.logged_in ? "已登录" : "待登录"}</small></div>
+      </button>
       <div class="choice ${d.kind === "grok" ? "on" : ""}" id="grok-choice" style="cursor:pointer" title="打开 Grok Bot 页">
         <div class="mark" style="background:#e0f2fe;color:#0369a1">G</div>
         <div><b>Grok Bot</b> ${defaultPill(d.kind === "grok")} ${grokAliases.length ? `<span class="pill">称呼：${esc(grokAliases.slice(0, 3).join("、"))}${grokAliases.length > 3 ? "…" : ""}</span>` : ""}
           <small>${d.grok.bots.length ? `已勾选 ${d.grok.bots.length} 个 Bot${grokAliases.length < d.grok.bots.length ? "，有的还没配称呼" : ""}，叫名字就能派活` : "xAI 的云端 AI 同事：登录、勾选 Bot，叫名字派活，回复念给你听"}</small></div>
       </div>
     </div>
-    <div class="card panel" id="cli-form">
+    <div class="card panel" id="cli-form"><h3>Claude Code CLI</h3>
       ${c.exists ? `
-      ${usingCli ? "" : `<div class="banner info">本地 CLI 不是默认模型${active ? `（默认是 ${esc(active.label)}）` : ""}${d.callable.ClaudeCLI ? "，但配了称呼，说“嗨 Claude”就能用它" : ""}。这里改的设置保存后，设备重新连接时生效；想让它当默认模型就点"保存并设为默认"。</div>`}
+      ${usingCli ? "" : `<div class="banner info">Claude Code CLI 不是默认模型${active ? `（默认是 ${esc(active.label)}）` : ""}${d.callable.ClaudeCLI ? "，但配了称呼，说“嗨 Claude”就能用它" : ""}。这里改的设置保存后，设备重新连接时生效；想让它当默认模型就点"保存并设为默认"。</div>`}
       <div class="cli-row"><div class="cli-k">模型</div><div>
         <div class="seg" data-k="model">${c.options.model.map((o) => `<button type="button" data-v="${o.value}" class="${o.value === v.model ? "on" : ""}">${o.label}<small>${esc(o.hint)}</small></button>`).join("")}
           <button type="button" data-v="__custom" class="${customModel ? "on" : ""}">自定义<small>填完整模型名</small></button></div>
@@ -742,12 +1116,47 @@ async function renderLLM(root) {
       </div>` : '<div class="muted">配置文件里没有 ClaudeCLI 条目，请重新运行安装脚本生成配置。</div>'}
     </div>
 
+    <div class="card panel" id="codex-form"></div>
     <div class="section-title">API Key · 云端模型，统一走 OpenAI 协议</div>
     <div class="vendors">${d.vendors.map((x) => `<button class="vendor ${x.id === llmVendor ? "on" : ""} ${d.vendor === x.id ? "using" : ""}" data-vendor="${x.id}">
       <i class="${x.configured ? "set" : ""}"></i><b>${esc(x.label)}</b>
       <small>${d.vendor === x.id ? "✓ 默认" : x.configured ? (d.callable[x.entry] ? `称呼：${esc(d.callable[x.entry][0])}` : "已配置") : "未配置"}</small></button>`).join("")}</div>
     <div class="card panel" id="api-form"></div>`;
 
+  const proxyValues = () => ({enabled: $("proxy-enabled").checked, url: $("proxy-url").value});
+  const proxyForm = drafts.proxy || d.cli_proxy;
+  $("proxy-result").textContent = d.cli_proxy_warning || "";
+  $("proxy-enabled").checked = proxyForm.enabled;
+  $("proxy-url").value = proxyForm.url;
+  const proxyDirty = () => JSON.stringify(proxyValues()) !== JSON.stringify({enabled:d.cli_proxy.enabled,url:d.cli_proxy.url});
+  $("proxy-save").onclick = async () => {
+    $("proxy-save").disabled = true;
+    try {
+      const r = await api("llm/cli-proxy", proxyValues());
+      d.cli_proxy = r.cli_proxy;
+      $("proxy-url").value = r.cli_proxy.url;
+      $("proxy-result").textContent = r.warning ? "已保存。" + r.warning : "已保存，新启动的 CLI 将使用此设置";
+    } catch (e) { $("proxy-result").textContent = e.message; }
+    finally { $("proxy-save").disabled = false; }
+  };
+  function selectCli(key) {
+    selectedCli=key;
+    for(const [name,id] of [["claude","cli-form"],["codex","codex-form"]]){
+      $(id).classList.toggle("hidden",name!==key);
+      const btn=$(name+"-choice");btn.classList.toggle("on",name===key);btn.setAttribute("aria-pressed",name===key);
+    }
+  }
+  $("claude-choice").onclick=()=>selectCli("claude");
+  $("codex-choice").onclick=()=>selectCli("codex");
+  selectCli(selectedCli || (usingCodex ? "codex" : "claude"));
+  const codexForm=renderCodexForm($("codex-form"),d,current,reload,drafts.codex);
+  async function reload(owner) {
+    cliDrafts={};
+    if(proxyDirty())cliDrafts.proxy=proxyValues();
+    if(owner!=="codex" && codexForm.dirty())cliDrafts.codex=codexForm.values();
+    if(owner!=="claude" && cliDirty()){cliDrafts.claude=cliValues();cliDrafts.claudeBase=claudeBase;}
+    page.dirty=null;await openPage("llm",true);
+  }
   $("grok-choice").onclick = () => openPage("grokbot");
 
   // ----- 本地 CLI -----
@@ -763,7 +1172,7 @@ async function renderLLM(root) {
     out.resume_keywords = (out.resume_keywords || "").split(/[,，]/).map((s) => s.trim()).filter(Boolean);
     return out;
   };
-  let cliDirty = () => false;
+  let cliDirty = () => false, claudeBase;
   if (c.exists) {
     const result = (html) => ($("cli-result").innerHTML = html);
     const syncModel = () => $("model-custom").classList.toggle("hidden", segValue("model") !== "__custom");
@@ -780,19 +1189,20 @@ async function renderLLM(root) {
       form.querySelectorAll("[data-level]").forEach((x) => x.classList.toggle("on", x === b));
     }));
     syncModel(); syncEffort();
-    cliDirty = snapshot(cliValues);
-    $("cli-reset").onclick = () => { page.dirty = null; openPage("llm", true); };
+    claudeBase = drafts.claudeBase || JSON.stringify(cliValues());
+    cliDirty = () => JSON.stringify(cliValues()) !== claudeBase;
+    $("cli-reset").onclick = () => { reload("claude"); };
     $("cli-save").onclick = (e) => busy(e.target, async () => {
       try {
         const r = await api("llm/claude", cliValues());
-        toast(r.changed.length ? r.note : "没有修改", r.failed); page.dirty = null; await openPage("llm", true);
+        toast(r.changed.length ? r.note : "没有修改", r.failed); await reload("claude");
       } catch (err) { result(`<span style="color:var(--err)">${esc(err.message)}</span>`); }
     });
     if ($("cli-use")) $("cli-use").onclick = (e) => busy(e.target, async () => {
       try {
         await api("llm/claude", cliValues());
         const r = await api("llm/use", { kind: "cli" });
-        toast(r.note, r.failed); page.dirty = null; await openPage("llm", true);
+        toast(r.note, r.failed); await reload("claude");
       } catch (err) { result(`<span style="color:var(--err)">${esc(err.message)}</span>`); }
     });
   }
@@ -833,14 +1243,14 @@ async function renderLLM(root) {
       catch (err) { bad(err.message); }
     });
     $("api-save").onclick = (e) => busy(e.target, async () => {
-      try { const r = await api(`llm/vendors/${x.id}`, values()); toast(r.changed.length ? r.note : "没有修改", r.failed); page.dirty = null; await openPage("llm", true); }
+      try { const r = await api(`llm/vendors/${x.id}`, values()); toast(r.changed.length ? r.note : "没有修改", r.failed); await reload("api"); }
       catch (err) { bad(err.message); }
     });
     if ($("api-use")) $("api-use").onclick = (e) => busy(e.target, async () => {
       try {
         await api(`llm/vendors/${x.id}`, values());
         const r = await api("llm/use", { kind: "api", vendor: x.id });
-        toast(r.note, r.failed); page.dirty = null; await openPage("llm", true);
+        toast(r.note, r.failed); await reload("api");
       } catch (err) { bad(err.message); }
     });
   };
@@ -851,7 +1261,7 @@ async function renderLLM(root) {
     renderApi();
   }));
   renderApi();
-  page.dirty = () => cliDirty() || apiDirty();
+  page.dirty = () => proxyDirty() || cliDirty() || codexForm.dirty() || apiDirty();
 }
 
 // ---------- 语音识别 ----------

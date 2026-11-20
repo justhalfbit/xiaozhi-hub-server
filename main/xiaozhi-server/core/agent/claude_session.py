@@ -5,6 +5,7 @@
 """
 
 import asyncio
+from core.agent import cli_proxy
 import json
 import os
 import re
@@ -164,6 +165,7 @@ class ClaudeSession(AgentSession):
             return PermissionResultAllow()
 
         kwargs = dict(
+            env=cli_proxy.overrides(),
             cli_path=self.config.cli_path,
             cwd=self.config.workdir,
             model=self.config.model or None,

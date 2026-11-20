@@ -435,15 +435,66 @@ $("logout").onclick = async () => { if (!confirmLeave()) return; page.dirty = nu
 let closeClashWindow = () => {};
 async function renderClashParty(root) {
   root.innerHTML = `<h1>Clash Party</h1>
+    <div class="row"><span id="clash-version" role="status"></span>
+      <button class="btn" id="clash-check">检查更新</button>
+      <button class="btn primary" id="clash-upgrade" disabled>更新</button></div>
     <div class="row"><span id="clash-state" role="status">正在连接设备窗口…</span>
       <button class="btn" id="clash-retry" hidden>重新连接</button></div>
     <div id="clash-window" style="width:100%;aspect-ratio:1200 / 680;max-height:70vh;background:#181818" hidden></div>
     <form id="clash-paste" hidden><input aria-label="粘贴内容" placeholder="先选中窗口中的输入框，再在这里粘贴" maxlength="8192" autocomplete="off" style="width:min(70%,420px)">
       <button class="btn">粘贴到窗口</button></form>`;
   const display = $("clash-window"), status = $("clash-state"), paste = $("clash-paste"), retry = $("clash-retry");
-  let viewer, active = true;
+  const versionLabel = $("clash-version"), check = $("clash-check"), upgrade = $("clash-upgrade");
+  let viewer, active = true, updateTimer, sawJob = false, targetVersion = "";
+  async function refreshUpdate(checkLatest, submit = false) {
+    clearTimeout(updateTimer);
+    check.disabled = upgrade.disabled = true;
+    let current = "";
+    try {
+      let info = await api("clash-party/update", submit ? {version:targetVersion} : undefined);
+      if (!active) return;
+      current = info.current;
+      const prefix = current ? "当前版本 " + current + " · " : "";
+      if (checkLatest && !info.busy && !info.retry && current) {
+        versionLabel.textContent = prefix + "正在检查…";
+        info = await api("clash-party/update?check=1");
+        if (!active) return;
+      }
+      const repair = info.retry;
+      targetVersion = repair ? info.target : info.latest || "";
+      upgrade.textContent = repair ? repair : info.available ? "更新到 " + info.latest : "更新";
+      if (info.busy) {
+        sawJob = true;
+        versionLabel.textContent = prefix + (info.phase || "安装任务进行中");
+        updateTimer = setTimeout(() => refreshUpdate(false), 1500);
+        return;
+      }
+      if (sawJob && info.phase === "更新成功") {
+        sawJob = false;
+        return openPage("clash-party", true);
+      }
+      if (sawJob && !checkLatest) {
+        sawJob = false;
+        return refreshUpdate(true);
+      }
+      const completed = info.target === current && info.phase === "更新成功";
+      const result = completed || (info.phase || "").startsWith("失败") ? info.phase + " · " : "";
+      versionLabel.textContent = repair ? prefix + info.phase : !current ? "尚未安装 Clash Party" : prefix + result +
+        (info.available ? "有新版本" : info.latest ? "已是最新版" : info.phase || "请检查更新");
+      upgrade.disabled = !(repair || info.available);
+    } catch (err) {
+      if (!active) return;
+      versionLabel.textContent = (current ? "当前版本 " + current + " · " : "") + (checkLatest ? "检查失败：" : "") + err.message;
+      if (sawJob) updateTimer = setTimeout(() => refreshUpdate(false), 3000);
+    }
+    if (active) check.disabled = false;
+  }
+  check.onclick = () => refreshUpdate(true);
+  upgrade.onclick = () => { sawJob = true; refreshUpdate(false, true); };
+  refreshUpdate(true);
   closeClashWindow = () => {
     active = false;
+    clearTimeout(updateTimer);
     viewer?.disconnect();
     paste.reset();
     closeClashWindow = () => {};

@@ -1,5 +1,7 @@
 """Bridge the authenticated admin tab to the local ThinkSmart private X display."""
 import asyncio
+import json
+import re
 import os
 from pathlib import Path
 
@@ -7,6 +9,7 @@ from aiohttp import WSMsgType, web
 
 DISPLAY = Path("/run/thinksmart-clash")
 STATE = Path("/var/lib/thinksmart-clash")
+RELEASE_HELPER = Path("/opt/thinksmart/client/current/deploy/clash-party/release.py")
 ASSETS = STATE / "novnc-1.5.0"
 
 
@@ -25,6 +28,8 @@ class ClashWindow:
 
     def register(self, app):
         app.router.add_get("/admin/api/clash-party", self.status)
+        app.router.add_get("/admin/api/clash-party/update", self.update)
+        app.router.add_post("/admin/api/clash-party/update", self.update)
         app.router.add_get("/admin/api/clash-party/display", self.display)
         app.router.add_post("/admin/api/clash-party/paste", self.paste)
         app.router.add_get("/admin/clash-view/{path:.*}", self.asset)
@@ -44,6 +49,28 @@ class ClashWindow:
         message = ("请在设备的「设置 → Clash Party」中一键安装" if not phase else
                    "窗口暂未就绪，请在设备上检查 Clash Party 服务" if phase == "就绪" else phase)
         return web.json_response({"ready": ready, "message": "" if ready else message},
+                                 headers={"Cache-Control": "no-store"})
+
+    async def update(self, request):
+        self.require_login(request)
+        if request.method == "POST":
+            _same_origin(request)
+            version = (await self.read_json(request)).get("version")
+            if not isinstance(version, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) or len(version) > 64:
+                raise web.HTTPBadRequest(text="版本号无效")
+            args = ("queue", version)
+        else:
+            args = ("check",) if request.query.get("check") == "1" else ("status",)
+        if not RELEASE_HELPER.is_file():
+            return web.json_response({"error": "设备更新组件尚未安装"}, status=503)
+        proc = await asyncio.create_subprocess_exec(
+            "/usr/bin/python3", str(RELEASE_HELPER), *args, stdout=asyncio.subprocess.PIPE)
+        output, _ = await proc.communicate()
+        try:
+            result = json.loads(output)
+        except ValueError:
+            return web.json_response({"error": "无法读取更新状态"}, status=503)
+        return web.json_response(result, status=409 if proc.returncode else 200,
                                  headers={"Cache-Control": "no-store"})
 
     async def asset(self, request):

@@ -198,6 +198,8 @@ async def test_requires_login_and_json(client):
 
 async def test_clash_window_requires_admin_and_same_origin(client):
     base = "/admin/api/clash-party"
+    assert (await client.get(base + "/update?check=1")).status == 401
+    assert (await client.post(base + "/update", json={"version": "2.0.5"})).status == 401
     assert (await client.get(base)).status == 401
     assert (await client.get(base + "/display")).status == 401
     assert (await client.get("/admin/clash-view/core/rfb.js")).status == 401
@@ -205,6 +207,7 @@ async def test_clash_window_requires_admin_and_same_origin(client):
     await client.post("/admin/api/setup", json={"password": "pass-1234"})
     assert (await client.get(base)).status == 200
     for headers in ({}, {"Origin": "http://other.local"}):
+        assert (await client.post(base + "/update", headers=headers, json={"version": "2.0.5"})).status == 403
         assert (await client.get(base + "/display", headers=headers)).status == 403
         assert (await client.post(base + "/paste", headers=headers, json={"text": "abc"})).status == 403
 
